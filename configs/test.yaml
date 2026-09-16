@@ -1,0 +1,93 @@
+# TEST RUN - verifies the whole pipeline end to end on a 5 000-video stratified subset.
+# Target: a single 12-16 GB GPU (e.g. laptop RTX 5070 Ti 12 GB). Everything is tuned for memory, not accuracy:
+# 4-bit QLoRA for both VLMs (incl. the Llama vision tower), 8 frames, a single 560px frame mosaic, batch 1-2 with
+# gradient accumulation + gradient checkpointing, paged 8-bit AdamW, capped optimiser steps.
+run_name: csf-test
+mode: test
+seed: 42
+
+paths:
+  work_dir: ./runs/test
+  cache_dir: ./cache/test
+  video_dir: ./cache/test/videos
+
+data:
+  repo_id: madhav-yrc/Chrono-TriClass-100k
+  manifest: manifest.csv             # falls back to manifest.csv inside the dataset repo if this path is missing
+  max_rows: 5000
+  num_frames: 8
+  frame_size: 224
+  mosaic_frames: 4
+  mosaic_size: 560
+  patch_size: 64
+  num_patches: 4
+  tool_max_side: 768
+  jpeg_quality: 95
+  delete_videos_after_cache: true
+  keep_videos_for_latency: 20
+  download_workers: 12
+  prefetch: 24
+
+models:
+  qwen_id: Qwen/Qwen2.5-VL-3B-Instruct
+  llama_id: meta-llama/Llama-3.2-11B-Vision-Instruct
+  vae_id: stabilityai/stable-video-diffusion-img2vid-xt
+  vae_subfolder: vae
+  vae_fallback_id: stabilityai/sd-vae-ft-mse
+  attn_implementation: sdpa
+
+train:
+  num_workers: 4
+  qwen:
+    quantization: 4bit
+    skip_quant_modules: [lm_head]
+    epochs: 1
+    max_steps: 150
+    batch_size: 2
+    eval_batch_size: 1
+    grad_accum: 4
+    lr: 2.0e-4
+    head_lr: 1.0e-3
+    lora_r: 16
+    lora_alpha: 32
+    optimizer: adamw_8bit
+    eval_every: 50
+    save_every: 50
+    early_stop_patience: 3
+  llama:
+    quantization: 4bit
+    # Quantise everything, lm_head included: the classifier reads the pooled hidden state via a forward
+    # hook and calls the backbone with logits_to_keep=1, so lm_head's output is never used. Keeping its
+    # 128k x 4096 fp16 weights resident costs ~1 GiB for nothing, which matters on a 12-16 GB card.
+    skip_quant_modules: []
+    epochs: 1
+    max_steps: 100
+    batch_size: 1
+    eval_batch_size: 1
+    grad_accum: 8
+    lr: 2.0e-4
+    head_lr: 1.0e-3
+    lora_r: 16
+    lora_alpha: 32
+    tool_dropout: 0.3
+    optimizer: adamw_8bit
+    eval_every: 50
+    save_every: 50
+    max_eval_batches: 200
+    early_stop_patience: 3
+  dispatcher:
+    train_videos: null
+    iterations: 200
+    batch_videos: 64
+    group_size: 8
+    inner_epochs: 2
+    lr: 3.0e-4
+
+eval:
+  profiles: [ultra_fast, balanced, max_security]
+  latency_samples: 20
+  latency_warmup: 2
+
+hub:
+  private: true
+  prompt_for_push: true
