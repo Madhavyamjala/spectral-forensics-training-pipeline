@@ -70,6 +70,27 @@ csf/
   launch.py               multi-GPU process launcher (used on Windows instead of torchrun)
 ```
 
+## 0. Regenerating the AI-Edited class
+
+The AI-Edited third of the dataset can be rebuilt from scratch from Kinetics-400, following
+*AI Edited Data Source and Pipeline*: **33,333 videos, 8 manipulation families, 32 models**, each
+video traceable to its source clip, its model and its edit parameters (the old class had 89% of
+its `generator_edit_method` values as `"unknown"`).
+
+```bash
+python -m csf.generation.spec          # the full allocation plan, self-checked
+python -m csf.generation.adapters      # per-model status: which are wired, which are not
+bash scripts/run_regen.sh --envs       # build the per-model environments
+bash scripts/run_regen.sh --kinetics   # acquire + qualify the source clips
+bash scripts/run_regen.sh --generate   # render on GPUs 2/3/4
+bash scripts/run_regen.sh --manifest   # rebuild manifest.csv around what was produced
+bash scripts/run_regen.sh --train      # train on the new dataset
+```
+
+13 of the 32 models are wired end to end today (11,688 videos, 35%); the rest are registered but
+refuse their jobs rather than emitting placeholder video. Full runbook, coverage table, timings
+and troubleshooting: **[docs/REGENERATION.md](docs/REGENERATION.md)**.
+
 ## 1. Setup
 
 **Windows (PowerShell):**

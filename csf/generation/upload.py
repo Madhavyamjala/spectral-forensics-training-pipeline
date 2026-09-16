@@ -1,0 +1,134 @@
+"""
+Publishing the regenerated AI-Edited videos back to the dataset repo.
+
+The user's decision for this run is "remove old and push new", so this does three things, in an
+order chosen so the repo is never left inconsistent for long:
+
+    1. upload the new `AI Edited/<family>/*.mp4` files in batched commits,
+    2. upload the new manifest.csv,
+    3. delete the old `AI Edited/` paths that the new manifest no longer references.
+
+Deletion runs last and only for paths the new manifest does not use, so an interrupted push
+leaves a repo with extra files rather than missing ones.
+
+This is a destructive, outward-facing operation against a public artefact, so it never runs from
+the normal stage sequence without an explicit opt-in: `generation.push.enabled` must be true, and
+an interactive run asks for confirmation and a WRITE token first.
+"""
+
+from __future__ import annotations
+
+import csv
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set
+
+from csf.logging_utils import get_logger
+
+log = get_logger("generation.upload")
+
+BATCH = 400
+
+
+def _api(token: Optional[str]):
+    from huggingface_hub import HfApi
+    return HfApi(token=token)
+
+
+def manifest_paths(manifest: Path) -> Set[str]:
+    """`AI Edited/...` repo paths referenced by the new manifest."""
+    out: Set[str] = set()
+    with open(Path(manifest), newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            if row.get("class") != "ai_edited":
+                continue
+            family = row.get("family") or ""
+            vid = row.get("video_id") or ""
+            if family and vid:
+                out.add(f"AI Edited/{family}/{vid}.mp4")
+    return out
+
+
+def existing_edited_paths(repo_id: str, token: Optional[str], revision: Optional[str] = None
+                          ) -> List[str]:
+    files = _api(token).list_repo_files(repo_id, repo_type="dataset", revision=revision)
+    return [f for f in files if f.replace("_", " ").lower().startswith("ai edited/")]
+
+
+def push(repo_id: str, manifest: Path, video_root: Path, token: Optional[str] = None,
+         delete_old: bool = True, private: bool = True, dry_run: bool = False) -> Dict[str, object]:
+    """Upload the regenerated videos + manifest, then prune the superseded ones."""
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
+
+    api = _api(token)
+    wanted = manifest_paths(manifest)
+    video_root = Path(video_root)
+    present = [(p, video_root / p) for p in sorted(wanted) if (video_root / p).exists()]
+    absent = len(wanted) - len(present)
+    if absent:
+        log.warning("%d manifest row(s) have no local file and will not be uploaded", absent)
+
+    try:
+        old = existing_edited_paths(repo_id, token)
+    except Exception as exc:                                   # noqa: BLE001 - repo may be new
+        log.warning("Could not list %s (%s); assuming nothing to delete", repo_id, str(exc)[:200])
+        old = []
+    stale = sorted(set(old) - wanted)
+
+    plan = {"repo_id": repo_id, "upload_videos": len(present), "missing_locally": absent,
+            "delete_old": len(stale) if delete_old else 0, "dry_run": dry_run}
+    log.info("Push plan: %s", plan)
+    if dry_run:
+        return plan
+
+    api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+
+    for i in range(0, len(present), BATCH):
+        chunk = present[i:i + BATCH]
+        ops = [CommitOperationAdd(path_in_repo=rp, path_or_fileobj=str(lp)) for rp, lp in chunk]
+        api.create_commit(repo_id, repo_type="dataset", operations=ops,
+                          commit_message=f"Add regenerated AI-Edited videos "
+                                         f"({i + 1}-{i + len(chunk)} of {len(present)})")
+        log.info("Uploaded %d/%d videos", i + len(chunk), len(present))
+
+    api.upload_file(path_or_fileobj=str(manifest), path_in_repo="manifest.csv",
+                    repo_id=repo_id, repo_type="dataset",
+                    commit_message="Update manifest for regenerated AI-Edited class")
+
+    if delete_old and stale:
+        for i in range(0, len(stale), BATCH):
+            chunk = stale[i:i + BATCH]
+            api.create_commit(repo_id, repo_type="dataset",
+                              operations=[CommitOperationDelete(path_in_repo=p) for p in chunk],
+                              commit_message=f"Remove superseded AI-Edited videos "
+                                             f"({i + 1}-{i + len(chunk)} of {len(stale)})")
+            log.info("Deleted %d/%d superseded files", i + len(chunk), len(stale))
+
+    log.info("Push complete: https://huggingface.co/datasets/%s", repo_id)
+    return {**plan, "url": f"https://huggingface.co/datasets/{repo_id}"}
+
+
+def push_interactive(cfg, manifest: Path, video_root: Path) -> Optional[str]:
+    """Confirm, take a WRITE token, then push. Returns the repo url, or None if declined."""
+    gen = cfg.generation
+    repo_id = gen.push.repo_id or cfg.data.repo_id
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+    interactive = bool(sys.stdin and sys.stdin.isatty())
+    if interactive:
+        print(f"\nAbout to replace the AI-Edited class of dataset '{repo_id}'.")
+        print(f"  upload : regenerated videos listed in {manifest}")
+        print(f"  delete : every existing 'AI Edited/...' file the new manifest does not use")
+        if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            log.info("Push declined by the operator")
+            return None
+        if not token:
+            import getpass
+            token = getpass.getpass("Hugging Face WRITE token (hidden): ").strip()
+    if not token:
+        raise RuntimeError("No Hugging Face token available. Set HF_TOKEN or run interactively.")
+
+    result = push(repo_id, manifest, video_root, token=token, delete_old=gen.push.delete_old,
+                  private=gen.push.private, dry_run=gen.push.dry_run)
+    return result.get("url")

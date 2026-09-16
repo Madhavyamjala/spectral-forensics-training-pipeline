@@ -126,6 +126,55 @@ class HubConfig:
 
 
 @dataclass
+class KineticsConfig:
+    """Where Kinetics-400 source clips come from, and how many to keep."""
+    local_root: Optional[str] = None            # an already-extracted tree on the cluster
+    mirror_base: str = "https://s3.amazonaws.com/kinetics/400"
+    hf_repo: Optional[str] = None               # optional Hugging Face mirror
+    hf_revision: Optional[str] = None
+    splits: List[str] = field(default_factory=lambda: ["train", "val"])
+    max_shards: Optional[int] = None            # cap the shard downloads (smoke runs)
+    probe_clips: bool = True
+    demand_margin: float = 1.6                  # oversample: clips are lost to the filters
+    score_workers: int = 8
+    score_frames: int = 12
+    rescore: bool = False
+
+
+@dataclass
+class GenerationPushConfig:
+    """Publishing the regenerated class back to the dataset repo (destructive - opt in)."""
+    enabled: bool = False
+    repo_id: Optional[str] = None               # defaults to data.repo_id
+    delete_old: bool = True
+    private: bool = True
+    dry_run: bool = False
+
+
+@dataclass
+class GenerationConfig:
+    enabled: bool = False
+    total_videos: int = 33333
+    gpus: List[int] = field(default_factory=lambda: [2, 3, 4])
+    video_root: str = "./cache/regen/videos"
+    envs_root: str = "./cache/regen/envs"
+    jobs_csv: str = "./cache/regen/jobs.csv"
+    ledger: str = "./cache/regen/ledger.jsonl"
+    manifest_out: str = "manifest_regen.csv"
+    job_timeout_s: int = 1800
+    fail_fast: int = 8
+    min_free_gb: float = 50.0
+    offline: bool = False                       # fail instead of building envs on the fly
+    deadline_hours: Optional[float] = None      # stop scheduling new groups after this long
+    retry_failed: bool = False
+    keep_old_edited: bool = False
+    only_models: List[str] = field(default_factory=list)      # restrict the run to these models
+    skip_models: List[str] = field(default_factory=list)
+    kinetics: KineticsConfig = field(default_factory=KineticsConfig)
+    push: GenerationPushConfig = field(default_factory=GenerationPushConfig)
+
+
+@dataclass
 class Config:
     run_name: str = "test"
     mode: str = "test"
@@ -137,6 +186,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     hub: HubConfig = field(default_factory=HubConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)

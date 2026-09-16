@@ -1,0 +1,44 @@
+# Wiring check for the regeneration pipeline: a tiny plan (200 videos) using only the two
+# cheapest tier-1 adapters, on one GPU. Verifies env building, the worker protocol, the ledger
+# and the manifest rebuild in ~30 minutes instead of days.
+#
+#   python main.py --config configs/regen_smoke.yaml --stage kinetics,generate,regen_manifest
+run_name: csf-regen-smoke
+mode: test
+seed: 42
+
+paths:
+  work_dir: ./runs/regen_smoke
+  cache_dir: ./cache/regen_smoke
+  video_dir: ./cache/regen_smoke/videos
+
+generation:
+  enabled: true
+  total_videos: 200
+  gpus: [2]
+  video_root: ./cache/regen_smoke/videos
+  envs_root: ./cache/regen/envs        # share the envs with the real run - they are expensive
+  jobs_csv: ./cache/regen_smoke/jobs.csv
+  ledger: ./cache/regen_smoke/ledger.jsonl
+  manifest_out: manifest_regen_smoke.csv
+  job_timeout_s: 900
+  fail_fast: 3
+  min_free_gb: 20.0
+  deadline_hours: 2.0
+  only_models: [inswapper, bg_real_composite]
+  kinetics:
+    max_shards: 3                      # a couple of shards is plenty for 200 videos
+    demand_margin: 1.0
+    score_workers: 8
+  push:
+    enabled: false
+
+data:
+  repo_id: madhav-yrc/Chrono-TriClass-100k
+  manifest: manifest.csv
+  max_rows: 2000
+  num_frames: 8
+  delete_videos_after_cache: false
+
+train:
+  num_workers: 4
