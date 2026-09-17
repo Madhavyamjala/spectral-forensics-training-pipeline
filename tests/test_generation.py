@@ -697,12 +697,85 @@ def test_ffmpeg_resolution() -> None:
     check("workers honour CSF_FFMPEG", "CSF_FFMPEG" in common)
 
 
+#: What each renderer dereferences from its job payload. Kept next to the tests rather than in
+#: the registry because it is an assertion about the workers, not configuration: a worker that
+#: needs an input the planner never binds fails on every single job, and only at render time.
+WORKER_REQUIREMENTS = {
+    "inswapper": ["driving_path"],            # identity donor
+    "reface": ["driving_path"],
+    "dreamid_v": ["driving_path"],
+    "fomm": ["driving_path"],                 # driving motion
+    "tpsmm": ["driving_path"],
+    "wav2lip": ["audio_path"],                # speech donor
+    "latentsync": ["audio_path"],
+    "musetalk": ["audio_path"],
+    "sadtalker": ["audio_path"],
+    "bg_real_composite": ["driving_path"],    # the background plate
+    "bg_flux_image": ["prompt"],
+    "bg_svd_video": ["prompt"],
+    "tokenflow": ["prompt"],
+    "styleganex": ["variant"],
+    "liveportrait_expr": ["variant"],
+    "propainter_inpaint": ["mask_size", "mask_motion"],
+    "e2fgvi_hq": ["mask_size", "mask_motion"],
+    "sttn": ["mask_size", "mask_motion"],
+    "fuseformer": ["mask_size", "mask_motion"],
+}
+#: Slots whose renderer needs a *second* clip, which must differ from the target.
+DISTINCT_SECOND_CLIP = {
+    "driving_path": ["inswapper", "reface", "dreamid_v", "fomm", "tpsmm", "bg_real_composite"],
+    "audio_path": ["wav2lip", "latentsync", "musetalk", "sadtalker"],
+}
+
+
+def test_worker_inputs() -> None:
+    """Every wired renderer must actually receive what it dereferences."""
+    print("worker inputs")
+    allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+    jobs = build_jobs(synthetic_pool(per_label=400), seed=42, allowed_models=allowed)
+
+    by_renderer = defaultdict(list)
+    for job in jobs:
+        by_renderer[ADAPTERS[job.model].runs].append(job)
+
+    for renderer, fields in sorted(WORKER_REQUIREMENTS.items()):
+        rows = by_renderer.get(renderer)
+        if not rows:
+            continue
+        for field in fields:
+            missing = [j.video_id for j in rows if not getattr(j, field, "")]
+            check(f"{renderer} always receives {field}", not missing,
+                  f"{len(missing)}/{len(rows)} jobs missing it, e.g. {missing[:2]}")
+
+    for field, renderers in DISTINCT_SECOND_CLIP.items():
+        key = "driving_clip_id" if field == "driving_path" else "audio_clip_id"
+        for renderer in renderers:
+            rows = by_renderer.get(renderer)
+            if not rows:
+                continue
+            same = [j.video_id for j in rows if getattr(j, key) == j.source_clip_id]
+            check(f"{renderer}'s second clip differs from the target", not same,
+                  f"{len(same)} jobs reuse the source, e.g. {same[:2]}")
+
+    # the generative background pipelines must not be handed a plate they would ignore
+    for renderer in ("bg_flux_image", "bg_svd_video", "bg_propainter_recon"):
+        rows = by_renderer.get(renderer, [])
+        check(f"{renderer} is not given a redundant background plate",
+              not [j for j in rows if j.driving_path])
+
+    covered = set(WORKER_REQUIREMENTS) | {"propainter_object", "bg_propainter_recon",
+                                          "diffueraser", "vace", "liveportrait"}
+    unchecked = {ADAPTERS[k].runs for k in allowed} - covered
+    check("every wired renderer is accounted for", not unchecked, str(sorted(unchecked)))
+    print(f"       {len(by_renderer)} renderers, {len(jobs):,} jobs checked")
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
-               test_ffmpeg_resolution):
+               test_ffmpeg_resolution, test_worker_inputs):
         fn()
     print()
     if FAILURES:
