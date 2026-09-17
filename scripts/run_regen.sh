@@ -11,6 +11,11 @@
 #   bash scripts/run_regen.sh --push      replace the AI-Edited class on the Hub (destructive)
 #   bash scripts/run_regen.sh --all       kinetics + generate + manifest + train
 #
+# Inspection (no side effects):
+#   bash scripts/run_regen.sh --plan      the 33,333-video allocation
+#   bash scripts/run_regen.sh --adapters  per-model status: slot, renderer, videos, GPU-hours
+#   bash scripts/run_regen.sh --budget 84 which models fit in 84 h on 3 GPUs
+#
 # Any extra arguments are passed through to main.py, e.g.
 #   bash scripts/run_regen.sh --generate --set generation.only_models='[inswapper]'
 set -euo pipefail
@@ -46,6 +51,10 @@ case "$PHASE" in
     ;;
   --plan)     exec "$PY" -m csf.generation.spec ;;
   --adapters) exec "$PY" -m csf.generation.adapters ;;
+  --budget)
+    HOURS="${1:-84}"
+    exec "$PY" -m csf.generation.budget --hours "$HOURS" --gpus 3
+    ;;
   --kinetics) gen_stage kinetics "$@" ;;
   --generate) gen_stage generate "$@" ;;
   --manifest) gen_stage regen_manifest "$@" ;;

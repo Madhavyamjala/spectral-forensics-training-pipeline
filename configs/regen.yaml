@@ -37,11 +37,22 @@ generation:
   fail_fast: 8                 # abandon a model group after 8 consecutive failures
   min_free_gb: 100.0
   offline: false               # build the per-model venvs on demand (node has internet)
-  deadline_hours: 84.0         # 3.5 days; leaves the rest of the week for training
+  deadline_hours: 90.0         # hard stop; the budget planner below should bite first
   retry_failed: false
   keep_old_edited: false       # the old 31,128 ai_edited rows are dropped
   only_models: []              # e.g. [inswapper, wav2lip] to run a subset
   skip_models: []
+  # Running every wired model costs ~523 GPU-hours (7.3 days on 3 GPUs), which does not leave
+  # room for training inside a week. The planner picks the model set up front instead: it keeps
+  # at least `budget_diversity_floor` distinct renderers per family, then spends the rest on
+  # volume. Set to null to run everything and take the extra days.
+  #   python -m csf.generation.budget --hours 84 --gpus 3      # preview the selection
+  budget_wall_clock_hours: 84.0
+  budget_diversity_floor: 2
+  budget_pin_models: []        # e.g. [tokenflow] to force a model in regardless of cost
+  # REFace (the FaceShifter substitute) is trained on CelebAMask-HQ: NON-COMMERCIAL RESEARCH
+  # ONLY, and generated videos inherit that. Leave false to skip it entirely.
+  accept_noncommercial: false
   kinetics:
     local_root: null           # set this if Kinetics-400 is already extracted on the cluster
     mirror_base: https://s3.amazonaws.com/kinetics/400

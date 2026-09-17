@@ -80,6 +80,7 @@ its `generator_edit_method` values as `"unknown"`).
 ```bash
 python -m csf.generation.spec          # the full allocation plan, self-checked
 python -m csf.generation.adapters      # per-model status: which are wired, which are not
+bash scripts/run_regen.sh --budget 84   # which models fit the time you have
 bash scripts/run_regen.sh --envs       # build the per-model environments
 bash scripts/run_regen.sh --kinetics   # acquire + qualify the source clips
 bash scripts/run_regen.sh --generate   # render on GPUs 2/3/4
@@ -87,9 +88,22 @@ bash scripts/run_regen.sh --manifest   # rebuild manifest.csv around what was pr
 bash scripts/run_regen.sh --train      # train on the new dataset
 ```
 
-13 of the 32 models are wired end to end today (11,688 videos, 35%); the rest are registered but
-refuse their jobs rather than emitting placeholder video. Full runbook, coverage table, timings
-and troubleshooting: **[docs/REGENERATION.md](docs/REGENERATION.md)**.
+**26,828 of 33,333 videos (80.5%) are covered by 23 distinct renderers.** Where the document
+names a model with no runnable public release, a substitute fills the slot (VideoReTalking →
+LatentSync 1.6, SimSwap → DreamID-V, AnyV2V/VideoComposer/InsV2V → VACE, and others) — and the
+manifest records the model that *actually rendered* each video in `model`, keeping the document's
+slot in `spec_model`, so the per-method breakdown never attributes one model's artifacts to
+another. Six slots are left as honest gaps rather than filled with a duplicate mechanism.
+
+Running everything wired costs ~523 GPU-hours (7.3 days on 3 GPUs), so the model set is chosen up
+front to fit a wall-clock budget, keeping at least two distinct renderers per family:
+
+```bash
+bash scripts/run_regen.sh --budget 84     # 18 models, 18,941 videos, 240 GPU-h
+```
+
+Full runbook, substitution table with metrics, licence warnings and troubleshooting:
+**[docs/REGENERATION.md](docs/REGENERATION.md)**.
 
 ## 1. Setup
 

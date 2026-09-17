@@ -23,7 +23,7 @@ from csf.generation.adapters.base import Adapter, AdapterError, NotImplementedAd
 from csf.generation.envs import EnvSpec, GitRepo, WeightFile
 
 __all__ = ["ADAPTERS", "ENVS", "Adapter", "AdapterError", "NotImplementedAdapter", "WorkerPool",
-           "env_specs", "adapter_for", "coverage"]
+           "env_specs", "adapter_for", "coverage", "cost_estimate", "videos_per_model"]
 
 # --------------------------------------------------------------------------------------
 # environments
@@ -124,6 +124,149 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
     ),
 
+    # --- LatentSync 1.6: audio-conditioned latent diffusion lip-sync ---------------------
+    "latentsync": EnvSpec(
+        name="latentsync",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.32", "transformers>=4.44", "accelerate", "safetensors",
+                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
+                      "decord", "mediapipe", "tqdm"),
+        repos=(GitRepo("https://github.com/bytedance/LatentSync.git", name="LatentSync"),),
+        weights=(WeightFile(dest="repos/LatentSync/checkpoints/latentsync_unet.pt",
+                            hf_repo="ByteDance/LatentSync-1.6", hf_file="latentsync_unet.pt"),
+                 WeightFile(dest="repos/LatentSync/checkpoints/whisper/tiny.pt",
+                            hf_repo="ByteDance/LatentSync-1.6", hf_file="whisper/tiny.pt")),
+        note="Apache-2.0. Stands in for VideoReTalking, which it beats on every reported metric.",
+    ),
+
+    # --- MuseTalk 1.5: latent-space audio-conditioned inpainting -------------------------
+    "musetalk": EnvSpec(
+        name="musetalk",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.30", "transformers>=4.44", "accelerate",
+                      "opencv-python-headless", "numpy<2", "librosa==0.10.2",
+                      "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
+        repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
+        weights=(
+            WeightFile(dest="repos/MuseTalk/models/musetalkV15/unet.pth",
+                       hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/unet.pth"),
+            WeightFile(dest="repos/MuseTalk/models/musetalkV15/musetalk.json",
+                       hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/musetalk.json"),
+            WeightFile(dest="repos/MuseTalk/models/sd-vae/diffusion_pytorch_model.bin",
+                       hf_repo="stabilityai/sd-vae-ft-mse",
+                       hf_file="diffusion_pytorch_model.bin"),
+            WeightFile(dest="repos/MuseTalk/models/sd-vae/config.json",
+                       hf_repo="stabilityai/sd-vae-ft-mse", hf_file="config.json"),
+            WeightFile(dest="repos/MuseTalk/models/whisper/tiny.pt",
+                       hf_repo="openai/whisper-tiny", hf_file="pytorch_model.bin"),
+            WeightFile(dest="repos/MuseTalk/models/dwpose/dw-ll_ucoco_384.pth",
+                       hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.pth"),
+        ),
+        note="MIT, commercial use allowed. face-parse-bisent is Drive-hosted upstream; the "
+             "worker degrades to MuseTalk's own bbox path when it is absent.",
+    ),
+
+    # --- SadTalker: audio -> 3DMM coefficients -> neural rendering -----------------------
+    "sadtalker": EnvSpec(
+        name="sadtalker",
+        torch=TORCH_CU121,
+        requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]",
+                      "scipy", "yacs", "pydub", "kornia", "face-alignment", "safetensors",
+                      "basicsr", "facexlib", "gfpgan", "tqdm"),
+        repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),),
+        post_install=(("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
+                             "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),),
+        note="Apache-2.0 (non-commercial restriction was removed upstream). Its own "
+             "download_models.sh pulls every checkpoint from GitHub Releases.",
+    ),
+
+    # --- LivePortrait: implicit-keypoint animation + stitching/retargeting ---------------
+    "liveportrait": EnvSpec(
+        name="liveportrait",
+        torch=TORCH_CU121,
+        requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
+                      "onnxruntime-gpu==1.18.1", "rich", "pyyaml", "albumentations", "tqdm"),
+        repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
+        post_install=(("-c", "import subprocess,os;r=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','LivePortrait');"
+                             "subprocess.run(['huggingface-cli','download','KlingTeam/LivePortrait',"
+                             "'--local-dir','pretrained_weights'],cwd=r,check=True)"),),
+        note="Drives both reenactment (v2v) and expression editing (retargeting ratios).",
+    ),
+
+    # --- VACE (Wan2.1): all-in-one masked video editing ---------------------------------
+    "vace": EnvSpec(
+        name="vace",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.31", "transformers>=4.49", "accelerate", "safetensors",
+                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
+        repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
+        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
+                             "'Wan-AI/Wan2.1-VACE-1.3B','--local-dir',"
+                             "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','Wan2.1-VACE-1.3B')],check=True)"),),
+        note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
+             "prompt-driven V2V, so it fills several slots the document's models cannot.",
+    ),
+
+    # --- DiffuEraser: diffusion video object removal --------------------------------------
+    "diffueraser": EnvSpec(
+        name="diffueraser",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
+                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
+                      "scipy", "tqdm"),
+        repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
+        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
+                             "'lixiaowen/diffuEraser','--local-dir',"
+                             "os.path.join(os.environ['CSF_ENV_ROOT'],'repos','DiffuEraser','weights','diffuEraser')],check=True)"),),
+        note="Apache-2.0. Diffusion removal - a different artifact class from ProPainter's "
+             "flow propagation, which is why it is worth a slot of its own.",
+    ),
+
+    # --- DreamID-V: DiT video face swapping ----------------------------------------------
+    "dreamid": EnvSpec(
+        name="dreamid",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.31", "transformers>=4.49", "accelerate", "safetensors",
+                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      "insightface==0.7.3", "onnxruntime-gpu==1.18.1", "easydict", "ftfy", "tqdm"),
+        repos=(GitRepo("https://github.com/bytedance/DreamID-V.git", name="DreamID-V"),),
+        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
+                             "'XuGuo699/DreamID-V','--local-dir',"
+                             "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','DreamID-V')],check=True)"),),
+        note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
+             "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
+    ),
+
+    # --- REFace: diffusion face swapping --------------------------------------------------
+    "reface": EnvSpec(
+        name="reface",
+        torch=TORCH_CU121,
+        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
+                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      "omegaconf", "pytorch-lightning", "kornia", "insightface==0.7.3",
+                      "onnxruntime-gpu==1.18.1", "tqdm"),
+        repos=(GitRepo("https://github.com/Sanoojan/REFace.git", name="REFace"),),
+        weights=(WeightFile(dest="repos/REFace/checkpoints/last.ckpt",
+                            hf_repo="Sanoojan/REFace", hf_file="last.ckpt"),),
+        note="LICENCE WARNING: MIT code, but trained on CelebAMask-HQ, which restricts use to "
+             "NON-COMMERCIAL RESEARCH. Skip this adapter if the dataset may ever ship "
+             "commercially: --set generation.skip_models='[faceshifter]'",
+    ),
+
+    # --- Thin-Plate-Spline Motion Model: reenactment ---------------------------------------
+    "tpsmm": EnvSpec(
+        name="tpsmm",
+        torch=TORCH_CU121,
+        requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
+                      "pyyaml", "scipy", "matplotlib", "tqdm"),
+        repos=(GitRepo("https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model.git",
+                       name="TPSMM"),),
+        note="MIT. Checkpoints are Tsinghua-Cloud/Drive hosted upstream - stage "
+             "repos/TPSMM/checkpoints/vox.pth.tar manually (see docs/REGENERATION.md).",
+    ),
+
     # --- tier-2 environments (declared, adapters not wired) -------------------------------
     "simswap": EnvSpec(
         name="simswap", torch=TORCH_LEGACY, torch_index=LEGACY_INDEX,
@@ -183,85 +326,121 @@ ENVS: Dict[str, EnvSpec] = {
 # --------------------------------------------------------------------------------------
 
 def _a(key: str, family: str, env: str, worker: str, *, tier: int = 1, implemented: bool = True,
-       note: str = "", **options) -> Adapter:
+       actual_model: str = "", cost_s: float = 60.0, note: str = "", **options) -> Adapter:
     return Adapter(key=key, family=family, env_name=env, worker=worker, implemented=implemented,
-                   tier=tier, options=options, note=note)
+                   tier=tier, actual_model=actual_model, cost_s=cost_s, options=options, note=note)
 
 
+#: Slots the specification names but that have no runnable public release. Each is filled by a
+#: substitute recorded in the manifest under its own name (see `Adapter.actual_model`), or left
+#: unwired where every candidate would merely duplicate a mechanism already present - a second
+#: slot rendered by an identical model adds videos but no new artifact class, and the per-method
+#: breakdown would be reporting one fingerprint under two names.
 ADAPTERS: Dict[str, Adapter] = {a.key: a for a in [
     # ---- background manipulation (3,000) ----
     _a("bg_real_composite", "background_manipulation", "sam2_diffusers", "worker_background.py",
-       mode="real_composite"),
+       cost_s=25.0, mode="real_composite"),
     _a("bg_flux_image", "background_manipulation", "sam2_diffusers", "worker_background.py",
-       mode="flux_image", flux_id="black-forest-labs/FLUX.1-schnell", steps=4),
+       cost_s=45.0, mode="flux_image", flux_id="black-forest-labs/FLUX.1-schnell", steps=4),
     _a("bg_svd_video", "background_manipulation", "sam2_diffusers", "worker_background.py",
-       mode="svd_video", svd_id="stabilityai/stable-video-diffusion-img2vid-xt", steps=25),
+       cost_s=120.0, mode="svd_video", svd_id="stabilityai/stable-video-diffusion-img2vid-xt",
+       steps=25),
     _a("bg_propainter_recon", "background_manipulation", "propainter", "worker_propainter.py",
-       mode="background_reconstruct"),
+       cost_s=70.0, mode="background_reconstruct"),
 
     # ---- face swap (6,250) ----
-    _a("inswapper", "face_swap", "insightface", "worker_inswapper.py"),
-    _a("simswap", "face_swap", "simswap", "worker_unimplemented.py", tier=2, implemented=False,
-       note="Upstream weights are Google-Drive hosted; no unattended download path."),
-    _a("faceshifter", "face_swap", "faceshifter", "worker_unimplemented.py", tier=2, implemented=False,
-       note="Public repo ships training code only - no released inference checkpoint."),
-    _a("face_transformer", "face_swap", "faceshifter", "worker_unimplemented.py", tier=2,
-       implemented=False, note="No maintained public inference release."),
+    _a("inswapper", "face_swap", "insightface", "worker_inswapper.py", cost_s=8.0),
+    _a("simswap", "face_swap", "dreamid", "worker_dreamid.py", actual_model="dreamid_v",
+       cost_s=150.0,
+       note="SimSwap's weights are Drive-only. DreamID-V stands in: same identity-injection "
+            "role, DiT instead of GAN, 99.9% vs 95.24% ID retrieval."),
+    _a("faceshifter", "face_swap", "reface", "worker_reface.py", actual_model="reface",
+       cost_s=20.0,
+       note="FaceShifter released no inference checkpoint. REFace stands in (diffusion "
+            "swap). NON-COMMERCIAL training data - see the env note."),
+    _a("face_transformer", "face_swap", "reface", "worker_unimplemented.py", tier=2,
+       implemented=False,
+       note="No maintained public release, and every candidate substitute duplicates a "
+            "mechanism already covered by inswapper/DreamID-V/REFace."),
 
     # ---- facial reenactment (5,250) ----
-    _a("fomm", "facial_reenactment", "fomm", "worker_fomm.py"),
-    _a("face2face", "facial_reenactment", "pirenderer", "worker_unimplemented.py", tier=2,
-       implemented=False, note="Original Face2Face is not publicly released."),
-    _a("pirenderer", "facial_reenactment", "pirenderer", "worker_unimplemented.py", tier=2,
-       implemented=False, note="Checkpoints are Google-Drive hosted upstream."),
-    _a("face2face_rho", "facial_reenactment", "pirenderer", "worker_unimplemented.py", tier=2,
-       implemented=False, note="No unattended weight download path."),
+    _a("fomm", "facial_reenactment", "fomm", "worker_fomm.py", cost_s=25.0),
+    _a("face2face", "facial_reenactment", "liveportrait", "worker_liveportrait.py",
+       actual_model="liveportrait", cost_s=20.0, mode="reenact",
+       note="Face2Face was never publicly released. LivePortrait stands in: implicit-keypoint "
+            "animation with stitching/retargeting, distinct from FOMM's local affine warping."),
+    _a("pirenderer", "facial_reenactment", "tpsmm", "worker_tpsmm.py", actual_model="tpsmm",
+       cost_s=20.0,
+       note="PIRenderer's checkpoints are Drive-hosted. TPSMM stands in - thin-plate-spline "
+            "warping, a different basis from FOMM. Its checkpoint also needs staging."),
+    _a("face2face_rho", "facial_reenactment", "tpsmm", "worker_unimplemented.py", tier=2,
+       implemented=False,
+       note="No unattended weight path, and the available substitutes are already used by the "
+            "face2face and pirenderer slots."),
 
-    # ---- lip-sync (5,250) ----
-    _a("wav2lip", "lip_sync", "wav2lip", "worker_wav2lip.py"),
-    _a("musetalk", "lip_sync", "musetalk", "worker_unimplemented.py", tier=2, implemented=False,
-       note="Needs MuseTalk + whisper + dwpose weights staged manually."),
-    _a("videoretalking", "lip_sync", "sadtalker", "worker_unimplemented.py", tier=2, implemented=False,
-       note="Checkpoint bundle is Google-Drive hosted upstream."),
-    _a("sadtalker", "lip_sync", "sadtalker", "worker_unimplemented.py", tier=2, implemented=False,
-       note="Checkpoint bundle is Google-Drive hosted upstream."),
+    # ---- lip-sync (5,250) - fully covered ----
+    _a("wav2lip", "lip_sync", "wav2lip", "worker_wav2lip.py", cost_s=30.0),
+    _a("musetalk", "lip_sync", "musetalk", "worker_musetalk.py", cost_s=25.0,
+       note="Genuinely available: download script pulls every component from the Hub."),
+    _a("videoretalking", "lip_sync", "latentsync", "worker_latentsync.py",
+       actual_model="latentsync", cost_s=60.0,
+       note="VideoReTalking's bundle is Drive-hosted. LatentSync 1.6 stands in and beats it on "
+            "every reported metric (HDTF FID 7.03 vs 9.5, SyncConf 8.9 vs 7.5, FVD 193 vs 271)."),
+    _a("sadtalker", "lip_sync", "sadtalker", "worker_sadtalker.py", cost_s=90.0,
+       note="Genuinely available: Apache-2.0, download_models.sh pulls from GitHub Releases."),
 
     # ---- expression / attribute editing (4,750) ----
-    _a("ganimation", "expression_attribute_editing", "ganimation", "worker_unimplemented.py",
-       tier=2, implemented=False, note="2018 repo, unmaintained; weights not published."),
+    _a("ganimation", "expression_attribute_editing", "liveportrait", "worker_liveportrait.py",
+       actual_model="liveportrait_expr", cost_s=20.0, mode="expression",
+       note="GANimation published no weights. LivePortrait's retargeting ratios give the same "
+            "continuous expression-magnitude control the slot calls for."),
     _a("styleganex", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
        tier=2, implemented=False, note="Needs StyleGANEX + pSp weights staged manually."),
     _a("latent_transformer", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
-       tier=2, implemented=False),
+       tier=2, implemented=False, note="No unattended weight path."),
     _a("vq_facial_editing", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
-       tier=2, implemented=False, note="No public release."),
+       tier=2, implemented=False, note="Never publicly released."),
 
-    # ---- object insertion / removal (3,500) ----
+    # ---- object insertion / removal (3,500) - fully covered ----
     _a("propainter_object", "object_insertion_removal", "propainter", "worker_propainter.py",
-       mode="object"),
-    _a("object_wiper", "object_insertion_removal", "videocomposer", "worker_unimplemented.py",
-       tier=2, implemented=False, note="No public code release."),
-    _a("anyv2v_object", "object_insertion_removal", "anyv2v", "worker_unimplemented.py",
-       tier=2, implemented=False, note="Needs an I2V backbone + per-frame editor staged."),
-    _a("videocomposer", "object_insertion_removal", "videocomposer", "worker_unimplemented.py",
-       tier=2, implemented=False, note="Weights require a manual request upstream."),
+       cost_s=70.0, mode="object"),
+    _a("object_wiper", "object_insertion_removal", "diffueraser", "worker_diffueraser.py",
+       actual_model="diffueraser", cost_s=120.0,
+       note="Object-WIPER has no public code. DiffuEraser stands in: diffusion removal, a "
+            "different artifact class from ProPainter's flow propagation."),
+    _a("anyv2v_object", "object_insertion_removal", "vace", "worker_vace.py",
+       actual_model="vace", cost_s=180.0, task="inpainting",
+       note="AnyV2V needs an I2V backbone staged. VACE stands in for mask-guided insertion."),
+    _a("videocomposer", "object_insertion_removal", "vace", "worker_vace.py",
+       actual_model="vace", cost_s=180.0, task="inpainting",
+       note="VideoComposer's weights need a manual request. VACE's reference-guided masked "
+            "editing covers the same conditioning."),
 
-    # ---- video inpainting (3,000) ----
+    # ---- video inpainting (3,000) - fully covered ----
     _a("propainter_inpaint", "video_inpainting", "propainter", "worker_propainter.py",
-       mode="inpaint"),
-    _a("e2fgvi_hq", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", model="e2fgvi_hq"),
-    _a("sttn", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", model="sttn"),
-    _a("fuseformer", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", model="fuseformer"),
+       cost_s=70.0, mode="inpaint"),
+    _a("e2fgvi_hq", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=45.0,
+       model="e2fgvi_hq"),
+    _a("sttn", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=35.0,
+       model="sttn"),
+    _a("fuseformer", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=40.0,
+       model="fuseformer"),
 
     # ---- video-to-video (2,333) ----
-    _a("tokenflow", "video_to_video", "tokenflow", "worker_tokenflow.py",
+    _a("tokenflow", "video_to_video", "tokenflow", "worker_tokenflow.py", cost_s=240.0,
        sd_id="stabilityai/stable-diffusion-2-1-base", steps=50),
-    _a("insv2v", "video_to_video", "tokenflow", "worker_unimplemented.py", tier=2, implemented=False,
-       note="InsV2V weights are Google-Drive hosted upstream."),
-    _a("anyv2v_style", "video_to_video", "anyv2v", "worker_unimplemented.py", tier=2,
-       implemented=False),
-    _a("vid2vid", "video_to_video", "vid2vid", "worker_unimplemented.py", tier=2, implemented=False,
-       note="NVIDIA vid2vid needs per-dataset training; no general pretrained release."),
+    _a("insv2v", "video_to_video", "vace", "worker_vace.py", actual_model="vace", cost_s=180.0,
+       task="depth",
+       note="InsV2V's weights are Drive-hosted. VACE stands in for prompt-driven whole-frame "
+            "transformation."),
+    _a("anyv2v_style", "video_to_video", "vace", "worker_vace.py", actual_model="vace",
+       cost_s=180.0, task="depth",
+       note="Same substitution as the object slot; recorded as vace in the manifest."),
+    _a("vid2vid", "video_to_video", "vid2vid", "worker_unimplemented.py", tier=2,
+       implemented=False,
+       note="NVIDIA vid2vid needs per-dataset training and has no general pretrained release. "
+            "Left as an honest gap: every substitute would be another diffusion model, and the "
+            "slot exists precisely to contribute a non-diffusion GAN artifact class."),
 ]}
 
 
@@ -282,38 +461,81 @@ def env_specs() -> Dict[str, EnvSpec]:
     return {name: ENVS[name] for name in sorted(used)}
 
 
-def coverage(targets: Dict[str, int] | None = None) -> Dict[str, object]:
-    """How many of the planned videos are covered by tier-1 (wired) adapters."""
+def videos_per_model(targets: Dict[str, int] | None = None) -> Dict[str, int]:
+    """Planned video count per specification slot."""
     targets = targets or S.FAMILY_TARGETS
-    per_model: Dict[str, int] = {}
+    out: Dict[str, int] = {}
     for family in S.FAMILY_LIST:
         _, cols, _ = S.family_matrix(family, targets[family.key])
         for pipe, n in zip(family.pipelines, cols):
-            per_model[pipe.key] = n
+            out[pipe.key] = n
+    return out
+
+
+def coverage(targets: Dict[str, int] | None = None) -> Dict[str, object]:
+    """How many of the planned videos are covered by wired adapters."""
+    per_model = videos_per_model(targets)
     wired = {k: v for k, v in per_model.items() if ADAPTERS[k].implemented}
     pending = {k: v for k, v in per_model.items() if not ADAPTERS[k].implemented}
+    substituted = {k: v for k, v in wired.items() if ADAPTERS[k].substituted}
     total = sum(per_model.values())
+
+    # what the manifest will actually report, grouped by the model that renders
+    by_actual: Dict[str, int] = {}
+    for key, n in wired.items():
+        by_actual[ADAPTERS[key].runs] = by_actual.get(ADAPTERS[key].runs, 0) + n
+
     return {"total_videos": total, "videos_wired": sum(wired.values()),
             "videos_pending": sum(pending.values()),
+            "videos_substituted": sum(substituted.values()),
             "fraction_wired": round(sum(wired.values()) / total, 4) if total else 0.0,
+            "distinct_actual_models": len(by_actual),
+            "videos_by_actual_model": dict(sorted(by_actual.items(), key=lambda kv: -kv[1])),
             "wired_models": dict(sorted(wired.items(), key=lambda kv: -kv[1])),
             "pending_models": dict(sorted(pending.items(), key=lambda kv: -kv[1]))}
 
 
+def cost_estimate(targets: Dict[str, int] | None = None, gpus: int = 3) -> Dict[str, object]:
+    """Estimated GPU-hours for the wired adapters, and wall clock on `gpus` GPUs."""
+    per_model = videos_per_model(targets)
+    per: Dict[str, float] = {}
+    for key, n in per_model.items():
+        a = ADAPTERS[key]
+        if a.implemented:
+            per[key] = n * a.cost_s / 3600.0
+    total = sum(per.values())
+    return {"gpu_hours_total": round(total, 1),
+            "wall_clock_hours": round(total / max(1, gpus), 1),
+            "per_model_gpu_hours": dict(sorted(per.items(), key=lambda kv: -kv[1]))}
+
+
 def _main() -> None:
     cov = coverage()
-    print(f"{'model':<24}{'family':<32}{'env':<16}{'tier':>5}{'videos':>9}  worker")
+    per_model = videos_per_model()
+    print(f"{'slot':<22}{'runs as':<18}{'family':<30}{'env':<15}{'videos':>8}{'GPU-h':>8}")
+    print("-" * 101)
     for family in S.FAMILY_LIST:
-        _, cols, _ = S.family_matrix(family, S.FAMILY_TARGETS[family.key])
-        for pipe, n in zip(family.pipelines, cols):
+        for pipe in family.pipelines:
             a = ADAPTERS[pipe.key]
+            n = per_model[pipe.key]
             mark = " " if a.implemented else "*"
-            print(f"{mark}{a.key:<23}{family.key:<32}{a.env_name:<16}{a.tier:>5}{n:>9}  {a.worker}")
-    print(f"\n* = registered but not wired to a runnable public release")
-    print(f"tier-1 coverage: {cov['videos_wired']:,}/{cov['total_videos']:,} videos "
-          f"({cov['fraction_wired']:.1%}) across "
-          f"{sum(1 for a in ADAPTERS.values() if a.implemented)} of {len(ADAPTERS)} models")
-    print(f"environments: {len(env_specs())}")
+            runs = "-" if not a.implemented else (a.runs if a.substituted else "(itself)")
+            hours = n * a.cost_s / 3600.0 if a.implemented else 0.0
+            print(f"{mark}{a.key:<21}{runs:<18}{family.key:<30}{a.env_name:<15}"
+                  f"{n:>8}{hours:>8.1f}")
+    print("-" * 101)
+    print("* = no runnable public release and no non-duplicating substitute\n")
+    print(f"coverage      : {cov['videos_wired']:,}/{cov['total_videos']:,} videos "
+          f"({cov['fraction_wired']:.1%}) | {cov['videos_substituted']:,} via substitution")
+    print(f"actual models : {cov['distinct_actual_models']} distinct renderers")
+    for name, n in cov["videos_by_actual_model"].items():
+        print(f"                  {name:<22}{n:>8}")
+    cost = cost_estimate(gpus=3)
+    print(f"\nestimated cost: {cost['gpu_hours_total']:,} GPU-hours "
+          f"({cost['wall_clock_hours']:,} h wall clock on 3 GPUs)")
+    for name, h in list(cost["per_model_gpu_hours"].items())[:6]:
+        print(f"                  {name:<22}{h:>8.1f} h")
+    print(f"\nenvironments  : {len(env_specs())}")
 
 
 if __name__ == "__main__":

@@ -214,8 +214,18 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
         else:
             raise EnvBuildError(f"Weight {weight.dest} for env {spec.name} has no url or hf_repo")
 
-    for cmd in spec.post_install:
-        _run([py, *cmd], cwd=root, what=f"post-install for {spec.name}", timeout=3600)
+    # post-install hooks (upstream downloaders, huggingface-cli pulls) locate the env through
+    # CSF_ENV_ROOT, which is otherwise only injected at worker launch - set it here too, and put
+    # the venv's bin dir first so `huggingface-cli` resolves to this env's copy.
+    if spec.post_install:
+        hook_env = os.environ.copy()
+        hook_env.update(spec.env_vars)
+        hook_env["CSF_ENV_ROOT"] = str(root)
+        hook_env["PATH"] = os.pathsep.join(
+            [str(py.parent), hook_env.get("PATH", "")]).rstrip(os.pathsep)
+        for cmd in spec.post_install:
+            _run([py, *cmd], cwd=root, env=hook_env,
+                 what=f"post-install for {spec.name}", timeout=7200)
 
     marker.write_text(json.dumps({"digest": want, "name": spec.name,
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),

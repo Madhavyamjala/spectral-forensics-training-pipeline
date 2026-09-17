@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -105,6 +106,34 @@ def _filter_models(jobs, only: Sequence[str], skip: Sequence[str]):
     return jobs
 
 
+def _apply_budget(cfg, jobs):
+    """Drop the model groups that do not fit `generation.budget_wall_clock_hours`.
+
+    Deciding here rather than letting `deadline_hours` truncate the run matters: a deadline stops
+    whichever group is in flight when it fires, so the dataset ends up shaped by scheduling
+    order. The planner instead keeps at least two distinct renderers per family and spends what
+    is left on volume, and says exactly what it dropped.
+    """
+    gen = cfg.generation
+    if not gen.budget_wall_clock_hours:
+        return jobs
+    from csf.generation.budget import family_breakdown, plan
+
+    budget = float(gen.budget_wall_clock_hours) * max(1, len(gen.gpus))
+    p = plan(budget, gpus=len(gen.gpus), targets=S.family_targets(gen.total_videos),
+             diversity_floor=gen.budget_diversity_floor, pinned=gen.budget_pin_models)
+    log.info("Budget planner: %s", json.dumps(p.to_dict()))
+    for fam, info in family_breakdown(p, S.family_targets(gen.total_videos)).items():
+        log.info("  %-32s %5d/%-5d videos | %d renderer(s): %s", fam, info["kept"],
+                 info["planned"], info["mechanisms"], ", ".join(info["models"]) or "-")
+    if p.skipped:
+        log.warning("Budget of %.0f h wall clock on %d GPU(s) does not fit every wired model; "
+                    "skipping %s. Raise generation.budget_wall_clock_hours (or set it to null) "
+                    "to run them.", gen.budget_wall_clock_hours, len(gen.gpus), p.skipped)
+    keep = set(p.selected)
+    return [j for j in jobs if j.model in keep]
+
+
 def plan_jobs(cfg, rebuild: bool = False):
     """Load the job plan, building it from the scored source pool the first time."""
     gen = cfg.generation
@@ -130,8 +159,17 @@ def stage_generate(cfg) -> Dict[str, object]:
 
     gen = cfg.generation
     jobs = _filter_models(plan_jobs(cfg), gen.only_models, gen.skip_models)
+    jobs = _apply_budget(cfg, jobs)
     if not jobs:
-        raise RuntimeError("No jobs to run after applying only_models / skip_models")
+        raise RuntimeError("No jobs to run after applying only_models / skip_models / budget")
+
+    # REFace's checkpoint carries a non-commercial-research restriction that the videos it
+    # produces inherit; its worker refuses to start unless this is acknowledged explicitly.
+    if gen.accept_noncommercial:
+        os.environ["CSF_ACCEPT_NONCOMMERCIAL"] = "1"
+        log.warning("generation.accept_noncommercial is set: adapters with non-commercial "
+                    "research-only weights (REFace) are enabled, and the videos they produce "
+                    "inherit that restriction.")
 
     root = _check_video_root(cfg)
     log_dir = Path(cfg.paths.work_dir) / "logs" / "generation"

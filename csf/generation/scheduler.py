@@ -44,15 +44,13 @@ from csf.logging_utils import get_logger
 
 log = get_logger("generation.scheduler")
 
-#: Rough seconds per video, used only to balance GPUs and to estimate the ETA. Measured
-#: throughput replaces these as soon as a model has produced a few videos.
-COST_HINTS: Dict[str, float] = {
-    "inswapper": 8.0, "bg_real_composite": 25.0, "bg_flux_image": 45.0, "bg_svd_video": 120.0,
-    "bg_propainter_recon": 70.0, "propainter_inpaint": 70.0, "propainter_object": 70.0,
-    "e2fgvi_hq": 45.0, "sttn": 35.0, "fuseformer": 40.0, "wav2lip": 30.0, "fomm": 25.0,
-    "tokenflow": 240.0,
-}
 DEFAULT_COST = 60.0
+
+
+def cost_of(model: str) -> float:
+    """Seconds per video for `model`, from its adapter. Used to balance GPUs and estimate ETA."""
+    a = ADAPTERS.get(model)
+    return a.cost_s if a is not None else DEFAULT_COST
 
 
 @dataclass
@@ -126,11 +124,11 @@ def balance(groups: Dict[str, List[Job]], gpus: Sequence[int]) -> Dict[int, List
     """Assign whole model groups to GPUs, greedily levelling estimated cost."""
     load = {g: 0.0 for g in gpus}
     plan: Dict[int, List[str]] = {g: [] for g in gpus}
-    ordered = sorted(groups, key=lambda m: -len(groups[m]) * COST_HINTS.get(m, DEFAULT_COST))
+    ordered = sorted(groups, key=lambda m: -len(groups[m]) * cost_of(m))
     for model in ordered:
         gpu = min(load, key=lambda g: load[g])
         plan[gpu].append(model)
-        load[gpu] += len(groups[model]) * COST_HINTS.get(model, DEFAULT_COST)
+        load[gpu] += len(groups[model]) * cost_of(model)
     for gpu in gpus:
         log.info("GPU %d: %d model group(s), %d video(s), est %.1f h", gpu, len(plan[gpu]),
                  sum(len(groups[m]) for m in plan[gpu]), load[gpu] / 3600.0)

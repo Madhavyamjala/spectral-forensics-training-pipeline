@@ -22,7 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from csf.generation import spec as S
-from csf.generation.adapters import ADAPTERS, coverage, env_specs
+from csf.generation.adapters import (ADAPTERS, coverage, cost_estimate, env_specs,
+                                     videos_per_model)
 from csf.generation.jobs import Job, build_jobs, object_operations, summarise
 
 FAILURES: list = []
@@ -198,8 +199,81 @@ def test_adapters() -> None:
           f"({cov['fraction_wired']:.1%})")
 
 
+def test_substitutions() -> None:
+    print("substitutions")
+    subs = {k: a for k, a in ADAPTERS.items() if a.substituted}
+    check("substitutes are all wired", all(a.implemented for a in subs.values()))
+    check("substitutes never claim their slot's name",
+          all(a.runs != a.key for a in subs.values()))
+    check("non-substitutes run as themselves",
+          all(a.runs == a.key for a in ADAPTERS.values() if not a.substituted))
+    check("every substitution carries an explanatory note",
+          all(a.note for a in subs.values()),
+          str([k for k, a in subs.items() if not a.note]))
+
+    # a family must never be rendered entirely by one model while looking like several
+    per_model = videos_per_model()
+    for family in S.FAMILY_LIST:
+        wired = [p.key for p in family.pipelines if ADAPTERS[p.key].implemented]
+        renderers = {ADAPTERS[k].runs for k in wired}
+        if wired:
+            check(f"{family.key} reports its true renderer count",
+                  len(renderers) >= 1 and len(renderers) <= len(wired))
+
+    # coverage bookkeeping must still add up with substitutions in play
+    cov = coverage()
+    check("coverage still accounts for every video",
+          cov["videos_wired"] + cov["videos_pending"] == 33333)
+    check("substituted videos are a subset of wired",
+          cov["videos_substituted"] <= cov["videos_wired"])
+    by_actual = sum(cov["videos_by_actual_model"].values())
+    check("per-renderer totals equal wired videos", by_actual == cov["videos_wired"],
+          f"{by_actual} != {cov['videos_wired']}")
+    print(f"       {cov['videos_wired']:,}/33,333 wired ({cov['fraction_wired']:.1%}), "
+          f"{cov['videos_substituted']:,} substituted, "
+          f"{cov['distinct_actual_models']} distinct renderers")
+
+
+def test_budget() -> None:
+    print("budget planner")
+    from csf.generation.budget import family_breakdown, plan
+
+    full = cost_estimate(gpus=3)
+    check("full cost is reported", full["gpu_hours_total"] > 0)
+
+    p = plan(84.0 * 3, gpus=3, diversity_floor=2)
+    check("plan stays inside its budget", p.gpu_hours_used <= 84.0 * 3,
+          f"{p.gpu_hours_used} > {84.0 * 3}")
+    check("plan selects something", p.videos > 0)
+    check("selected and skipped are disjoint",
+          not (set(p.selected) & set(p.skipped)))
+    check("selected + skipped covers every wired model",
+          set(p.selected) | set(p.skipped) ==
+          {k for k, a in ADAPTERS.items() if a.implemented})
+
+    fams = family_breakdown(p)
+    empty = [f for f, i in fams.items() if i["mechanisms"] == 0]
+    check("no family is left empty by the planner", not empty, str(empty))
+    # the floor counts distinct renderers, not slots - two VACE slots are one mechanism
+    for fam, info in fams.items():
+        check(f"{fam} renderer list has no duplicates",
+              len(info["models"]) == len(set(info["models"])))
+
+    # a bigger budget must never select fewer videos
+    small = plan(40.0 * 3, gpus=3)
+    big = plan(200.0 * 3, gpus=3)
+    check("more budget never yields fewer videos", big.videos >= small.videos,
+          f"{big.videos} < {small.videos}")
+    check("an unlimited budget selects every wired model",
+          set(plan(10_000.0, gpus=3).selected) ==
+          {k for k, a in ADAPTERS.items() if a.implemented})
+    print(f"       84 h x 3 GPUs -> {len(p.selected)} models, {p.videos:,} videos "
+          f"({p.coverage:.1%}), {p.gpu_hours_used:.0f} GPU-h")
+
+
 def main() -> int:
-    for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters):
+    for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
+               test_substitutions, test_budget):
         fn()
     print()
     if FAILURES:

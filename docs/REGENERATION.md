@@ -39,32 +39,97 @@ The document's hand-computed tables are reproduced exactly at the base targets �
 awkward ones (video-to-video 116/116/112/106, inpainting 180/150/130/140, and the object family's
 700/200, 900/0, 0/850, 150/700 removal-insertion split).
 
-## 2. Model coverage — read this before planning the week
+## 2. Model coverage and substitutions
 
-The 32 models are **not** equally available. Some have no public inference release at all, and
-several publish weights only through Google Drive, which cannot be fetched unattended.
+The 32 models the document names are not equally available. Several publish weights only through
+Google Drive (unfetchable unattended), some released training code with no inference checkpoint,
+and a few were never released at all.
+
+Where a named model cannot be run, a **substitute** fills the slot. The slot preserves the
+document's allocation - its source-content mix and per-family balance - while the manifest records
+the model that *actually rendered* the video:
+
+| column | meaning |
+|---|---|
+| `generator_edit_method`, `model` | the model that really ran (`latentsync`, `vace`, ...) |
+| `spec_model` | the document's slot it filled (`videoretalking`, `insv2v`, ...) |
+| `substituted` | whether those two differ |
+
+This separation is not cosmetic. Recording the slot name would attribute LatentSync's diffusion
+fingerprint to VideoReTalking, and the per-method accuracy breakdown - the thing this whole
+regeneration exists to enable - would report a model that never ran.
 
 ```bash
-python -m csf.generation.adapters      # per-model status, env and video count
+python -m csf.generation.adapters      # full table: slot, renderer, videos, GPU-hours
 ```
 
-Currently **13 of 32 models are wired end to end, covering 11,688 of the 33,333 videos (35%)**:
+**Coverage: 26,828 of 33,333 videos (80.5%) across 23 distinct renderers**, of which 12,515 are
+produced by a substitute.
 
-| Wired (tier 1) | Registered but not runnable (tier 2) |
-|---|---|
-| INSwapper, FOMM, Wav2Lip, TokenFlow, ProPainter (×3 roles), E²FGVI-HQ, STTN, FuseFormer, SAM2 composite, FLUX.1-schnell, SVD | SimSwap, FaceShifter, Face Transformer, Face2Face, PIRenderer, Face2Face-ρ, MuseTalk, VideoReTalking, SadTalker, GANimation, StyleGANEX, LatentTransformer, VQ editing, Object-WIPER, AnyV2V (×2), VideoComposer, InsV2V, vid2vid |
+### The substitutions
 
-A tier-2 model **refuses its jobs** rather than emitting a copied or lightly-perturbed source
-clip. That is deliberate: a placeholder video labelled AI-Edited would teach the detector that
-"AI-Edited" means "unchanged video", which is worse than having fewer rows. Failed jobs are
-recorded in the ledger and simply left out of the new manifest.
+| Slot | Why it cannot run | Substitute | Evidence |
+|---|---|---|---|
+| SimSwap | Drive-only weights | **DreamID-V** (Apache-2.0, Wan2.1 DiT) | 99.9% vs 95.24% ID retrieval |
+| FaceShifter | training code only | **REFace** (WACV'25) | ⚠ non-commercial data, see below |
+| VideoReTalking | Drive-only bundle | **LatentSync 1.6** (Apache-2.0) | HDTF FID 7.03 vs 9.5, SyncConf 8.9 vs 7.5, FVD 193 vs 271 |
+| Face2Face | never released | **LivePortrait** | implicit keypoints, distinct from FOMM's affine warping |
+| PIRenderer | Drive-only weights | **TPSMM** (MIT) | thin-plate-spline, a third motion basis |
+| GANimation | no weights published | **LivePortrait retargeting** | continuous expression magnitude, the AU-control analogue |
+| Object-WIPER | no public code | **DiffuEraser** (Apache-2.0) | diffusion removal vs ProPainter's flow propagation |
+| AnyV2V ×2, VideoComposer, InsV2V | Drive-only / manual request | **VACE Wan2.1-1.3B** (Apache-2.0) | masked V2V covers all four |
 
-Three tier-1 models (E²FGVI-HQ, STTN, FuseFormer) clone cleanly but need their checkpoints staged
-by hand — see §6.
+Two slots turned out to be **available after all** and are now wired as themselves, not
+substituted: **MuseTalk** (MIT, `download_weights.sh` pulls from the Hub) and **SadTalker**
+(Apache-2.0 since the non-commercial clause was dropped, `download_models.sh` pulls from GitHub
+Releases).
 
-**To promote a tier-2 model:** implement `csf/generation/adapters/workers/worker_<x>.py` against
-the protocol in `adapters/base.py`, point its `EnvSpec` at the repo and weights, and set
-`implemented=True` in the registry. Nothing else in the pipeline changes.
+### Still unwired (6,505 videos)
+
+`face_transformer`, `face2face_rho`, `styleganex`, `latent_transformer`, `vq_facial_editing`,
+`vid2vid`. These are left as honest gaps rather than filled, because every remaining candidate
+would duplicate a mechanism already in that family. A second slot rendered by an identical model
+adds rows but no new artifact class, and makes the per-method breakdown report one fingerprint
+under two names. `vid2vid` in particular exists to contribute a *non-diffusion GAN* artifact
+class, so substituting another diffusion model would defeat the slot's purpose.
+
+### ⚠ REFace licence
+
+REFace's code is MIT but its checkpoint is trained on CelebAMask-HQ, which permits
+**non-commercial research use only**, and generated videos inherit that. Its worker refuses to
+start unless you acknowledge this:
+
+```yaml
+generation:
+  accept_noncommercial: true      # enables REFace (1,563 videos)
+```
+
+Leave it `false` (the default) and the slot is simply skipped. Decide before generating, not
+after.
+
+## 2a. Fitting the run into a week
+
+Running every wired model costs **≈523 GPU-hours - about 7.3 days on three GPUs**, before any
+training. That does not fit a one-week end-to-end target, so the model set is chosen up front:
+
+```bash
+python -m csf.generation.budget --hours 84 --gpus 3       # preview
+```
+
+Selection is two-phase, because raw efficiency alone would spend everything on the cheap face
+models and leave video-to-video empty:
+
+1. **diversity floor** - guarantee at least `budget_diversity_floor` (default 2) *distinct
+   renderers* per family. Renderers, not slots: two VACE slots are one mechanism.
+2. **efficiency fill** - spend the rest on videos-per-GPU-hour.
+
+At 84 h × 3 GPUs this selects **18 models, 18,941 videos (56.8%), 240 GPU-hours**, with every
+family covered by at least two renderers except expression editing (which has only one wired
+model in total).
+
+This is preferred over relying on `deadline_hours`, which stops whichever group is in flight when
+it fires and so shapes the dataset by scheduling order. Set
+`generation.budget_wall_clock_hours: null` to run everything and accept the extra days.
 
 ## 3. Hardware assumptions
 
@@ -129,27 +194,35 @@ a model has produced a few videos:
 | Phase | Estimate |
 |---|---|
 | Kinetics download + scoring | 8–20 h (dominated by shard transfer) |
-| Environment builds | 1–2 h |
-| Generation, tier-1 models, 3 GPUs | ~59 GPU-hours wall clock (~2.5 days) |
+| Environment builds | 2–4 h (18 envs, several with their own torch build) |
+| Generation at the default 84 h budget | 240 GPU-h ≈ 80 h wall clock on 3 GPUs |
+| Generation, everything wired | 523 GPU-h ≈ 174 h ≈ 7.3 days |
 | Feature extraction (~100k videos) | 8–14 h |
 | Training + eval + export | 1.5–2.5 days |
 
-TokenFlow is the critical path at roughly 40 h on its own GPU (DDIM inversion of every frame);
-the balancer gives it a GPU to itself. If the week gets tight, drop it first:
-`--set generation.skip_models='[tokenflow]'`.
+The expensive models are DreamID-V (78 GPU-h), the four VACE slots (144 GPU-h combined) and
+TokenFlow (40 GPU-h) — all diffusion samplers. The budget planner drops them first; pin one back
+with `generation.budget_pin_models: [tokenflow]` if you would rather trade volume for that
+mechanism.
 
-`generation.deadline_hours` defaults to 84 (3.5 days) so generation always ends with a usable,
-manifest-able set of videos rather than being killed mid-write.
+`generation.deadline_hours` (90 h) remains as a hard backstop so generation always ends with a
+usable, manifest-able set of videos rather than being killed mid-write.
 
 ## 6. Staging the checkpoints that cannot be auto-fetched
 
-E²FGVI-HQ, STTN and FuseFormer publish weights via Google Drive. Put them here, then re-run:
+Four wired models publish weights via Google Drive / Tsinghua Cloud. Put them here, then re-run:
 
 ```
 cache/regen/envs/videoinpaint/repos/E2FGVI/release_model/E2FGVI-HQ-CVPR22.pth
 cache/regen/envs/videoinpaint/repos/STTN/checkpoints/sttn.pth
 cache/regen/envs/videoinpaint/repos/FuseFormer/checkpoints/fuseformer.pth
+cache/regen/envs/tpsmm/repos/TPSMM/checkpoints/vox.pth.tar
 ```
+
+Everything else fetches itself. Two adapters call an upstream downloader during the env build
+(SadTalker's `download_models.sh`, LivePortrait's `huggingface-cli download`); if those fail, the
+env build reports it and the worker names the exact missing path at load time rather than failing
+per job.
 
 Each worker checks for its checkpoint at load time and fails with the exact path it wants, so a
 missing file costs one log line, not a burned model group.

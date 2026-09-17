@@ -40,9 +40,9 @@ log = get_logger("generation.manifest")
 
 BASE_COLUMNS = ["class", "generator_edit_method", "video_id", "split", "duration_sec", "width",
                 "height", "fps", "codec", "bitrate", "has_audio", "sha256"]
-EXTRA_COLUMNS = ["family", "model", "source_clip_id", "source_label", "source_group", "variant",
-                 "operation", "mask_size", "mask_motion", "driving_clip_id", "audio_clip_id",
-                 "provenance"]
+EXTRA_COLUMNS = ["family", "model", "spec_model", "substituted", "source_clip_id", "source_label",
+                 "source_group", "variant", "operation", "mask_size", "mask_motion",
+                 "driving_clip_id", "audio_clip_id", "provenance"]
 ALL_COLUMNS = BASE_COLUMNS + EXTRA_COLUMNS
 
 
@@ -66,13 +66,29 @@ def read_ledger(path: Path) -> Dict[str, dict]:
 
 
 def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
+    """One manifest row.
+
+    `model` and `generator_edit_method` record the model that *actually rendered* the video,
+    which is not always the model the specification named for that slot - several of the
+    document's models have no runnable public release and a substitute stands in. `spec_model`
+    keeps the slot so the allocation stays auditable against the document.
+
+    Recording the slot name in `generator_edit_method` instead would attribute, say, LatentSync's
+    diffusion fingerprint to VideoReTalking, and the per-method accuracy breakdown in the
+    ablation report - the thing this whole regeneration exists to make possible - would be
+    reporting a model that never ran.
+    """
+    from csf.generation.adapters import ADAPTERS
+    adapter = ADAPTERS.get(job.model)
+    actual = adapter.runs if adapter is not None else job.model
+    substituted = bool(adapter is not None and adapter.substituted)
     probed = probe_video(path)
     if probed is None:
         log.debug("Generated file is unreadable, dropping from the manifest: %s", path)
         return None
     row: Dict[str, object] = {
         "class": "ai_edited",
-        "generator_edit_method": job.model,
+        "generator_edit_method": actual,
         "video_id": job.video_id,
         "split": job.split,
         "duration_sec": probed["duration_sec"],
@@ -84,7 +100,9 @@ def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
         "has_audio": probed["has_audio"],
         "sha256": sha256_file(path),
         "family": job.family,
-        "model": job.model,
+        "model": actual,
+        "spec_model": job.model,
+        "substituted": substituted,
         "source_clip_id": job.source_clip_id,
         "source_label": job.source_label,
         "source_group": job.source_group,
@@ -94,7 +112,8 @@ def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
         "mask_motion": job.mask_motion,
         "driving_clip_id": job.driving_clip_id,
         "audio_clip_id": job.audio_clip_id,
-        "provenance": json.dumps({**(meta or {}), "regenerated": True}, sort_keys=True)[:2000],
+        "provenance": json.dumps({**(meta or {}), "regenerated": True, "spec_model": job.model,
+                                  "actual_model": actual}, sort_keys=True)[:2000],
     }
     return row
 
@@ -173,6 +192,9 @@ def _report(rows: Sequence[dict], new_rows: Sequence[dict], old_counts: Counter,
     per_split = Counter(r.get("split", "") for r in rows)
     per_family = Counter(r.get("family", "") for r in new_rows)
     per_model = Counter(r.get("model", "") for r in new_rows)
+    per_spec_model = Counter(r.get("spec_model", "") for r in new_rows)
+    substitutions = Counter(f"{r.get('spec_model')} -> {r.get('model')}"
+                            for r in new_rows if r.get("substituted") in (True, "True"))
     edited_split = Counter(r.get("split", "") for r in new_rows)
     return {
         "total_rows": len(rows),
@@ -183,7 +205,10 @@ def _report(rows: Sequence[dict], new_rows: Sequence[dict], old_counts: Counter,
         "jobs_failed": failed,
         "recorded_ok_but_missing": missing_file,
         "per_family": dict(sorted(per_family.items(), key=lambda kv: -kv[1])),
-        "per_model": dict(sorted(per_model.items(), key=lambda kv: -kv[1])),
+        "per_model_actual": dict(sorted(per_model.items(), key=lambda kv: -kv[1])),
+        "per_model_spec_slot": dict(sorted(per_spec_model.items(), key=lambda kv: -kv[1])),
+        "substitutions": dict(sorted(substitutions.items(), key=lambda kv: -kv[1])),
+        "distinct_renderers": len(per_model),
         "ai_edited_per_split": dict(edited_split),
         "class_balance_delta": {
             cls: per_class.get(cls, 0) - max(per_class.values()) for cls in per_class},

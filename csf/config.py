@@ -170,6 +170,15 @@ class GenerationConfig:
     keep_old_edited: bool = False
     only_models: List[str] = field(default_factory=list)      # restrict the run to these models
     skip_models: List[str] = field(default_factory=list)
+    # Choose the model set up front to fit a wall-clock budget, instead of letting
+    # deadline_hours cut the run off mid-group (which biases the dataset toward whichever
+    # models sort earliest). null disables the planner and runs everything wired.
+    budget_wall_clock_hours: Optional[float] = None
+    budget_diversity_floor: int = 2                           # distinct renderers per family
+    budget_pin_models: List[str] = field(default_factory=list)
+    # REFace's checkpoint is trained on CelebAMask-HQ: non-commercial research only. Its
+    # adapter refuses to start unless this is set explicitly.
+    accept_noncommercial: bool = False
     kinetics: KineticsConfig = field(default_factory=KineticsConfig)
     push: GenerationPushConfig = field(default_factory=GenerationPushConfig)
 

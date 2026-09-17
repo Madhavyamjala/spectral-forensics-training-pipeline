@@ -53,15 +53,37 @@ class NotImplementedAdapter(AdapterError):
 
 @dataclass
 class Adapter:
-    """One manipulation model: which env it needs, which worker renders it, how it is configured."""
-    key: str                                   # matches spec.Pipeline.key
+    """One manipulation model: which env it needs, which worker renders it, how it is configured.
+
+    `key` is the *slot* in the specification document. `actual_model` is what really renders the
+    video, which differs whenever the document names a model with no runnable public release and
+    a substitute stands in for it (VideoReTalking -> LatentSync, for example).
+
+    Those two are kept apart deliberately. The slot preserves the document's allocation - the
+    source-content mix and per-family balance it designed - while `actual_model` is what lands in
+    the manifest, so the per-method accuracy breakdown reports the model that genuinely produced
+    the artifacts. Recording the slot name instead would quietly attribute LatentSync's
+    fingerprint to VideoReTalking, and any attribution study built on it would be wrong.
+    """
+    key: str                                   # matches spec.Pipeline.key (the document's slot)
     family: str                                # the family it belongs to (informational)
     env_name: str
     worker: str                                # file name under adapters/workers/
     implemented: bool = True
     tier: int = 1                              # 1 = wired up and expected to run; 2 = scaffold
+    actual_model: str = ""                     # empty => the slot runs its own named model
+    cost_s: float = 60.0                       # measured/estimated seconds per video, for planning
     options: Dict[str, object] = field(default_factory=dict)
     note: str = ""
+
+    @property
+    def runs(self) -> str:
+        """The model that actually renders - what the manifest records."""
+        return self.actual_model or self.key
+
+    @property
+    def substituted(self) -> bool:
+        return bool(self.actual_model) and self.actual_model != self.key
 
     @property
     def worker_path(self) -> Path:
@@ -76,8 +98,8 @@ class Adapter:
             except (TypeError, json.JSONDecodeError):
                 meta = {}
         return {
-            "job_id": job.job_id, "video_id": job.video_id, "model": self.key,
-            "family": job.family, "source_path": job.source_path,
+            "job_id": job.job_id, "video_id": job.video_id, "model": self.runs,
+            "spec_model": self.key, "family": job.family, "source_path": job.source_path,
             "driving_path": job.driving_path, "audio_path": job.audio_path,
             "output_path": str(output_path), "variant": job.variant, "operation": job.operation,
             "mask_size": job.mask_size, "mask_motion": job.mask_motion, "prompt": job.prompt,
@@ -121,6 +143,8 @@ class WorkerProcess:
         # workers that serve several spec models (background modes, the three inpainting
         # baselines) pick their variant up from the environment at load() time
         environ["CSF_ADAPTER"] = self.adapter.key
+        environ["CSF_SPEC_MODEL"] = self.adapter.key
+        environ["CSF_ACTUAL_MODEL"] = self.adapter.runs
         for name, value in self.adapter.options.items():
             environ[f"CSF_{name.upper()}"] = str(value)
         # the shared worker helpers live next to the worker scripts
