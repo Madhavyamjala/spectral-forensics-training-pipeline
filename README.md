@@ -197,8 +197,13 @@ python main.py --config configs/regen_smoke.yaml --stage kinetics,generate,regen
 bash scripts/run_regen.sh --envs        # build the 18 per-model environments (2-4 h, once)
 bash scripts/run_regen.sh --kinetics    # fetch + qualify Kinetics-400 source clips
 bash scripts/run_regen.sh --generate    # render 33,333 videos  (~3.9 days on 4 GPUs)
-bash scripts/run_regen.sh --manifest    # rebuild manifest.csv around what was produced
+bash scripts/run_regen.sh --manifest    # rebuild manifest.csv + metadata.csv
 ```
+
+`--manifest` writes two files: `manifest_regen.csv` for training, and `metadata.csv` with 70
+per-video columns (43 of them the specification's attribution fields — identity, face quality,
+visibility, occlusion, pose, mask class, audio source). Old `ai_edited` rows are dropped from
+both; `real` and `ai_generated` rows are left untouched.
 
 Inspect before committing days to it:
 

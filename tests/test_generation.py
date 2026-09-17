@@ -417,10 +417,133 @@ def test_attribution() -> None:
           "CC BY 4.0" in KINETICS_ATTRIBUTION and "Kinetics-400" in KINETICS_ATTRIBUTION)
 
 
+def test_metadata() -> None:
+    """Per-video metadata must land as real columns, not a truncated JSON blob."""
+    print("per-video metadata")
+    import json as _json
+
+    from csf.generation.metadata import (CONTAINER_COLUMNS, IDENTITY_COLUMNS, coverage,
+                                         metadata_columns, metadata_row, spec_metadata_columns)
+
+    cols = metadata_columns()
+    check("columns are unique", len(cols) == len(set(cols)))
+    check("every family's spec fields are columns",
+          all(f in cols for fam in S.FAMILY_LIST for f in fam.metadata_fields),
+          str([f for fam in S.FAMILY_LIST for f in fam.metadata_fields if f not in cols]))
+    check("identity and container groups are present",
+          all(c in cols for c in IDENTITY_COLUMNS + CONTAINER_COLUMNS))
+    check("the spec contributes a substantial share", len(spec_metadata_columns()) >= 40,
+          str(len(spec_metadata_columns())))
+
+    probed = {"duration_sec": 4.0, "width": 640, "height": 360, "fps": 25.0,
+              "codec": "h264", "bitrate": 500000, "has_audio": True}
+    job = Job(job_id="j", video_id="aiedit-lip_sync-3", family="lip_sync",
+              model="videoretalking", source_group="g", source_clip_id="c",
+              source_path="/x.mp4", source_label="singing", split="valid",
+              audio_clip_id="donor", seed=7,
+              metadata=_json.dumps({"expression_intensity": 0.9, "language": "unknown",
+                                    "speech_duration": 1.0}))
+
+    class _P:
+        def exists(self):
+            return True
+
+        def stat(self):
+            return type("S", (), {"st_size": 4242})()
+
+    rendered = {"lip_sync_model": "latentsync", "audio_source": "donor",
+                "speech_duration": 6.4, "substitutes_for": "videoretalking"}
+    row = metadata_row(job, _P(), probed, "deadbeef", rendered, render_seconds=11.5)
+
+    check("the renderer's value beats the planned one",
+          str(row["speech_duration"]) == "6.4", str(row["speech_duration"]))
+    check("planned values survive where nothing was measured",
+          str(row["expression_intensity"]) == "0.9", str(row["expression_intensity"]))
+    check("container fields come from the probed file", row["bitrate"] == 500000)
+    check("substitution is recorded",
+          row["model"] == "latentsync" and row["spec_model"] == "videoretalking"
+          and row["substituted"] is True)
+    check("render time is recorded", row["render_seconds"] == 11.5)
+    check("file size and digest are recorded",
+          row["file_bytes"] == 4242 and row["sha256"] == "deadbeef")
+    check("unknown renderer keys are dropped, not crammed in",
+          "substitutes_for" not in row)
+    check("every column is a scalar a CSV cell can hold",
+          all(isinstance(v, (str, int, float, bool)) for v in row.values()),
+          str([k for k, v in row.items() if not isinstance(v, (str, int, float, bool))]))
+
+    cov = coverage([row])
+    check("coverage reports per-family fill rates", "lip_sync" in
+          cov["per_family_field_fill_rate"])
+    check("coverage is honest about unfilled fields",
+          cov["per_family_field_fill_rate"]["lip_sync"]["occlusion_level"] == 0.0)
+    print(f"       {len(cols)} columns, {len(spec_metadata_columns())} from the specification")
+
+
+def test_metadata_merge() -> None:
+    """Regenerating replaces the old AI-Edited metadata without touching the other classes."""
+    print("metadata merge")
+    import csv as _csv
+    import tempfile
+
+    from csf.generation.metadata import merge_metadata, read_metadata, write_metadata
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "metadata.csv"
+        old_cols = ["video_id", "class", "duration_sec", "legacy_note"]
+        old_rows = (
+            [{"video_id": f"real-{i}", "class": "real", "duration_sec": 2.0,
+              "legacy_note": "keep"} for i in range(4)]
+            + [{"video_id": f"aigen-{i}", "class": "ai_generated", "duration_sec": 3.0,
+                "legacy_note": "keep"} for i in range(3)]
+            + [{"video_id": f"aiedit-old-{i}", "class": "ai_edited", "duration_sec": 4.0,
+                "legacy_note": "stale"} for i in range(5)])
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.DictWriter(fh, fieldnames=old_cols)
+            w.writeheader()
+            w.writerows(old_rows)
+
+        new_rows = [{"video_id": f"aiedit-face_swap-{i}", "class": "ai_edited",
+                     "family": "face_swap", "model": "inswapper", "yaw": -3.1}
+                    for i in range(6)]
+
+        res = merge_metadata(new_rows, path)
+        check("old ai_edited rows are dropped", res["dropped_ai_edited"] == 5,
+              str(res["dropped_ai_edited"]))
+        check("real and ai_generated rows are kept", res["kept_other_classes"] == 7,
+              str(res["kept_other_classes"]))
+
+        write_metadata(new_rows, path)
+        final = read_metadata(path)
+        counts = Counter(r["class"] for r in final)
+        check("the other two classes survive the rewrite",
+              counts["real"] == 4 and counts["ai_generated"] == 3, str(dict(counts)))
+        check("only the regenerated ai_edited rows remain", counts["ai_edited"] == 6,
+              str(counts["ai_edited"]))
+        check("no stale ai_edited id survives",
+              not any(r["video_id"].startswith("aiedit-old-") for r in final))
+        check("a column only the old file had is preserved",
+              any(r.get("legacy_note") == "keep" for r in final))
+        check("the new schema's columns are present", "yaw" in final[0])
+
+        write_metadata(new_rows, path)
+        check("re-running is idempotent", len(read_metadata(path)) == len(final),
+              f"{len(final)} -> {len(read_metadata(path))}")
+
+        kept = merge_metadata(new_rows, path, keep_old_edited=True)
+        check("keep_old_edited retains both sets",
+              sum(1 for r in kept["rows"] if str(r.get("class")) == "ai_edited") == 6)
+
+        missing = merge_metadata(new_rows, Path(tmp) / "absent.csv")
+        check("an absent file is not an error",
+              missing["existing"] == 0 and len(missing["rows"]) == 6)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
-               test_kinetics_schema, test_attribution):
+               test_kinetics_schema, test_attribution, test_metadata,
+               test_metadata_merge):
         fn()
     print()
     if FAILURES:

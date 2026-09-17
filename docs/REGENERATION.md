@@ -329,6 +329,57 @@ per job.
 Each worker checks for its checkpoint at load time and fails with the exact path it wants, so a
 missing file costs one log line, not a burned model group.
 
+## 6a. Per-video metadata
+
+The `regen_manifest` stage writes two files from one pass over the produced videos:
+
+| file | purpose |
+|---|---|
+| `manifest_regen.csv` | training-facing, read by `csf.data.manifest` on every run - class, split, method |
+| `metadata.csv` | analysis-facing, **70 columns**, 43 of them the specification's per-video fields |
+
+They share `video_id`. Splitting them keeps the manifest narrow (the ablation only needs class,
+split and method) while making the attribution fields the document asks for - identity, face
+quality, visibility, occlusion, pose, mask class, audio source - real queryable columns rather
+than a truncated JSON blob.
+
+Column groups, listed by `python -m csf.generation.metadata --columns`:
+
+- **identity** - `video_id`, `family`, `model`, `spec_model`, `substituted`, `split`, `sha256`
+- **container** - duration, resolution, fps, codec, bitrate, audio. Probed from the *produced*
+  file, never copied from the source clip: those fingerprints are exactly what
+  `baseline_metadata_shortcut` in the ablation exists to expose.
+- **job** - source/driving/audio clip ids, variant, mask class, prompt, seed, render seconds
+- **specification** - the union of every family's `metadata_fields`, derived from `spec.py`, so a
+  field added there becomes a column automatically
+
+Where a field is both planned and measured, **the measured value wins** - a requested edit
+magnitude the renderer could not honour would otherwise be recorded as fact.
+
+`metadata_schema.json` sits beside it and reports the fill rate of every specification field per
+family. Fields no renderer reports show up as `0.0`, which is the honest signal that the
+attribution analysis cannot use them.
+
+### Replacing the old class
+
+`metadata.csv` is **merged, not overwritten**. Regenerating drops the old `ai_edited` rows, which
+describe files the new manifest no longer references, and keeps every `real` and `ai_generated`
+row untouched - those classes are not regenerated, and a wholesale rewrite would silently discard
+two thirds of the dataset's metadata. Columns an older file carried are preserved, the write is
+atomic, and re-running is idempotent.
+
+`generation.keep_old_edited: true` keeps both sets, matching the manifest's behaviour.
+
+Rebuild it at any time without re-rendering anything - it is reconstructed from the job plan and
+the generation ledger:
+
+```bash
+python -m csf.generation.metadata --config configs/regen.yaml
+```
+
+The push uploads `metadata.csv` and `metadata_schema.json` alongside the manifest, so the Hub
+copy can never describe deleted videos.
+
 ## 7. Publishing (destructive)
 
 Replacing the AI-Edited class on the Hub is opt-in and never runs from `--stage all`:
