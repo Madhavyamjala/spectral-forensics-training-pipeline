@@ -19,6 +19,7 @@ an interactive run asks for confirmation and a WRITE token first.
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -29,6 +30,77 @@ from csf.logging_utils import get_logger
 log = get_logger("generation.upload")
 
 BATCH = 400
+
+
+#: Kinetics-400 is CC BY 4.0, and every AI-Edited video here is a derivative of a Kinetics clip.
+#: The licence requires that redistribution credits the original authors, links the licence and
+#: states that changes were made - so the dataset card carries all three, and the push refuses to
+#: run without it.
+KINETICS_ATTRIBUTION = """\
+## Source data and attribution
+
+The AI-Edited class of this dataset is derived from **Kinetics-400**, via the Hugging Face mirror
+[`liuhuanjim013/kinetics400`](https://huggingface.co/datasets/liuhuanjim013/kinetics400).
+
+- **Original dataset**: Kinetics-400
+- **Original authors**: Will Kay, Joao Carreira, Karen Simonyan, Brian Zhang, Chloe Hillier,
+  Sudheendra Vijayanarasimhan, Fabio Viola, Tim Green, Trevor Back, Paul Natsev, Mustafa
+  Suleyman, Andrew Zisserman
+- **Original paper**: *The Kinetics Human Action Video Dataset*,
+  [arXiv:1705.06950](https://arxiv.org/abs/1705.06950)
+- **Original licence**: [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/)
+
+### Changes made
+
+Every AI-Edited video is a **modified** Kinetics-400 clip. Source clips were re-encoded and then
+altered by one of the manipulation models listed above - face swapping, reenactment, lip-sync,
+expression editing, object insertion/removal, inpainting, background replacement or whole-frame
+transformation. The `spec_model`, `model` and `source_clip_id` columns record, for every row,
+which model produced it and which Kinetics clip it came from.
+
+This dataset is released under **CC BY 4.0**, the same licence as the source.
+"""
+
+
+def build_dataset_card(cfg, report: Optional[Dict[str, object]] = None) -> str:
+    """The dataset card pushed as README.md, including the CC BY 4.0 attribution."""
+    report = report or {}
+    per_model = report.get("per_model_actual") or {}
+    rows = "\n".join(f"| `{k}` | {v:,} |" for k, v in sorted(per_model.items(),
+                                                              key=lambda kv: -kv[1]))
+    counts = report.get("per_class") or {}
+    class_rows = "\n".join(f"| {k} | {v:,} |" for k, v in sorted(counts.items()))
+    return f"""---
+license: cc-by-4.0
+task_categories:
+- video-classification
+tags:
+- deepfake-detection
+- video-forensics
+- kinetics400
+---
+
+# {cfg.data.repo_id.split('/')[-1]}
+
+Three-class video forensics dataset: **Real / AI-Generated / AI-Edited**.
+
+| class | videos |
+|---|---:|
+{class_rows or "| (see manifest.csv) | |"}
+
+## AI-Edited class
+
+Regenerated from Kinetics-400 following *AI Edited Data Source and Pipeline*: eight manipulation
+families rendered by the models below. Each row records the model that actually produced it
+(`model`), the specification slot it fills (`spec_model`), the source clip (`source_clip_id`) and
+the edit parameters.
+
+| model | videos |
+|---|---:|
+{rows or "| (see manifest.csv) | |"}
+
+{KINETICS_ATTRIBUTION}
+"""
 
 
 def _api(token: Optional[str]):
@@ -57,7 +129,8 @@ def existing_edited_paths(repo_id: str, token: Optional[str], revision: Optional
 
 
 def push(repo_id: str, manifest: Path, video_root: Path, token: Optional[str] = None,
-         delete_old: bool = True, private: bool = True, dry_run: bool = False) -> Dict[str, object]:
+         delete_old: bool = True, private: bool = True, dry_run: bool = False,
+         card: Optional[str] = None) -> Dict[str, object]:
     """Upload the regenerated videos + manifest, then prune the superseded ones."""
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 
@@ -96,6 +169,16 @@ def push(repo_id: str, manifest: Path, video_root: Path, token: Optional[str] = 
                     repo_id=repo_id, repo_type="dataset",
                     commit_message="Update manifest for regenerated AI-Edited class")
 
+    if card is not None:
+        api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md",
+                        repo_id=repo_id, repo_type="dataset",
+                        commit_message="Dataset card with CC BY 4.0 Kinetics-400 attribution")
+        api.upload_file(path_or_fileobj=KINETICS_ATTRIBUTION.encode("utf-8"),
+                        path_in_repo="ATTRIBUTION.md", repo_id=repo_id, repo_type="dataset",
+                        commit_message="Kinetics-400 attribution (CC BY 4.0)")
+        log.info("Uploaded the dataset card and ATTRIBUTION.md (CC BY 4.0 requires credit, a "
+                 "licence link and a statement of changes)")
+
     if delete_old and stale:
         for i in range(0, len(stale), BATCH):
             chunk = stale[i:i + BATCH]
@@ -129,6 +212,14 @@ def push_interactive(cfg, manifest: Path, video_root: Path) -> Optional[str]:
     if not token:
         raise RuntimeError("No Hugging Face token available. Set HF_TOKEN or run interactively.")
 
+    report = {}
+    report_path = Path(cfg.paths.work_dir) / "metrics" / "regeneration_report.json"
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
     result = push(repo_id, manifest, video_root, token=token, delete_old=gen.push.delete_old,
-                  private=gen.push.private, dry_run=gen.push.dry_run)
+                  private=gen.push.private, dry_run=gen.push.dry_run,
+                  card=build_dataset_card(cfg, report))
     return result.get("url")
