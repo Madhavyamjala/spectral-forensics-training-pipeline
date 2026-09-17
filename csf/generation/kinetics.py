@@ -15,8 +15,13 @@ Sources, in preference order:
   1. `local_root` - an already-extracted Kinetics-400 tree on the cluster (nothing downloaded)
   2. `hf_repo`    - a Hugging Face mirror (the default, `liuhuanjim013/kinetics400`). Community
                     mirrors differ in layout, so `probe_hf_layout` inspects the repo and picks
-                    the right reader: one file per clip, tar/zip shards, or parquet with the
-                    video inline.
+                    the right reader: one file per clip, tar/zip shards, or a `datasets`-loadable
+                    table. The default mirror is the last of those: 241,181 rows of
+                    video_id / video_path / metadata / clips[] / frames[], with no label column
+                    and clip *paths* rather than inline bytes. `resolve_row_label` recovers the
+                    class (falling back to a join on the official annotation CSVs, since the ids
+                    are YouTube ids) and `rank_clips` picks the best clip per video using the
+                    mirror's own quality metrics.
   3. `mirror_base` - the CVDF S3 shards, kept as a fallback
 
 Everything is resumable: extracted clips and a JSON ledger live under `<cache>/kinetics/`, and
@@ -169,6 +174,134 @@ def load_annotations(cache: Path, mirror_base: str, splits: Sequence[str] = ("tr
     log.info("Kinetics annotations: %d clips across %d labels", len(table),
              len({a.label for a in table.values()}))
     return table
+
+
+#: Row keys that sometimes carry the action class directly.
+LABEL_KEYS = ("label", "labels", "class", "category", "action", "action_label", "class_name")
+#: Row keys that carry the video/clip payload or its path.
+VIDEO_KEYS = ("clip_path", "video_path", "video", "mp4", "clip", "bytes", "path", "file")
+
+
+def _safe_name(name: str) -> str:
+    keep = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(name))
+    return keep[:120] or "clip"
+
+
+def _first_str(value) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        for v in value:
+            got = _first_str(v)
+            if got:
+                return got
+    return None
+
+
+def label_from_path(path: str, wanted: Optional[Dict[str, int]] = None) -> Optional[str]:
+    """Pull a Kinetics class out of a path like `train/playing guitar/abc_000001_000011.mp4`."""
+    parts = [normalize_label(p) for p in Path(str(path)).parts[:-1]]
+    for part in reversed(parts):
+        if not part or part in ("train", "val", "test", "videos", "clips", "data", "."):
+            continue
+        if wanted is None or part in wanted:
+            return part
+    return None
+
+
+def resolve_row_label(row: Dict[str, object], wanted: Optional[Dict[str, int]] = None,
+                      annotations: Optional[Dict[str, Annotation]] = None) -> Optional[str]:
+    """Work out a row's Kinetics class, whatever the mirror happens to record.
+
+    The `liuhuanjim013/kinetics400` schema (video_id / video_path / metadata / clips / frames)
+    carries no explicit label column, so the class has to be recovered. Tried in order of how
+    trustworthy each source is:
+
+      1. an explicit label field, if the mirror has one,
+      2. the same inside `metadata`,
+      3. the directory component of `video_path` / `clips[].clip_path`,
+      4. the official Kinetics annotation table, joined on `video_id` (this mirror's ids are
+         YouTube ids, which is what the annotation CSVs key on),
+      5. a frame-level `annotation` string, which on some mirrors holds the action name.
+
+    Returns a normalized label, or None when nothing matches.
+    """
+    def accept(cand: Optional[str]) -> Optional[str]:
+        if not cand:
+            return None
+        norm = normalize_label(cand)
+        if not norm:
+            return None
+        return norm if (wanted is None or norm in wanted) else None
+
+    for key in LABEL_KEYS:
+        got = accept(_first_str(row.get(key)))
+        if got:
+            return got
+
+    meta = row.get("metadata")
+    if isinstance(meta, dict):
+        for key in LABEL_KEYS:
+            got = accept(_first_str(meta.get(key)))
+            if got:
+                return got
+
+    clips = row.get("clips") if isinstance(row.get("clips"), (list, tuple)) else []
+    for path_value in [row.get("video_path")] + [c.get("clip_path") for c in clips
+                                                 if isinstance(c, dict)]:
+        path = _first_str(path_value)
+        if path:
+            got = label_from_path(path, wanted)
+            if got:
+                return got
+
+    if annotations:
+        vid = _first_str(row.get("video_id")) or _first_str(row.get("id"))
+        if vid:
+            ann = annotations.get(vid)
+            if ann is None:                       # ids may carry the _start_end suffix
+                ann = next((a for cid, a in annotations.items() if cid.startswith(vid)), None)
+            if ann is not None:
+                got = accept(ann.label)
+                if got:
+                    return got
+
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        for frame in (clip.get("frames") or [])[:3]:
+            if isinstance(frame, dict):
+                got = accept(_first_str(frame.get("annotation"))
+                             or _first_str(frame.get("annotation_extra")))
+                if got:
+                    return got
+    return None
+
+
+def _clip_quality(clip: Dict[str, object]) -> float:
+    """A single score for ranking a row's clips. This mirror ships per-clip quality metrics and
+    per-frame aesthetic scores; preferring the best clip of each video is free quality."""
+    score = 0.0
+    metrics = clip.get("quality_metrics")
+    if isinstance(metrics, dict):
+        for v in metrics.values():
+            if isinstance(v, (int, float)):
+                score += float(v)
+    frames = clip.get("frames") or []
+    aesthetic = [f.get("aesthetic_score") for f in frames
+                 if isinstance(f, dict) and isinstance(f.get("aesthetic_score"), (int, float))]
+    if aesthetic:
+        score += float(sum(aesthetic)) / len(aesthetic)
+    return score
+
+
+def rank_clips(row: Dict[str, object]) -> List[Dict[str, object]]:
+    """The row's clips, best first. Falls back to the whole video when there are no clips."""
+    clips = [c for c in (row.get("clips") or []) if isinstance(c, dict)]
+    if not clips:
+        path = _first_str(row.get("video_path")) or row.get("video")
+        return [{"clip_name": _first_str(row.get("video_id")) or "video", "clip_path": path}]
+    return sorted(clips, key=_clip_quality, reverse=True)
 
 
 def _label_of(member_name: str, annotations: Dict[str, Annotation]) -> Tuple[Optional[str], Optional[str]]:
@@ -374,8 +507,9 @@ class SourcePool:
             log.info("HF mirror %s: %d archive shard(s)", repo_id, len(archives))
             return "archives", archives
         if parquet:
-            log.info("HF mirror %s: %d parquet file(s)", repo_id, len(parquet))
-            return "parquet", parquet
+            log.info("HF mirror %s: %d parquet file(s) -> Hugging Face Dataset", repo_id,
+                     len(parquet))
+            return "dataset", parquet
         raise RuntimeError(
             f"Could not find videos, archives or parquet in dataset {repo_id}. Files seen: "
             f"{files[:20]}. Point generation.kinetics.hf_repo at a different mirror, or set "
@@ -390,7 +524,7 @@ class SourcePool:
             return self._hf_individual(repo_id, files, wanted, revision, layout, annotations)
         if layout == "archives":
             return self._hf_archives(repo_id, files, wanted, revision, annotations, workdir)
-        return self._hf_parquet(repo_id, files, wanted, revision)
+        return self._hf_dataset(repo_id, wanted, revision, annotations)
 
     # -- layout: one file per clip ------------------------------------------------------
 
@@ -526,57 +660,127 @@ class SourcePool:
             log.warning("Zip %s could not be read (%s) -> skipped", archive.name, exc)
         return kept
 
-    # -- layout: parquet ----------------------------------------------------------------
+    # -- layout: a Hugging Face Dataset (parquet-backed, possibly nested) ----------------
 
-    def _hf_parquet(self, repo_id: str, files: Sequence[str],
-                    wanted: Dict[str, int], revision: Optional[str]) -> Dict[str, int]:
-        """Stream a parquet-backed mirror through `datasets`, writing out the video bytes."""
+    def _hf_dataset(self, repo_id: str, wanted: Dict[str, int], revision: Optional[str],
+                    annotations: Optional[Dict[str, Annotation]] = None,
+                    split: str = "train") -> Dict[str, int]:
+        """Stream a `datasets`-loadable mirror and materialise the clips we need.
+
+        Written against the `liuhuanjim013/kinetics400` schema - video_id / video_path /
+        metadata / clips[] / frames[] - which has no label column and stores *paths* rather than
+        inline bytes, but it also handles the simpler flat layouts. Two things are resolved per
+        row: the action class (`resolve_row_label`) and the best clip to take (`rank_clips`,
+        which uses the mirror's own quality metrics).
+
+        Rows are streamed, so the 241k-row table is never materialised locally, and the loop
+        stops as soon as every label quota is met.
+        """
         try:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError(
-                f"{repo_id} stores its clips in parquet, which needs the `datasets` package:\n"
+                f"{repo_id} is a Hugging Face Dataset, which needs the `datasets` package:\n"
                 f"    pip install datasets\n"
-                f"Alternatively point generation.kinetics.hf_repo at a mirror that ships video "
-                f"files, or set generation.kinetics.local_root.") from exc
+                f"Alternatively set generation.kinetics.local_root to an extracted tree, or "
+                f"point hf_repo at a mirror that ships plain video files.") from exc
 
         counts = {label: self._count_on_disk(label) for label in wanted}
-        ds = load_dataset(repo_id, split="train", streaming=True, revision=revision)
-        label_key = video_key = None
-        written = 0
-        for row in ds:
-            if label_key is None:
-                label_key = next((k for k in ("label", "labels", "class", "category", "action")
-                                  if k in row), None)
-                video_key = next((k for k in ("video", "mp4", "clip", "bytes", "path")
-                                  if k in row), None)
-                if not label_key or not video_key:
-                    raise RuntimeError(f"Cannot find label/video columns in {repo_id}; row keys "
-                                       f"are {list(row)[:12]}")
-                log.info("Parquet mirror: label column %r, video column %r", label_key, video_key)
+        log.info("Streaming dataset %s (split=%s) for %d label(s)", repo_id, split, len(wanted))
+        ds = load_dataset(repo_id, split=split, streaming=True, revision=revision)
 
-            label = normalize_label(str(row[label_key]))
-            if wanted.get(label, 0) <= counts.get(label, 0):
+        scanned = written = unlabelled = 0
+        logged_keys = False
+        for row in ds:
+            scanned += 1
+            if not logged_keys:
+                log.info("Row schema: %s", sorted(row)[:12])
+                logged_keys = True
+            if scanned % 20000 == 0:
+                log.info("  scanned %d row(s) | pool %d | %d unlabelled",
+                         scanned, sum(counts.values()), unlabelled)
+
+            label = resolve_row_label(row, wanted, annotations)
+            if label is None:
+                unlabelled += 1
                 continue
-            payload = row[video_key]
-            data = payload.get("bytes") if isinstance(payload, dict) else payload
-            if not isinstance(data, (bytes, bytearray)):
+            need = wanted.get(label, 0) - counts.get(label, 0)
+            if need <= 0:
                 continue
+
             dest_dir = self.clips_dir / label.replace("/", "_")
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / f"{label.replace(' ', '_')}_{counts.get(label, 0):06d}.mp4"
-            dest.write_bytes(data)
-            counts[label] = counts.get(label, 0) + 1
-            written += 1
-            if written % 500 == 0:
+            for clip in rank_clips(row):
+                if need <= 0:
+                    break
+                name = _first_str(clip.get("clip_name")) or _first_str(row.get("video_id")) \
+                    or f"{label}_{counts.get(label, 0):06d}"
+                dest = dest_dir / f"{_safe_name(name)}.mp4"
+                if dest.exists():
+                    continue
+                if self._materialise(repo_id, clip, dest, revision):
+                    counts[label] = counts.get(label, 0) + 1
+                    written += 1
+                    need -= 1
+
+            if written and written % 200 == 0:
                 self.ledger["counts"] = counts
                 self._save_ledger()
-                log.info("  parquet: %d clip(s) written, pool %d", written, sum(counts.values()))
+                log.info("  %d clip(s) written | pool %d", written, sum(counts.values()))
             if all(counts.get(k, 0) >= v for k, v in wanted.items()):
+                log.info("All label quotas satisfied after %d row(s)", scanned)
                 break
+
         self.ledger["counts"] = counts
         self._save_ledger()
+        log.info("Dataset ingest done: scanned %d row(s), wrote %d clip(s), %d row(s) had no "
+                 "resolvable label", scanned, written, unlabelled)
+        if written == 0:
+            raise RuntimeError(
+                f"Streamed {scanned} row(s) from {repo_id} but could not resolve any of the "
+                f"{len(wanted)} Kinetics classes the spec needs. If the mirror records classes "
+                f"somewhere this code does not look, extend resolve_row_label(); if its ids are "
+                f"YouTube ids, make sure generation.kinetics.mirror_base is set so the official "
+                f"annotation CSVs can be joined on them.")
         return counts
+
+    def _materialise(self, repo_id: str, clip: Dict[str, object], dest: Path,
+                     revision: Optional[str]) -> bool:
+        """Write one clip to `dest`, whether the row holds bytes or a path into the repo."""
+        payload = None
+        for key in VIDEO_KEYS:
+            if key in clip and clip[key] is not None:
+                payload = clip[key]
+                break
+        if payload is None:
+            return False
+
+        # inline bytes (datasets' Video/Audio features decode to a dict)
+        data = payload.get("bytes") if isinstance(payload, dict) else payload
+        if isinstance(data, (bytes, bytearray)) and data:
+            dest.write_bytes(data)
+            return True
+
+        path = _first_str(payload.get("path") if isinstance(payload, dict) else payload)
+        if not path:
+            return False
+        local = Path(path)
+        if local.exists():                      # already on disk (local_files / cached)
+            try:
+                os.link(local, dest)
+            except OSError:
+                shutil.copy2(local, dest)
+            return True
+
+        from huggingface_hub import hf_hub_download
+        repo_rel = path.lstrip("./")
+        try:
+            got = hf_hub_download(repo_id, repo_rel, repo_type="dataset", revision=revision)
+            shutil.copy2(got, dest)
+            return True
+        except Exception as exc:                # noqa: BLE001 - one bad clip is not fatal
+            log.debug("Could not fetch %s from %s: %s", repo_rel, repo_id, str(exc)[:160])
+            return False
 
     # ---------------- pool table ----------------
 
@@ -639,9 +843,21 @@ def acquire(gen_cfg, cache_dir: Path, wanted: Dict[str, int]) -> Path:
         missing = shortfall(have)
 
     if missing and kin.hf_repo:
+        # Some mirrors - including liuhuanjim013/kinetics400 - carry no label column, only
+        # YouTube ids. Load the official annotation table first so those ids can be joined to a
+        # class; it is two small CSVs and it is what makes such a mirror usable at all.
+        annotations: Optional[Dict[str, Annotation]] = None
+        if kin.mirror_base:
+            try:
+                annotations = load_annotations(pool.root, kin.mirror_base, tuple(kin.splits))
+            except Exception as exc:                          # noqa: BLE001 - not fatal
+                log.warning("Could not load the Kinetics annotation CSVs (%s). Labels will have "
+                            "to come from the mirror's own fields or its paths.", str(exc)[:200])
+
         log.info("Fetching Kinetics-400 clips from the Hugging Face mirror %s", kin.hf_repo)
         try:
-            have = pool.ingest_hf(kin.hf_repo, wanted, revision=kin.hf_revision)
+            have = pool.ingest_hf(kin.hf_repo, wanted, revision=kin.hf_revision,
+                                  annotations=annotations)
             missing = shortfall(have)
         except Exception as exc:                              # noqa: BLE001 - fall back to S3
             log.error("Hugging Face mirror %s failed: %s", kin.hf_repo, str(exc)[:400])

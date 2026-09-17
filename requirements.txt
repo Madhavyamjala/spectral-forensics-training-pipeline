@@ -5,6 +5,7 @@ accelerate>=1.10
 bitsandbytes>=0.46
 diffusers>=0.35
 huggingface_hub>=0.34
+datasets>=3.0          # streaming the Kinetics-400 mirror during the kinetics stage
 safetensors>=0.4
 opencv-python-headless>=4.10
 scipy>=1.11
