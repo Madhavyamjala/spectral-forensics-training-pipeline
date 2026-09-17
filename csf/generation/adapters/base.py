@@ -84,10 +84,12 @@ class Adapter:
 
     @property
     def substituted(self) -> bool:
+        """Return whether another model renders this specification slot."""
         return bool(self.actual_model) and self.actual_model != self.key
 
     @property
     def worker_path(self) -> Path:
+        """Return the filesystem path of this adapter worker."""
         return WORKER_DIR / self.worker
 
     def payload(self, job, output_path: Path, gpu: int) -> Dict[str, object]:
@@ -118,6 +120,7 @@ class WorkerProcess:
 
     def __init__(self, adapter: Adapter, env: ReadyEnv, gpu: int, log_dir: Path,
                  startup_timeout: int = 1800, job_timeout: int = 1800):
+        """Initialize a persistent worker subprocess for one adapter and GPU."""
         self.adapter = adapter
         self.env = env
         self.gpu = gpu
@@ -134,6 +137,7 @@ class WorkerProcess:
     # ---------------- lifecycle ----------------
 
     def start(self) -> None:
+        """Start the worker process and wait for its ready message."""
         if not self.adapter.worker_path.exists():
             raise AdapterError(f"Worker script missing for adapter '{self.adapter.key}': "
                                f"{self.adapter.worker_path}")
@@ -173,6 +177,7 @@ class WorkerProcess:
         log.info("Worker %s ready on GPU %d", self.adapter.key, self.gpu)
 
     def _drain_stderr(self) -> None:
+        """Continuously copy worker stderr into the diagnostic log."""
         assert self.proc and self.proc.stderr
         path = self.log_dir / f"worker_{self.adapter.key}_gpu{self.gpu}.log"
         with open(path, "a", encoding="utf-8") as fh:
@@ -189,6 +194,7 @@ class WorkerProcess:
                     pass
 
     def stderr_tail(self, lines: int = 25) -> str:
+        """Return the most recent worker stderr lines."""
         buf: List[str] = []
         while not self._stderr_tail.empty():
             try:
@@ -198,9 +204,11 @@ class WorkerProcess:
         return "\n".join(buf[-lines:])
 
     def alive(self) -> bool:
+        """Return whether the worker subprocess is still running."""
         return self.proc is not None and self.proc.poll() is None
 
     def stop(self) -> None:
+        """Stop the worker subprocess and release its streams."""
         if self.proc is None:
             return
         try:
@@ -303,6 +311,7 @@ class WorkerPool:
 
     def __init__(self, envs_root: Path, log_dir: Path, max_resident: int = 1,
                  job_timeout: int = 1800, offline: bool = False):
+        """Initialize the resident worker pool and environment builder."""
         self.envs_root = Path(envs_root)
         self.log_dir = Path(log_dir)
         self.max_resident = max(1, max_resident)
@@ -314,6 +323,7 @@ class WorkerPool:
         self._lock = threading.RLock()
 
     def _env(self, spec: EnvSpec) -> ReadyEnv:
+        """Build or reuse the environment required by an adapter."""
         with self._lock:
             if spec.name not in self._envs:
                 self._envs[spec.name] = build_env(spec, self.envs_root, offline=self.offline)
@@ -328,6 +338,7 @@ class WorkerPool:
 
     def _get_locked(self, adapter: Adapter, spec: EnvSpec, gpu: int, slot: int,
                     key: tuple) -> WorkerProcess:
+        """Return a live worker while the pool lock is held."""
         worker = self._workers.get(key)
         if worker is not None and worker.alive():
             self._touch(key)
@@ -354,15 +365,18 @@ class WorkerPool:
         return worker
 
     def _touch(self, key: tuple) -> None:
+        """Mark a worker as the most recently used pool entry."""
         if key in self._order:
             self._order.remove(key)
             self._order.append(key)
 
     def shutdown(self) -> None:
+        """Stop every resident worker in the pool."""
         with self._lock:
             self._shutdown_locked()
 
     def _shutdown_locked(self) -> None:
+        """Stop all workers while the pool lock is held."""
         for key, worker in list(self._workers.items()):
             log.debug("Stopping worker %s", key)
             worker.stop()

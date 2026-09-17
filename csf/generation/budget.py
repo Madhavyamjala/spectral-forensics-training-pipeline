@@ -52,6 +52,7 @@ class ModelCost:
 
     @property
     def efficiency(self) -> float:
+        """Return videos produced per GPU-hour for this model."""
         return self.videos / self.gpu_hours if self.gpu_hours > 0 else float("inf")
 
 
@@ -68,13 +69,16 @@ class BudgetPlan:
 
     @property
     def wall_clock_hours(self) -> float:
+        """Return estimated wall-clock time at the configured GPU count."""
         return self.gpu_hours_used / max(1, self.gpus)
 
     @property
     def coverage(self) -> float:
+        """Return the selected fraction of all planned videos."""
         return self.videos / self.total_videos if self.total_videos else 0.0
 
     def to_dict(self) -> Dict[str, object]:
+        """Serialize the budget plan for reporting."""
         return {"budget_gpu_hours": round(self.budget_gpu_hours, 1), "gpus": self.gpus,
                 "gpu_hours_used": round(self.gpu_hours_used, 1),
                 "wall_clock_hours": round(self.wall_clock_hours, 1),
@@ -104,6 +108,7 @@ def effective_speedup(model: str, workers_per_gpu: int) -> float:
 
 
 def model_costs(targets: Optional[Dict[str, int]] = None) -> List[ModelCost]:
+    """Build per-model cost records from the planned video targets."""
     per_model = videos_per_model(targets)
     out = []
     for key, n in per_model.items():
@@ -135,6 +140,7 @@ def plan(budget_gpu_hours: float, gpus: int = 3, targets: Optional[Dict[str, int
     spent = 0.0
 
     def admit(c: ModelCost) -> bool:
+        """Add a model to the plan and update its accumulated totals."""
         nonlocal spent
         if c.key in chosen:
             return True
@@ -222,6 +228,7 @@ def wall_clock_estimate(gpus: int, workers_per_gpu: int, allowed: Optional[set] 
 
 
 def _main() -> int:
+    """Print the adapter coverage and estimated generation cost report."""
     import argparse
 
     ap = argparse.ArgumentParser(description="Fit the generation run into a wall-clock budget")

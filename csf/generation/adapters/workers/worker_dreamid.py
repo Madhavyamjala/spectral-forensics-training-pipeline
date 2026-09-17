@@ -32,10 +32,12 @@ MAX_SIDE = 640
 
 class State:
     def __init__(self, repo: Path, ckpt_dir: Path, script: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt_dir, self.script = repo, ckpt_dir, script
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("DreamID-V")
     ckpt_dir = Path(os.environ.get("CSF_ENV_ROOT", ".")) / "weights" / "DreamID-V"
     if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
@@ -65,6 +67,7 @@ def _best_face_frame(frames):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("driving_path") or ""
     if not donor or not Path(donor).exists() or donor == src:

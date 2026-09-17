@@ -28,10 +28,12 @@ MAX_FRAMES = 200
 
 class State:
     def __init__(self, repo: Path, ckpt: Path, config: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt, self.config = repo, ckpt, config
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("LatentSync")
     require(repo / "scripts" / "inference.py", "LatentSync inference script")
     ckpt = require(repo / "checkpoints" / "latentsync_unet.pt", "latentsync_unet.pt")
@@ -42,6 +44,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("audio_path") or ""
     if not donor or not Path(donor).exists():

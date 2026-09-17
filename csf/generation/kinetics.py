@@ -104,33 +104,91 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+_FFPROBE_WARNED = False
+
+
+def _probe_with_opencv(path: Path) -> Optional[Dict[str, object]]:
+    """Fallback container probe using OpenCV, which is already a hard dependency.
+
+    It cannot report codec, bitrate or the presence of an audio track, so those come back as
+    unknown/zero/False. That is enough to build the source pool - the sampler only needs
+    resolution, duration and frame rate - and it means a missing ffprobe binary degrades the
+    metadata instead of emptying the pool.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return None
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if width <= 0 or height <= 0:
+            return None
+        if frames <= 0:                      # some containers do not report a frame count
+            ok, _ = cap.read()
+            if not ok:
+                return None
+    finally:
+        cap.release()
+    duration = round(frames / fps, 3) if fps > 0 and frames > 0 else 0.0
+    return {"duration_sec": duration, "width": width, "height": height,
+            "fps": round(fps, 3), "codec": "unknown", "bitrate": 0, "has_audio": False,
+            "probe": "opencv"}
+
+
 def probe_video(path: Path) -> Optional[Dict[str, object]]:
-    """Container metadata via ffprobe; returns None when the file is unreadable."""
-    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
+    """Container metadata, via ffprobe when available and OpenCV otherwise.
+
+    Returns None only when neither backend can read the file, i.e. the video really is unusable.
+    An earlier version returned None whenever ffprobe was missing, which silently discarded every
+    clip and made a fully-populated pool look empty.
+    """
+    global _FFPROBE_WARNED
+
+    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+           str(path)]
+    info = None
     try:
         out = subprocess.run(cmd, capture_output=True, timeout=60, check=True).stdout
         info = json.loads(out)
-    except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError, OSError):
-        return None
-    video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
-    if video is None:
-        return None
-    audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
-    fps = 0.0
-    rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
-    try:
-        num, den = rate.split("/")
-        fps = float(num) / float(den) if float(den) else 0.0
-    except (ValueError, ZeroDivisionError):
-        fps = 0.0
-    try:
-        duration = float(info.get("format", {}).get("duration", 0.0))
-    except (TypeError, ValueError):
-        duration = 0.0
-    return {"duration_sec": round(duration, 3), "width": int(video.get("width") or 0),
-            "height": int(video.get("height") or 0), "fps": round(fps, 3),
-            "codec": video.get("codec_name", "unknown"),
-            "bitrate": int(info.get("format", {}).get("bit_rate") or 0), "has_audio": audio}
+    except FileNotFoundError:
+        if not _FFPROBE_WARNED:
+            _FFPROBE_WARNED = True
+            log.warning("ffprobe is not on PATH - falling back to OpenCV for container metadata. "
+                        "Codec, bitrate and audio presence will be recorded as unknown, and the "
+                        "generation workers need ffmpeg to encode, so install it before running "
+                        "the 'generate' stage:\n"
+                        "    Linux:  sudo apt install ffmpeg   (or: conda install -c conda-forge ffmpeg)\n"
+                        "    Windows: winget install Gyan.FFmpeg")
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        info = None
+
+    if info is not None:
+        video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+        if video is not None:
+            audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+            rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+            try:
+                num, den = rate.split("/")
+                fps = float(num) / float(den) if float(den) else 0.0
+            except (ValueError, ZeroDivisionError):
+                fps = 0.0
+            try:
+                duration = float(info.get("format", {}).get("duration", 0.0))
+            except (TypeError, ValueError):
+                duration = 0.0
+            return {"duration_sec": round(duration, 3), "width": int(video.get("width") or 0),
+                    "height": int(video.get("height") or 0), "fps": round(fps, 3),
+                    "codec": video.get("codec_name", "unknown"),
+                    "bitrate": int(info.get("format", {}).get("bit_rate") or 0),
+                    "has_audio": audio, "probe": "ffprobe"}
+
+    return _probe_with_opencv(path)
 
 
 # --------------------------------------------------------------------------------------
@@ -550,7 +608,11 @@ class SourcePool:
                 by_label.setdefault(label, []).append(f)
 
         matched = sum(len(v) for v in by_label.values())
+        absent = sorted(set(wanted) - set(by_label))
         log.info("HF mirror: %d file(s) match the %d label(s) the spec needs", matched, len(wanted))
+        if absent:
+            log.warning("%d label(s) the spec needs have no file in this mirror: %s%s",
+                        len(absent), absent[:8], " ..." if len(absent) > 8 else "")
         if matched == 0:
             raise RuntimeError(
                 f"No file in {repo_id} matched any of the {len(wanted)} Kinetics classes the "
@@ -787,24 +849,55 @@ class SourcePool:
     def write_pool(self, labels: Iterable[str], probe: bool = True) -> Path:
         """Probe every clip on disk and write `source_pool.csv` (the sampler's input)."""
         rows = []
+        on_disk = 0
+        empty_files = 0
+        unreadable: List[Path] = []
         for label in sorted(set(labels)):
             d = self.clips_dir / label.replace("/", "_")
             if not d.exists():
                 continue
             for clip in sorted(d.glob("*.mp4")):
+                on_disk += 1
                 if clip.stat().st_size == 0:
+                    empty_files += 1
                     continue
                 row = {"clip_id": clip.stem, "label": label, "path": str(clip.resolve())}
                 if probe:
                     meta = probe_video(clip)
                     if meta is None:
-                        log.debug("Unreadable clip dropped from pool: %s", clip)
+                        unreadable.append(clip)
                         continue
                     row.update(meta)
                     row["sha256"] = sha256_file(clip)
                 rows.append(row)
+
+        if unreadable:
+            log.warning("%d of %d clip(s) could not be decoded and were left out of the pool. "
+                        "First few: %s", len(unreadable), on_disk,
+                        [str(p) for p in unreadable[:3]])
         if not rows:
-            raise RuntimeError(f"Source pool is empty under {self.clips_dir}. Run the 'kinetics' stage first.")
+            # Distinguish the two very different causes - an empty directory means the download
+            # never happened, whereas files that all fail to decode means the probe is broken,
+            # and telling someone to "run the kinetics stage" when it just ran and left 267
+            # clips on disk sends them looking in the wrong place entirely.
+            if on_disk == 0:
+                raise RuntimeError(
+                    f"No clips were downloaded to {self.clips_dir}. Check "
+                    f"generation.kinetics.hf_repo / local_root / mirror_base and your Hub login, "
+                    f"then re-run the 'kinetics' stage.")
+            raise RuntimeError(
+                f"{on_disk} clip(s) are present under {self.clips_dir} but none could be read "
+                f"({len(unreadable)} failed to decode, {empty_files} were zero bytes), so the "
+                f"source pool is empty.\n"
+                f"Most often this means neither ffprobe nor OpenCV can open them:\n"
+                f"  * install ffmpeg (Linux: sudo apt install ffmpeg, or "
+                f"conda install -c conda-forge ffmpeg)\n"
+                f"  * check a file by hand: ffprobe {unreadable[0] if unreadable else '<clip>'}\n"
+                f"  * if the files are Git LFS pointers rather than video, delete "
+                f"{self.clips_dir} and re-run so they are fetched properly\n"
+                f"Set generation.kinetics.probe_clips=false to skip probing entirely (the pool "
+                f"then carries no container metadata).")
+        log.info("Source pool: %d clip(s) on disk -> %d usable", on_disk, len(rows))
         fields = list(rows[0].keys())
         self.pool_csv.parent.mkdir(parents=True, exist_ok=True)
         with open(self.pool_csv, "w", newline="", encoding="utf-8") as fh:

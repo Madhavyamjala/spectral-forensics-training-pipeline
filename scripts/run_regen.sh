@@ -30,8 +30,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-# GPU 0 is left to the vLLM workers.
-export CSF_TRAIN_GPUS="${CSF_TRAIN_GPUS:-1,2,3,4}"
+# GPUs 0 and 1 are left to the vLLM workers.
+export CSF_TRAIN_GPUS="${CSF_TRAIN_GPUS:-2,3,4,5}"
 
 PHASE="${1:---all}"; shift || true
 

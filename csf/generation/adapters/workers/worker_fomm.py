@@ -28,12 +28,14 @@ MAX_FRAMES = 120
 
 class State:
     def __init__(self, generator, kp_detector, detector):
+        """Store the reusable components required by this model worker."""
         self.generator = generator
         self.kp_detector = kp_detector
         self.detector = detector
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     import torch
     import yaml
 
@@ -64,6 +66,7 @@ def load() -> State:
 
 
 def _face_box(state: State, frame):
+    """Detect the primary face and return its bounding box."""
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     boxes = state.detector.detectMultiScale(gray, 1.15, 5, minSize=(64, 64))
     if len(boxes) == 0:
@@ -77,6 +80,7 @@ def _face_box(state: State, frame):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     import torch
 
     src = payload["source_path"]
@@ -108,6 +112,7 @@ def render(state: State, payload: dict) -> dict:
         raise RuntimeError("no usable face track in the driving clip")
 
     def to_tensor(img):
+        """Convert an image array to a normalized model tensor."""
         return torch.tensor(img.astype(np.float32) / 255.0).permute(2, 0, 1)[None].cuda()
 
     out_crops = []

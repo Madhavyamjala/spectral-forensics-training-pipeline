@@ -35,11 +35,13 @@ MAX_FRAMES = 120
 
 class State:
     def __init__(self, repo: Path, python: str):
+        """Store the reusable components required by this model worker."""
         self.repo = repo
         self.python = python
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("ProPainter")
     require(repo / "inference_propainter.py", "ProPainter inference script")
     require(repo / "weights" / "ProPainter.pth", "ProPainter checkpoint")
@@ -69,6 +71,7 @@ def _object_masks(frames, seed: int):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     mode = (payload.get("options") or {}).get("mode", "inpaint")
     src = payload["source_path"]
     frames, fps = read_video(src, max_frames=MAX_FRAMES, max_side=MAX_SIDE)

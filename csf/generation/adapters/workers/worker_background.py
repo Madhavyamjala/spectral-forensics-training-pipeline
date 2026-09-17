@@ -36,6 +36,7 @@ MAX_FRAMES = 160
 
 class State:
     def __init__(self, mode: str):
+        """Store the reusable components required by this model worker."""
         self.mode = mode
         self.sam_video = None
         self.sam_image = None
@@ -50,6 +51,7 @@ class State:
 
 
 def _load_sam(state: State) -> None:
+    """Load the SAM2 segmenter into the shared worker state."""
     import torch
     from sam2.build_sam import build_sam2, build_sam2_video_predictor
     from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -129,6 +131,7 @@ def _segment(state: State, frames) -> list:
 
 
 def _flux_background(state: State, prompt: str, size, seed: int):
+    """Generate a replacement background with the FLUX pipeline."""
     import torch
     from diffusers import FluxPipeline
 
@@ -186,6 +189,7 @@ def _real_background(state: State, payload: dict, size, n_frames: int):
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     mode = os.environ.get("CSF_BG_MODE", "")
     state = State(mode)
     _load_sam(state)
@@ -193,6 +197,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     mode = (payload.get("options") or {}).get("mode") or state.mode
     frames, fps = read_video(payload["source_path"], max_frames=MAX_FRAMES, max_side=MAX_SIDE)
     h, w = frames[0].shape[:2]

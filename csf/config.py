@@ -161,6 +161,10 @@ class GenerationConfig:
     enabled: bool = False
     total_videos: int = 33333
     gpus: List[int] = field(default_factory=lambda: [2, 3, 4])
+    #: Which GPU the driver process itself binds. These are physical ids, the same numbering
+    #: nvidia-smi uses. null => the first entry of `gpus`, so the driver never lands on a card
+    #: the run was told to avoid.
+    driver_gpu: Optional[int] = None
     video_root: str = "./cache/regen/videos"
     envs_root: str = "./cache/regen/envs"
     jobs_csv: str = "./cache/regen/jobs.csv"
@@ -215,18 +219,22 @@ class Config:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize the complete configuration to a dictionary."""
         return dataclasses.asdict(self)
 
     def save(self, path: Path) -> None:
+        """Write the resolved configuration as formatted JSON."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     @property
     def work_dir(self) -> Path:
+        """Return the configured working directory as a path."""
         return Path(self.paths.work_dir)
 
     @property
     def cache_dir(self) -> Path:
+        """Return the configured cache directory as a path."""
         return Path(self.paths.cache_dir)
 
 
@@ -251,6 +259,7 @@ def _build(cls, values: Dict[str, Any]):
 
 
 def _apply_override(raw: Dict[str, Any], override: str) -> None:
+    """Apply one dotted command-line override to a raw configuration."""
     if "=" not in override:
         raise ValueError(f"Override must look like section.key=value, got: {override!r}")
     key, value = override.split("=", 1)
@@ -262,6 +271,7 @@ def _apply_override(raw: Dict[str, Any], override: str) -> None:
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:
+    """Load, override, validate, and instantiate a pipeline configuration."""
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     for ov in overrides or []:
         _apply_override(raw, ov)

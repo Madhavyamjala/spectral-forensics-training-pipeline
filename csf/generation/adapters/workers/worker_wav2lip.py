@@ -27,10 +27,12 @@ MAX_FRAMES = 200
 
 class State:
     def __init__(self, repo: Path, ckpt: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt = repo, ckpt
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("Wav2Lip")
     require(repo / "inference.py", "Wav2Lip inference script")
     ckpt = require(repo / "checkpoints" / "wav2lip_gan.pth", "wav2lip_gan.pth")
@@ -40,6 +42,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("audio_path") or ""
     if not donor or not Path(donor).exists():

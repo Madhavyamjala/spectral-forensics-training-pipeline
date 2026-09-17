@@ -230,9 +230,18 @@ and so shapes the dataset by scheduling order. `deadline_hours` remains as a har
 Written for `tfgpu.cs.fiu.edu`: 6 × H200 NVL (143 GB). The default config uses **GPUs 1–4**,
 leaving GPU 0 to the vLLM workers.
 
-- Generation pins its own workers via `generation.gpus: [1, 2, 3, 4]`, with
+- Generation pins its own workers via `generation.gpus: [2, 3, 4, 5]`, with
   `max_workers_per_gpu: 4` processes on each.
-- Training uses `CUDA_VISIBLE_DEVICES=1,2,3,4` (`CSF_TRAIN_GPUS` overrides it).
+- `generation.driver_gpu` is the card the driver process itself binds. Without it a
+  single-process run always takes `cuda:0`, since there is no `LOCAL_RANK` to take a hint from -
+  which is wrong on a shared box. It defaults to `gpus[0]`.
+- Training uses `CUDA_VISIBLE_DEVICES=2,3,4,5` (`CSF_TRAIN_GPUS` overrides it).
+
+**These are physical ids**, the same numbering `nvidia-smi` prints. Do not also export
+`CUDA_VISIBLE_DEVICES` for the generation stages: the ids would then be indices into that list
+rather than physical devices, and `gpus: [2, 3, 4, 5]` would silently mean something else. The
+run warns if it finds the variable set, and refuses outright if `generation.gpus` names a card it
+cannot see.
 - Adding GPUs is the only way below ~3.9 days for the full set; more workers per GPU does not
   help once the diffusion models dominate.
 
@@ -396,6 +405,13 @@ rather than missing ones. Dry-run first with `--set generation.push.dry_run=true
 
 | Symptom | What it means |
 |---|---|
+| Runs on `cuda:0` when you asked for another card | Set `generation.driver_gpu` (or `CSF_DRIVER_GPU=2`). A single-process run has no `LOCAL_RANK`, so it defaults to device 0. |
+| `peft is not installed` / `bitsandbytes is required` on a generation-only run | Fixed: preflight now only demands the training stack when a training stage is selected. If you still see it, you have a training stage in `--stage`. |
+| `generation.gpus ... names GPU(s) [n]` | Those ids do not exist in this process. Usually `CUDA_VISIBLE_DEVICES` is set and has renumbered them. |
+| `N clip(s) are present ... but none could be read` | ffprobe is missing and OpenCV cannot decode them either. Install ffmpeg (`conda install -c conda-forge ffmpeg`), or set `generation.kinetics.probe_clips=false` to build the pool without container metadata. |
+| `ffprobe is not on PATH` warning | The pool still builds via OpenCV, but codec/bitrate/audio are recorded as unknown **and the generation workers need ffmpeg to encode**. Install it before the `generate` stage. |
+| `No clips were downloaded to ...` | The download genuinely produced nothing - check `hf_repo` / `local_root` / `mirror_base` and your Hub login. |
+| `N label(s) the spec needs have no file in this mirror` | Those Kinetics classes are spelled differently (or absent) upstream. The sampler redistributes within each source group, so a few are harmless. |
 | `Only N clips pass the 'face' filter` | No face detector in the driver env. `pip install insightface` or `mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. |
 | A whole model group fails instantly | Usually a missing weight. Read `runs/regen/logs/generation/worker_<model>_gpu<N>.log` — the worker names the file it wanted. |
 | `group abandoned after N consecutive failures` | `fail_fast` tripped. The group is skipped, the run continues; fix the cause and re-run with `retry_failed=true`. |
