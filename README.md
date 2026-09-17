@@ -277,9 +277,16 @@ AnyV2V/VideoComposer/InsV2V → VACE), the manifest records the model that *actu
 video in `model` and keeps the document's slot in `spec_model`.
 
 Source clips come from the Hugging Face mirror
-[`liuhuanjim013/kinetics400`](https://huggingface.co/datasets/liuhuanjim013/kinetics400); the
-loader detects the repository's layout at runtime (one file per clip, tar/zip shards, or parquet)
-and falls back to the CVDF S3 shards for anything the mirror cannot satisfy.
+[`liuhuanjim013/kinetics400`](https://huggingface.co/datasets/liuhuanjim013/kinetics400)
+(241,181 videos). That mirror has no label column and stores clip *paths* rather than inline
+bytes, so the loader recovers each clip's action class — falling back to a join against the
+official Kinetics annotation CSVs on `video_id` — and uses the mirror's own per-clip quality
+metrics to take the best clip of each video. Other layouts (per-clip files, tar/zip shards) are
+detected and handled too, with the CVDF S3 shards as a fallback.
+
+Kinetics-400 is **CC BY 4.0**. Every AI-Edited video is a modified Kinetics clip, so the pushed
+dataset card carries the required credit, licence link and statement of changes — see
+[ATTRIBUTION.md](ATTRIBUTION.md).
 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.

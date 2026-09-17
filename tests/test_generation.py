@@ -343,9 +343,84 @@ def test_concurrency() -> None:
     print(f"       4 GPUs x 4 workers -> {conc['wall_clock_days']} days for 33,333 videos")
 
 
+def test_kinetics_schema() -> None:
+    """The default mirror carries no label column and stores clip paths, not bytes."""
+    print("kinetics mirror schema")
+    from csf.generation.kinetics import (Annotation, label_from_path, rank_clips,
+                                         resolve_row_label, _safe_name)
+
+    wanted = {"playing guitar": 10, "riding a bike": 10, "singing": 5}
+    row = {
+        "video_id": "abc123XYZ", "video_path": "videos/abc123XYZ.mp4",
+        "metadata": {"resolution": "1280x720", "frame_rate": 30, "codec": "h264"},
+        "clips": [
+            {"clip_name": "abc123XYZ_000010_000020",
+             "clip_path": "clips/abc123XYZ_000010_000020.mp4", "start_time": 10.0,
+             "duration": 10.0, "frames_count": 300,
+             "quality_metrics": {"sharpness": 0.4, "stability": 0.3},
+             "frames": [{"frame_number": 0, "image_path": "f0.jpg", "annotation": "",
+                         "clip_score": 0.2, "aesthetic_score": 5.1}]},
+            {"clip_name": "abc123XYZ_000030_000040",
+             "clip_path": "clips/abc123XYZ_000030_000040.mp4", "start_time": 30.0,
+             "duration": 10.0, "frames_count": 300,
+             "quality_metrics": {"sharpness": 0.9, "stability": 0.8},
+             "frames": [{"frame_number": 0, "image_path": "f0.jpg", "annotation": "",
+                         "clip_score": 0.7, "aesthetic_score": 6.9}]},
+        ]}
+    anns = {"abc123XYZ_000010_000020":
+            Annotation("abc123XYZ_000010_000020", "playing guitar", "train")}
+
+    check("resolves a label with no label column, by joining video_id on the annotations",
+          resolve_row_label(row, wanted, anns) == "playing guitar")
+    check("ranks the higher-quality clip first",
+          rank_clips(row)[0]["clip_name"] == "abc123XYZ_000030_000040")
+    check("falls back to a foldered path",
+          resolve_row_label({"video_id": "z", "video_path": "train/riding a bike/z.mp4",
+                             "clips": []}, wanted, None) == "riding a bike")
+    check("an explicit label column still wins",
+          resolve_row_label({"label": "Singing", "video_path": "x.mp4"}, wanted,
+                            None) == "singing")
+    check("frame annotations are the last resort",
+          resolve_row_label({"video_id": "q", "clips": [
+              {"clip_path": "c.mp4", "frames": [{"annotation": "playing guitar"}]}]},
+              wanted, None) == "playing guitar")
+    check("classes outside the spec's 147 are rejected",
+          resolve_row_label({"label": "abseiling", "video_path": "x.mp4"}, wanted, None) is None)
+    check("a row with no clips falls back to the whole video",
+          rank_clips({"video_id": "v", "video_path": "videos/v.mp4",
+                      "clips": []})[0]["clip_path"] == "videos/v.mp4")
+    check("unresolvable rows return None, they do not raise",
+          resolve_row_label({"video_id": "unknown", "clips": []}, wanted, None) is None)
+    check("clip names are made filesystem-safe",
+          "/" not in _safe_name("abc/def:ghi") and _safe_name("") == "clip")
+    check("label_from_path ignores split directories",
+          label_from_path("train/playing guitar/x.mp4", wanted) == "playing guitar")
+
+
+def test_attribution() -> None:
+    """Kinetics-400 is CC BY 4.0, so anything we redistribute has to carry the credit."""
+    print("licence attribution")
+    from csf.config import load_config
+    from csf.generation.upload import KINETICS_ATTRIBUTION, build_dataset_card
+
+    card = build_dataset_card(load_config("configs/regen.yaml"),
+                              {"per_class": {"ai_edited": 33333},
+                               "per_model_actual": {"vace": 2883}})
+    for needed, what in (("cc-by-4.0", "licence identifier in the card metadata"),
+                         ("creativecommons.org/licenses/by/4.0", "link to the licence"),
+                         ("Kinetics-400", "name of the source dataset"),
+                         ("Zisserman", "credit to the original authors"),
+                         ("1705.06950", "citation of the original paper"),
+                         ("Changes made", "statement that the material was modified")):
+        check(f"dataset card states the {what}", needed in card, needed)
+    check("the attribution block is self-contained",
+          "CC BY 4.0" in KINETICS_ATTRIBUTION and "Kinetics-400" in KINETICS_ATTRIBUTION)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
-               test_substitutions, test_budget, test_reallocation, test_concurrency):
+               test_substitutions, test_budget, test_reallocation, test_concurrency,
+               test_kinetics_schema, test_attribution):
         fn()
     print()
     if FAILURES:

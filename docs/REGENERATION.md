@@ -26,11 +26,40 @@ once and picks the matching reader:
 |---|---|
 | `<split>/<label>/<clip>.mp4` | one `hf_hub_download` per clip, per-label quotas |
 | `*.tar` / `*.tar.gz` / `*.zip` shards | stream a shard, keep the needed clips, delete it |
-| `*.parquet` with the video inline | `load_dataset(..., streaming=True)`, write out the bytes |
+| a `datasets`-loadable table | stream rows, resolve the class, materialise the clips |
+
+The default mirror is the third kind, and it has two properties worth knowing:
+
+**There is no label column.** Its 241,181 rows are `video_id`, `video_path`, `metadata`,
+`clips[]` and `frames[]` — the action class appears nowhere directly. `resolve_row_label` recovers
+it, most trustworthy source first:
+
+1. an explicit label field, if a mirror has one,
+2. the same inside `metadata`,
+3. the directory component of `video_path` / `clips[].clip_path`,
+4. **the official Kinetics annotation CSVs, joined on `video_id`** — this mirror's ids are YouTube
+   ids, which is what those CSVs key on. This is the path that actually works here, which is why
+   the `kinetics` stage downloads the annotation CSVs even when the S3 mirror is not used,
+5. a frame-level `annotation` string.
+
+**Clips are paths, not bytes.** Rows reference files elsewhere in the repo, so each selected clip
+is fetched with `hf_hub_download`. Rows also carry per-clip `quality_metrics` and per-frame
+`aesthetic_score`, so `rank_clips` takes the best clip of each video rather than the first — free
+quality, since the mirror already did the scoring.
 
 If the mirror cannot satisfy some labels, the CVDF S3 shards
 (`generation.kinetics.mirror_base`) fill the gap. Set `generation.kinetics.local_root` instead if
 Kinetics is already extracted on the cluster, and nothing is downloaded at all.
+
+The `kinetics` stage needs the `datasets` package (`pip install datasets`, already in
+`requirements.txt`).
+
+### Licence
+
+Kinetics-400 is **CC BY 4.0**, and every AI-Edited video is a modified Kinetics clip, so anything
+you redistribute has to credit the original authors, link the licence and say that changes were
+made. `csf/generation/upload.py` writes all three into the dataset card and an `ATTRIBUTION.md`
+on every push; see [ATTRIBUTION.md](../ATTRIBUTION.md) in the repo root.
 
 ## 1. What gets built
 
