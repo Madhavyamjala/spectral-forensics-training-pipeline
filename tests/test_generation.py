@@ -1050,6 +1050,41 @@ def test_env_interpreter() -> None:
             else:
                 os.environ[key] = value
 
+    # a requirement must not be able to swap the pinned torch out from under the env
+    import csf.generation.envs as E_
+    with tempfile.TemporaryDirectory() as tmp:
+        spec = EnvSpec(name="pinned", torch="torch==2.5.1 torchvision==0.20.1")
+        check("torch pins are read off the spec",
+              E_.torch_pins(spec) == ["torch==2.5.1", "torchvision==0.20.1"])
+        written = E_._write_constraints(spec, Path(tmp))
+        check("a constraints file pins every torch package",
+              written.read_text().split() == ["torch==2.5.1", "torchvision==0.20.1"])
+        check("an env with no torch needs no constraints",
+              E_._write_constraints(EnvSpec(name="x", torch=""), Path(tmp)) is None)
+
+        # a stub interpreter reporting the wrong torch must fail the build
+        stub = Path(tmp) / "python"
+        stub.write_text('#!/bin/sh\necho "2.14.0+cu130"\n')
+        stub.chmod(0o755)
+        try:
+            E_._verify_torch(stub, spec)
+            check("a drifted torch fails the build", False, "no error raised")
+        except E_.EnvBuildError as exc:
+            check("a drifted torch fails the build, naming both versions",
+                  "2.5.1" in str(exc) and "2.14.0" in str(exc), str(exc)[:120])
+        stub.write_text('#!/bin/sh\necho "2.5.1+cu121"\n')
+        stub.chmod(0o755)
+        E_._verify_torch(stub, spec)          # the pinned build passes, local CUDA tag and all
+
+    build_src_ = inspect.getsource(E_.build_env)
+    check("the constraints file is handed to pip for the requirements install",
+          'build_env_vars["PIP_CONSTRAINT"]' in build_src_)
+    check("the torch pin is verified before the env is marked ready",
+          "_verify_torch(py, spec)" in build_src_)
+    check("sam2_diffusers pins a torch that satisfies SAM2's floor",
+          env_specs()["sam2_diffusers"].torch.startswith("torch==2.5.1"),
+          env_specs()["sam2_diffusers"].torch)
+
     body = inspect.getsource(_venv_python).split('"""')[-1]      # skip the docstring's prose
     check("the interpreter path is never resolved through its symlink",
           ".resolve()" not in body and "os.path.abspath" in body)

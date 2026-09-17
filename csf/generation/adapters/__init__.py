@@ -30,6 +30,10 @@ __all__ = ["ADAPTERS", "ENVS", "Adapter", "AdapterError", "NotImplementedAdapter
 # --------------------------------------------------------------------------------------
 
 TORCH_CU121 = "torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1"
+#: SAM2 declares torch>=2.5.1 / torchvision>=0.20.1. Installing it against TORCH_CU121 makes pip
+#: pull the newest torch from PyPI on top of the pinned build - the env then flip-flops between
+#: the two on every rebuild. Meet upstream's floor instead of fighting it.
+TORCH_SAM2 = "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
 TORCH_LEGACY = "torch==1.13.1 torchvision==0.14.1"
 LEGACY_INDEX = "https://download.pytorch.org/whl/cu117"
 
@@ -48,7 +52,7 @@ ENVS: Dict[str, EnvSpec] = {
     # --- background: SAM2 segmentation + diffusers generators ---------------------------
     "sam2_diffusers": EnvSpec(
         name="sam2_diffusers",
-        torch=TORCH_CU121,
+        torch=TORCH_SAM2,
         requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
                       "sentencepiece", "protobuf", "opencv-python-headless", "numpy<2",
                       "imageio[ffmpeg]", "pillow", "tqdm",

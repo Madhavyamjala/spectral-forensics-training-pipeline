@@ -216,6 +216,29 @@ def _venv_python(root: Path) -> Path:
     return Path(os.path.abspath(Path(root) / name))
 
 
+def torch_pins(spec: "EnvSpec") -> List[str]:
+    """The exact `name==version` pins in an env's torch line."""
+    return [tok for tok in spec.torch.split() if "==" in tok]
+
+
+def _write_constraints(spec: "EnvSpec", root: Path) -> Optional[Path]:
+    """Write a pip constraints file pinning torch for every later install in this env.
+
+    Without it, any requirement that declares a newer torch - SAM2 asks for >=2.5.1 - makes pip
+    quietly uninstall the CUDA-matched build we just placed and pull a multi-gigabyte wheel from
+    PyPI instead. On the next rebuild the torch step puts the pinned version back and the
+    requirements step swaps it out again: the env never settles, and whichever torch wins is not
+    the one the adapter was pinned against. As a constraint the same conflict becomes a
+    resolution error at build time, naming the package that wants to move torch.
+    """
+    pins = torch_pins(spec)
+    if not pins:
+        return None
+    path = Path(root) / "constraints.txt"
+    path.write_text("\n".join(pins) + "\n", encoding="utf-8")
+    return path
+
+
 def _clean_environ() -> Dict[str, str]:
     """os.environ minus the interpreter state that would leak the driver's packages in.
 
@@ -293,6 +316,25 @@ def _ensure_pip(py: Path, label: str) -> None:
         raise EnvBuildError(f"{label}: pip is still missing after bootstrapping")
 
 
+def _verify_torch(py: Path, spec: "EnvSpec") -> None:
+    """Confirm the env ended up with the torch it pinned, not one a dependency dragged in."""
+    want = dict(tok.split("==", 1) for tok in torch_pins(spec)).get("torch")
+    if not want:
+        return
+    try:
+        proc = _probe(py, "import torch; print(torch.__version__)", timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EnvBuildError(f"env '{spec.name}': torch check could not run: {exc}") from exc
+    if proc.returncode != 0:
+        raise EnvBuildError(f"env '{spec.name}': torch is not importable after the build")
+    got = proc.stdout.strip().split("+")[0]
+    if got != want:
+        raise EnvBuildError(
+            f"env '{spec.name}': pinned torch=={want} but the built environment has {got}. "
+            f"A requirement pulled a different build in - check which one asks for a newer "
+            f"torch; the pin is in the env's constraints.txt.")
+
+
 def _verify_imports(py: Path, modules: Sequence[str], label: str) -> None:
     """Fail the build if the env cannot import what its worker needs."""
     if not modules:
@@ -351,6 +393,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             else:
                 try:
                     _verify_imports(py, spec.checks(), f"env '{spec.name}'")
+                    _verify_torch(py, spec)
                     return ReadyEnv(spec, root, py,
                                     {r.folder: repos_dir / r.folder for r in spec.repos})
                 except EnvBuildError as exc:
@@ -404,6 +447,11 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             cmd += ["--index-url", spec.torch_index]
         _run(cmd, what=announce(f"installing {spec.torch.split()[0]} (several GB)"),
              timeout=7200, env=build_env_vars)
+
+    constraints = _write_constraints(spec, root)
+    if constraints:
+        # pip reads this for every install below, post-install hooks included
+        build_env_vars["PIP_CONSTRAINT"] = str(constraints)
 
     if spec.requirements:
         _run([py, "-m", "pip", "install", *spec.requirements],
@@ -459,6 +507,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             f"{py}. The venv step probably failed silently - check that `python -m venv` works "
             f"on this machine (some distributions need python3-venv / ensurepip installed).")
     _verify_imports(py, spec.checks(), f"env '{spec.name}'")
+    _verify_torch(py, spec)
     marker.write_text(json.dumps({"digest": want, "name": spec.name, "python": str(py),
                                   "root": str(root),
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),
@@ -516,8 +565,18 @@ def diagnose(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, Dict[str, o
             except (OSError, subprocess.SubprocessError):
                 missing.append(mod)
         info["missing_imports"] = missing
+        want = dict(tok.split("==", 1) for tok in torch_pins(spec)).get("torch")
+        if want and "torch" not in missing:
+            try:
+                proc = _probe(py, "import torch; print(torch.__version__)", timeout=300)
+                info["torch"] = proc.stdout.strip() if proc.returncode == 0 else "?"
+            except (OSError, subprocess.SubprocessError):
+                info["torch"] = "?"
+            info["torch_pinned"] = want
+            if str(info["torch"]).split("+")[0] != want:
+                info["torch_drifted"] = True
         info["verdict"] = ("ok" if info["own_venv"] and info["pip"] != "MISSING" and not missing
-                           else "broken")
+                           and not info.get("torch_drifted") else "broken")
         out[spec.name] = info
     return out
 
@@ -566,6 +625,10 @@ def _main() -> int:
                 print(f"         pip: {info.get('pip')}")
                 missing = info.get("missing_imports") or []
                 print(f"         cannot import: {', '.join(missing) if missing else '-'}")
+                if info.get("torch_pinned"):
+                    drift = "  <- NOT the pinned build" if info.get("torch_drifted") else ""
+                    print(f"         torch: {info.get('torch')} "
+                          f"(pinned {info['torch_pinned']}){drift}")
             if info["verdict"] != "ok":
                 bad += 1
                 print(f"         fix: python -m csf.generation.envs --build {name} --force "
