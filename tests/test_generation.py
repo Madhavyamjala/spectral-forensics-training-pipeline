@@ -539,11 +539,33 @@ def test_metadata_merge() -> None:
               missing["existing"] == 0 and len(missing["rows"]) == 6)
 
 
+def test_stage_scoping() -> None:
+    """Generation-only runs must not be gated on the training stack."""
+    print("stage scoping")
+    import inspect
+
+    import main as driver
+
+    check("generation and training stages are disjoint",
+          not (set(driver.GENERATION_STAGES) & set(driver.TRAINING_STAGES)))
+    check("STAGES is exactly their union",
+          driver.STAGES == driver.GENERATION_STAGES + driver.TRAINING_STAGES)
+    check("preflight takes the selected stages",
+          "selected" in inspect.signature(driver.preflight).parameters)
+    src = inspect.getsource(driver.preflight)
+    check("the training stack is only demanded when training",
+          "if training:" in src and src.index("if training:") < src.index("import peft"))
+    check("bitsandbytes is gated on training too",
+          src.index("if training:") < src.index("import bitsandbytes"))
+    check("the generation stages require ffmpeg", "ffprobe" in src)
+    check("generation.gpus is validated", "_check_generation_gpus" in src)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
-               test_metadata_merge):
+               test_metadata_merge, test_stage_scoping):
         fn()
     print()
     if FAILURES:
