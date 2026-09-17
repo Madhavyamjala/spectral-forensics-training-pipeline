@@ -25,7 +25,10 @@ paths:
 generation:
   enabled: true
   total_videos: 33333
-  gpus: [1, 2, 3, 4]            # 4 GPUs; GPU 0 left to the vLLM workers
+  # Physical GPU ids, the same numbering nvidia-smi uses. GPUs 0 and 1 are held by the
+  # vLLM workers, so the run stays off them entirely.
+  gpus: [2, 3, 4, 5]
+  driver_gpu: 2                # the driver process itself; null => gpus[0]
   # Must match paths.video_dir: the feature stage reads <video_dir>/<repo_path> and only falls
   # back to the Hub when the file is absent, so writing here means no re-download.
   video_root: ./cache/regen/videos

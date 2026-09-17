@@ -16,7 +16,7 @@ import os
 import platform
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, List
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -38,14 +38,40 @@ class DistInfo:
         return self.world_size > 1
 
 
-def init_distributed(timeout_minutes: int = 180) -> DistInfo:
+def init_distributed(timeout_minutes: int = 180, device_index: Optional[int] = None) -> DistInfo:
+    """Set up the process group and bind this process to a GPU.
+
+    Under torchrun the device is `LOCAL_RANK`, which is what NCCL expects. A single-process run
+    has no local rank, so it would otherwise always take cuda:0 - unhelpful on a shared box where
+    GPU 0 belongs to something else. `device_index` (or `CSF_DRIVER_GPU`) picks a different card;
+    it is a *physical* index, so it means the same thing as the ids in `nvidia-smi` and in
+    `generation.gpus`.
+    """
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    if device_index is None and os.environ.get("CSF_DRIVER_GPU"):
+        try:
+            device_index = int(os.environ["CSF_DRIVER_GPU"])
+        except ValueError:
+            device_index = None
+
     if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        # torchrun owns the mapping; an explicit index only applies to a single process
+        index = local_rank if world_size > 1 else (
+            device_index if device_index is not None else local_rank)
+        count = torch.cuda.device_count()
+        if index >= count:
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            raise RuntimeError(
+                f"Requested GPU {index} but this process can only see {count} device(s)"
+                + (f" because CUDA_VISIBLE_DEVICES={visible!r} restricts it - the ids you pass "
+                   f"are then indices into that list, not physical ids. Either unset it and use "
+                   f"physical ids, or renumber accordingly." if visible else ".")
+            )
+        torch.cuda.set_device(index)
+        device = torch.device("cuda", index)
     else:
         device = torch.device("cpu")
 

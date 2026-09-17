@@ -15,7 +15,8 @@ paths:
 generation:
   enabled: true
   total_videos: 200
-  gpus: [2]
+  gpus: [2]                  # physical ids; 0 and 1 belong to the vLLM workers
+  driver_gpu: 2
   video_root: ./cache/regen_smoke/videos
   envs_root: ./cache/regen/envs        # share the envs with the real run - they are expensive
   jobs_csv: ./cache/regen_smoke/jobs.csv
@@ -40,5 +41,11 @@ data:
   num_frames: 8
   delete_videos_after_cache: false
 
+# The smoke run never reaches a training stage, but preflight reads these; keeping them
+# unquantised means it does not ask for bitsandbytes just to generate 200 videos.
 train:
   num_workers: 4
+  qwen:
+    quantization: none
+  llama:
+    quantization: none

@@ -161,6 +161,10 @@ class GenerationConfig:
     enabled: bool = False
     total_videos: int = 33333
     gpus: List[int] = field(default_factory=lambda: [2, 3, 4])
+    #: Which GPU the driver process itself binds. These are physical ids, the same numbering
+    #: nvidia-smi uses. null => the first entry of `gpus`, so the driver never lands on a card
+    #: the run was told to avoid.
+    driver_gpu: Optional[int] = None
     video_root: str = "./cache/regen/videos"
     envs_root: str = "./cache/regen/envs"
     jobs_csv: str = "./cache/regen/jobs.csv"
