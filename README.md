@@ -80,7 +80,7 @@ its `generator_edit_method` values as `"unknown"`).
 ```bash
 python -m csf.generation.spec          # the full allocation plan, self-checked
 python -m csf.generation.adapters      # per-model status: which are wired, which are not
-bash scripts/run_regen.sh --budget 84   # which models fit the time you have
+bash scripts/run_regen.sh --eta        # time to produce the full set
 bash scripts/run_regen.sh --envs       # build the per-model environments
 bash scripts/run_regen.sh --kinetics   # acquire + qualify the source clips
 bash scripts/run_regen.sh --generate   # render on GPUs 2/3/4
@@ -88,18 +88,20 @@ bash scripts/run_regen.sh --manifest   # rebuild manifest.csv around what was pr
 bash scripts/run_regen.sh --train      # train on the new dataset
 ```
 
-**26,828 of 33,333 videos (80.5%) are covered by 23 distinct renderers.** Where the document
-names a model with no runnable public release, a substitute fills the slot (VideoReTalking →
-LatentSync 1.6, SimSwap → DreamID-V, AnyV2V/VideoComposer/InsV2V → VACE, and others) — and the
-manifest records the model that *actually rendered* each video in `model`, keeping the document's
-slot in `spec_model`, so the per-method breakdown never attributes one model's artifacts to
-another. Six slots are left as honest gaps rather than filled with a duplicate mechanism.
+**All 33,333 videos, produced by 24 distinct renderers.** Six of the document's models have no
+runnable public release; each family's target is re-apportioned across the models that do run, so
+every family still reaches the size the document specifies. Where a substitute stands in
+(VideoReTalking → LatentSync 1.6, SimSwap → DreamID-V, AnyV2V/VideoComposer/InsV2V → VACE), the
+manifest records the model that *actually rendered* each video in `model` and keeps the
+document's slot in `spec_model`, so the per-method breakdown never attributes one model's
+artifacts to another.
 
-Running everything wired costs ~523 GPU-hours (7.3 days on 3 GPUs), so the model set is chosen up
-front to fit a wall-clock budget, keeping at least two distinct renderers per family:
+The scheduler runs several workers per GPU (an H200 has 143 GB; INSwapper needs 3 GB), which is
+worth ~3.8× on the latency-bound models:
 
 ```bash
-bash scripts/run_regen.sh --budget 84     # 18 models, 18,941 videos, 240 GPU-h
+bash scripts/run_regen.sh --eta        # 33,333 videos in ~3.9 days on 4 GPUs
+bash scripts/run_regen.sh --budget 84  # or cap wall-clock time and take fewer
 ```
 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:

@@ -148,7 +148,15 @@ def plan_jobs(cfg, rebuild: bool = False):
         raise RuntimeError(f"{features_csv} is missing - run the 'kinetics' stage first.")
     features = load_features(features_csv)
     targets = S.family_targets(gen.total_videos)
-    jobs = build_jobs(features, targets, seed=cfg.seed)
+    allowed = None
+    if gen.reallocate_unfillable:
+        from csf.generation.adapters import ADAPTERS
+        allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+        unfillable = sorted(set(ADAPTERS) - allowed)
+        log.info("Reallocating %d unfillable slot(s) %s onto the runnable models in their "
+                 "family, so every family still reaches its specified size",
+                 len(unfillable), unfillable)
+    jobs = build_jobs(features, targets, seed=cfg.seed, allowed_models=allowed)
     write_jobs(jobs, jobs_csv)
     log.info("Job plan: %s", json.dumps(summarise(jobs)))
     return jobs
@@ -176,7 +184,8 @@ def stage_generate(cfg) -> Dict[str, object]:
     scheduler = GenerationScheduler(
         video_root=root, envs_root=Path(gen.envs_root), log_dir=log_dir, gpus=gen.gpus,
         job_timeout=gen.job_timeout_s, fail_fast=gen.fail_fast, min_free_gb=gen.min_free_gb,
-        offline=gen.offline, deadline_hours=gen.deadline_hours)
+        offline=gen.offline, deadline_hours=gen.deadline_hours,
+        gpu_vram_gb=gen.gpu_vram_gb, max_workers_per_gpu=gen.max_workers_per_gpu)
     ledger = Ledger(Path(gen.ledger))
 
     summary = scheduler.run(jobs, ledger, retry_failed=gen.retry_failed)

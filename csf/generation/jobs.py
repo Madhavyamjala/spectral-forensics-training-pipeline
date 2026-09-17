@@ -40,7 +40,7 @@ import random
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from csf.generation import spec as S
 from csf.generation.filters import qualifying
@@ -152,15 +152,16 @@ EXPRESSION_INTENSITY = (0.3, 0.5, 0.7, 0.9)
 # --------------------------------------------------------------------------------------
 
 
-def object_operations(target: int) -> Dict[str, List[str]]:
+def object_operations(target: int, allowed: Optional[Set[str]] = None) -> Dict[str, List[str]]:
     """Per-model removal/insertion lists for the object family, scaled to `target`.
 
     The document fixes the split per model; scaling keeps those ratios and still lands on the
     column totals produced by `spec.family_matrix`.
     """
-    _, cols, _ = S.family_matrix(S.OBJECT_EDIT, target)
+    pipelines = S.family_pipelines(S.OBJECT_EDIT, allowed)
+    _, cols, _ = S.family_matrix(S.OBJECT_EDIT, target, allowed)
     out: Dict[str, List[str]] = {}
-    for pipe, col_total in zip(S.OBJECT_EDIT.pipelines, cols):
+    for pipe, col_total in zip(pipelines, cols):
         base = S.OBJECT_OPERATION_SPLIT[pipe.key]
         names = ["object_removal", "object_insertion"]
         weights = [base[n] for n in names]
@@ -321,7 +322,13 @@ def assign_splits(jobs: Sequence[Job], seed: int) -> None:
 
 
 def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str, int]] = None,
-               seed: int = 42) -> List[Job]:
+               seed: int = 42, allowed_models: Optional[Set[str]] = None) -> List[Job]:
+    """Expand the plan into one job per output video.
+
+    `allowed_models` restricts each family to the pipelines that can actually be run and
+    redistributes that family's target across them, so the family still reaches its specified
+    size. Without it, slots with no runnable model simply produce nothing.
+    """
     targets = targets or S.FAMILY_TARGETS
     allocator = ClipAllocator(features, seed)
     jobs: List[Job] = []
@@ -329,7 +336,8 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
 
     for family in S.FAMILY_LIST:
         target = targets[family.key]
-        rows, cols, grid = S.family_matrix(family, target)
+        pipelines = S.family_pipelines(family, allowed_models)
+        rows, cols, grid = S.family_matrix(family, target, allowed_models)
 
         # secondary breakdowns, drawn per family then consumed per cell
         variant_pool: List[str] = []
@@ -341,14 +349,15 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
         if mask_sizes:
             _rng(seed, family.key, "mask_size").shuffle(mask_sizes)
             _rng(seed, family.key, "mask_motion").shuffle(mask_motions)
-        operations = object_operations(target) if family.key == "object_insertion_removal" else {}
+        operations = (object_operations(target, allowed_models)
+                      if family.key == "object_insertion_removal" else {})
         for key in operations:
             _rng(seed, family.key, "ops", key).shuffle(operations[key])
         op_cursor: Dict[str, int] = defaultdict(int)
 
         v_cursor = 0
         for i, group in enumerate(family.source_groups):
-            for j, pipe in enumerate(family.pipelines):
+            for j, pipe in enumerate(pipelines):
                 n = grid[i][j]
                 if n == 0:
                     continue

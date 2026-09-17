@@ -73,6 +73,7 @@ class Adapter:
     tier: int = 1                              # 1 = wired up and expected to run; 2 = scaffold
     actual_model: str = ""                     # empty => the slot runs its own named model
     cost_s: float = 60.0                       # measured/estimated seconds per video, for planning
+    vram_gb: float = 8.0                       # peak VRAM per worker, for per-GPU concurrency
     options: Dict[str, object] = field(default_factory=dict)
     note: str = ""
 
@@ -310,29 +311,38 @@ class WorkerPool:
         self._workers: Dict[tuple, WorkerProcess] = {}
         self._order: List[tuple] = []
         self._envs: Dict[str, ReadyEnv] = {}
+        self._lock = threading.RLock()
 
     def _env(self, spec: EnvSpec) -> ReadyEnv:
-        if spec.name not in self._envs:
-            self._envs[spec.name] = build_env(spec, self.envs_root, offline=self.offline)
-        return self._envs[spec.name]
+        with self._lock:
+            if spec.name not in self._envs:
+                self._envs[spec.name] = build_env(spec, self.envs_root, offline=self.offline)
+            return self._envs[spec.name]
 
-    def get(self, adapter: Adapter, spec: EnvSpec, gpu: int) -> WorkerProcess:
-        key = (adapter.key, gpu)
+    def get(self, adapter: Adapter, spec: EnvSpec, gpu: int, slot: int = 0) -> WorkerProcess:
+        """A live worker for (adapter, gpu, slot). `slot` lets one GPU hold several workers of
+        the same model, which is what fills a 143 GB card running a 3 GB net."""
+        key = (adapter.key, gpu, slot)
+        with self._lock:
+            return self._get_locked(adapter, spec, gpu, slot, key)
+
+    def _get_locked(self, adapter: Adapter, spec: EnvSpec, gpu: int, slot: int,
+                    key: tuple) -> WorkerProcess:
         worker = self._workers.get(key)
         if worker is not None and worker.alive():
             self._touch(key)
             return worker
         if worker is not None:
-            log.warning("Worker %s on GPU %d died -> restarting", adapter.key, gpu)
+            log.warning("Worker %s on GPU %d (slot %d) died -> restarting", adapter.key, gpu, slot)
             worker.stop()
             self._workers.pop(key, None)
             if key in self._order:
                 self._order.remove(key)
 
-        resident = [k for k in self._order if k[1] == gpu]
+        resident = [k for k in self._order if k[1] == gpu and k[0] != adapter.key]
         while len(resident) >= self.max_resident:
             victim = resident.pop(0)
-            log.info("Retiring worker %s on GPU %d to free VRAM", victim[0], victim[1])
+            log.info("Retiring worker %s on GPU %d slot %d to free VRAM", *victim)
             self._workers.pop(victim).stop()
             self._order.remove(victim)
 
@@ -349,6 +359,10 @@ class WorkerPool:
             self._order.append(key)
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
         for key, worker in list(self._workers.items()):
             log.debug("Stopping worker %s", key)
             worker.stop()

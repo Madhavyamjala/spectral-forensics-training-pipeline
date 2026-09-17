@@ -27,11 +27,13 @@ Output: mp4s under `<video_root>/AI Edited/<family>/`, ledger.jsonl, failures.cs
 
 from __future__ import annotations
 
+import itertools
 import json
 import shutil
 import threading
 import time
 from collections import defaultdict
+from queue import Empty, Queue
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -45,6 +47,23 @@ from csf.logging_utils import get_logger
 log = get_logger("generation.scheduler")
 
 DEFAULT_COST = 60.0
+#: Fraction of a card's VRAM we are willing to commit to resident workers.
+VRAM_HEADROOM = 0.85
+
+
+def concurrency_for(model: str, gpu_vram_gb: float, cap: int) -> int:
+    """How many workers of `model` to run on one GPU.
+
+    An H200 has 143 GB and INSwapper needs ~3 GB, so one worker per card wastes almost all of
+    it. The small nets are latency-bound anyway - they spend most of their time decoding video
+    and detecting faces on the CPU - so several in parallel scale nearly linearly. Diffusion
+    samplers already saturate the SMs and gain far less, but they are also the ones whose VRAM
+    footprint limits the count, so the same formula handles both.
+    """
+    a = ADAPTERS.get(model)
+    vram = a.vram_gb if a is not None else 8.0
+    fit = int((gpu_vram_gb * VRAM_HEADROOM) // max(1.0, vram))
+    return max(1, min(cap, fit))
 
 
 def cost_of(model: str) -> float:
@@ -170,7 +189,8 @@ class Progress:
 class GenerationScheduler:
     def __init__(self, video_root: Path, envs_root: Path, log_dir: Path, gpus: Sequence[int],
                  job_timeout: int = 1800, fail_fast: int = 8, min_free_gb: float = 50.0,
-                 offline: bool = False, deadline_hours: Optional[float] = None):
+                 offline: bool = False, deadline_hours: Optional[float] = None,
+                 gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1):
         self.video_root = Path(video_root)
         self.envs_root = Path(envs_root)
         self.log_dir = Path(log_dir)
@@ -180,6 +200,8 @@ class GenerationScheduler:
         self.min_free_gb = min_free_gb
         self.offline = offline
         self.deadline = (time.monotonic() + deadline_hours * 3600.0) if deadline_hours else None
+        self.gpu_vram_gb = gpu_vram_gb
+        self.max_workers_per_gpu = max(1, max_workers_per_gpu)
         self.failures: List[Tuple[str, str, str]] = []
         self._fail_lock = threading.Lock()
 
@@ -232,7 +254,7 @@ class GenerationScheduler:
 
     def _gpu_loop(self, gpu: int, models: Sequence[str], groups: Dict[str, List[Job]],
                   ledger: Ledger, progress: Progress, specs) -> None:
-        pool = WorkerPool(self.envs_root, self.log_dir, max_resident=1,
+        pool = WorkerPool(self.envs_root, self.log_dir, max_resident=self.max_workers_per_gpu,
                           job_timeout=self.job_timeout, offline=self.offline)
         try:
             for model in models:
@@ -248,8 +270,9 @@ class GenerationScheduler:
                    progress: Progress, specs) -> None:
         adapter = adapter_for(model)
         spec = specs[adapter.env_name]
-        log.info("GPU %d: starting model '%s' (%d videos, env %s)", gpu, model, len(jobs),
-                 adapter.env_name)
+        slots = concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu)
+        log.info("GPU %d: starting model '%s' (%d videos, env %s, %d worker(s) x %.0f GB)",
+                 gpu, model, len(jobs), adapter.env_name, slots, adapter.vram_gb)
 
         if not adapter.implemented:
             reason = f"NotImplemented[{model}]: {adapter.note or 'no runnable public release wired up'}"
@@ -261,69 +284,90 @@ class GenerationScheduler:
                 progress.update(False)
             return
 
-        try:
-            worker = pool.get(adapter, spec, gpu)
-        except (AdapterError, EnvBuildError) as exc:
-            reason = f"worker/env unavailable: {exc}"[:500]
-            log.error("GPU %d: cannot start '%s': %s", gpu, model, reason)
-            for job in jobs:
-                ledger.record(Outcome(job.job_id, False, error=reason))
-                self._note_failure(job, reason)
-                progress.update(False)
-            return
+        queue: "Queue[Optional[Job]]" = Queue()
+        for job in jobs:
+            queue.put(job)
+        abandon = threading.Event()
+        consecutive = itertools.count()
+        fail_streak = [0]
+        streak_lock = threading.Lock()
 
-        consecutive = 0
-        for i, job in enumerate(jobs):
-            if self.deadline and time.monotonic() > self.deadline:
-                log.warning("GPU %d: deadline reached inside '%s' after %d/%d videos",
-                            gpu, model, i, len(jobs))
-                return
-            if not self._disk_ok():
-                return
-
-            out = self.output_path(job)
-            if out.exists() and out.stat().st_size > 0 and not ledger.seen(job.job_id):
-                ledger.record(Outcome(job.job_id, True, str(out)))
-                progress.update(True)
-                continue
-
-            started = time.monotonic()
-            # always ask the pool: a worker that died on the previous job has been replaced,
-            # and holding a stale reference here would burn a retry on every single job
+        def slot_loop(slot: int) -> None:
             try:
-                worker = pool.get(adapter, spec, gpu)
+                worker = pool.get(adapter, spec, gpu, slot)
             except (AdapterError, EnvBuildError) as exc:
-                outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500])
+                reason = f"worker/env unavailable: {exc}"[:500]
+                log.error("GPU %d slot %d: cannot start '%s': %s", gpu, slot, model, reason)
+                if slot == 0:                      # slot 0 failing means the model cannot run
+                    abandon.set()
+                    self._drain(queue, ledger, progress, reason)
+                return
+
+            while not abandon.is_set():
+                if self.deadline and time.monotonic() > self.deadline:
+                    log.warning("GPU %d slot %d: deadline reached inside '%s'", gpu, slot, model)
+                    return
+                if not self._disk_ok():
+                    abandon.set()
+                    return
+                try:
+                    job = queue.get_nowait()
+                except Empty:
+                    return
+
+                out = self.output_path(job)
+                if out.exists() and out.stat().st_size > 0 and not ledger.seen(job.job_id):
+                    ledger.record(Outcome(job.job_id, True, str(out)))
+                    progress.update(True)
+                    continue
+
+                started = time.monotonic()
+                try:
+                    worker = pool.get(adapter, spec, gpu, slot)
+                except (AdapterError, EnvBuildError) as exc:
+                    outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500])
+                else:
+                    outcome = self._run_one(worker, pool, adapter, spec, gpu, job, out, slot)
+                outcome.seconds = time.monotonic() - started
                 ledger.record(outcome)
-                progress.update(False)
-                self._note_failure(job, outcome.error)
-                consecutive += 1
-                if consecutive >= self.fail_fast:
-                    log.error("GPU %d: '%s' cannot start a worker -> abandoning the group", gpu, model)
-                    return
-                continue
-            outcome = self._run_one(worker, pool, adapter, spec, gpu, job, out)
-            outcome.seconds = time.monotonic() - started
-            ledger.record(outcome)
-            progress.update(outcome.ok)
-            if outcome.ok:
-                consecutive = 0
-            else:
-                consecutive += 1
-                self._note_failure(job, outcome.error)
-                if consecutive >= self.fail_fast:
-                    log.error("GPU %d: '%s' failed %d times in a row -> abandoning the group. "
-                              "Last error: %s", gpu, model, consecutive, outcome.error[:300])
-                    for rest in jobs[i + 1:]:
-                        reason = f"group abandoned after {consecutive} consecutive failures"
-                        ledger.record(Outcome(rest.job_id, False, error=reason))
-                        self._note_failure(rest, reason)
-                        progress.update(False)
-                    return
+                progress.update(outcome.ok)
+
+                with streak_lock:
+                    if outcome.ok:
+                        fail_streak[0] = 0
+                    else:
+                        fail_streak[0] += 1
+                        self._note_failure(job, outcome.error)
+                        if fail_streak[0] >= self.fail_fast and not abandon.is_set():
+                            log.error("GPU %d: '%s' failed %d times in a row -> abandoning the "
+                                      "group. Last error: %s", gpu, model, fail_streak[0],
+                                      outcome.error[:300])
+                            abandon.set()
+                            self._drain(queue, ledger, progress,
+                                        f"group abandoned after {fail_streak[0]} consecutive failures")
+
+        threads = [threading.Thread(target=slot_loop, args=(i,), name=f"gpu{gpu}-{model}-{i}")
+                   for i in range(slots)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         log.info("GPU %d: finished model '%s'", gpu, model)
 
+    def _drain(self, queue: "Queue[Optional[Job]]", ledger: Ledger, progress: Progress,
+               reason: str) -> None:
+        """Record every remaining job in an abandoned group as failed."""
+        while True:
+            try:
+                job = queue.get_nowait()
+            except Empty:
+                return
+            ledger.record(Outcome(job.job_id, False, error=reason))
+            self._note_failure(job, reason)
+            progress.update(False)
+
     def _run_one(self, worker, pool: WorkerPool, adapter, spec, gpu: int, job: Job,
-                 out: Path) -> Outcome:
+                 out: Path, slot: int = 0) -> Outcome:
         payload = adapter.payload(job, out, gpu)
         for attempt in (1, 2):
             try:
@@ -333,7 +377,7 @@ class GenerationScheduler:
                     log.warning("Worker %s died on %s (%s) -> restarting and retrying once",
                                 adapter.key, job.job_id, str(exc)[:200])
                     try:
-                        worker = pool.get(adapter, spec, gpu)
+                        worker = pool.get(adapter, spec, gpu, slot)
                         continue
                     except (AdapterError, EnvBuildError) as exc2:
                         return Outcome(job.job_id, False, error=f"restart failed: {exc2}"[:500])

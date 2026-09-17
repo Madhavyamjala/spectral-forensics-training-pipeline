@@ -271,9 +271,81 @@ def test_budget() -> None:
           f"({p.coverage:.1%}), {p.gpu_hours_used:.0f} GPU-h")
 
 
+def test_reallocation() -> None:
+    print("reallocation")
+    allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+    unfillable = set(ADAPTERS) - allowed
+
+    total = 0
+    for family in S.FAMILY_LIST:
+        target = S.FAMILY_TARGETS[family.key]
+        pipelines = S.family_pipelines(family, allowed)
+        rows, cols, grid = S.family_matrix(family, target, allowed)
+        check(f"{family.key} still reaches its specified size", sum(cols) == target,
+              f"{sum(cols)} != {target}")
+        check(f"{family.key} keeps its source-group mix", sum(rows) == target)
+        check(f"{family.key} drops only unfillable pipelines",
+              not ({p.key for p in pipelines} & unfillable))
+        for i, r in enumerate(grid):
+            if sum(r) != rows[i]:
+                check(f"{family.key} row {i} margin", False)
+        total += sum(cols)
+    check("reallocated plan totals 33,333", total == 33333, str(total))
+
+    features = synthetic_pool(per_label=400)
+    jobs = build_jobs(features, seed=42, allowed_models=allowed)
+    check("reallocated job count is 33,333", len(jobs) == 33333, str(len(jobs)))
+    check("no job targets an unfillable slot",
+          not ({j.model for j in jobs} & unfillable))
+    check("reallocated plan is reproducible",
+          [j.job_id for j in jobs] ==
+          [j.job_id for j in build_jobs(features, seed=42, allowed_models=allowed)])
+    splits = defaultdict(set)
+    for j in jobs:
+        splits[j.source_clip_id].add(j.split)
+    check("reallocation keeps splits leakage-free",
+          not [k for k, v in splits.items() if len(v) > 1])
+    check("every family still has >=1 renderer",
+          len({ADAPTERS[j.model].runs for j in jobs}) >= 8)
+
+    # object family's removal/insertion allocation must survive losing a pipeline
+    ops = Counter(j.operation for j in jobs if j.family == "object_insertion_removal")
+    check("object operations still sum to the family target",
+          sum(ops.values()) == S.FAMILY_TARGETS["object_insertion_removal"])
+    print(f"       33,333 videos across {len({ADAPTERS[j.model].runs for j in jobs})} renderers")
+
+
+def test_concurrency() -> None:
+    print("concurrency model")
+    from csf.generation.budget import effective_speedup, wall_clock_estimate
+    from csf.generation.scheduler import concurrency_for
+
+    check("a 3 GB model packs many workers into 143 GB",
+          concurrency_for("inswapper", 143.0, 6) == 6)
+    check("a 26 GB model packs fewer", concurrency_for("bg_flux_image", 143.0, 6) == 4,
+          str(concurrency_for("bg_flux_image", 143.0, 6)))
+    check("concurrency never drops below 1",
+          concurrency_for("bg_flux_image", 8.0, 6) == 1)
+    check("cap is respected", concurrency_for("inswapper", 143.0, 2) == 2)
+
+    check("one worker means no speedup", effective_speedup("inswapper", 1) == 1.0)
+    check("diffusion gains less than small nets",
+          effective_speedup("insv2v", 4) < effective_speedup("inswapper", 4))
+
+    allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+    serial = wall_clock_estimate(4, 1, allowed=allowed)
+    conc = wall_clock_estimate(4, 4, allowed=allowed)
+    check("reallocated estimate covers 33,333", serial["videos"] == 33333)
+    check("concurrency reduces wall clock",
+          conc["wall_clock_hours"] < serial["wall_clock_hours"])
+    check("concurrency never invents capacity",
+          conc["gpu_hours_effective"] <= serial["gpu_hours_serial"])
+    print(f"       4 GPUs x 4 workers -> {conc['wall_clock_days']} days for 33,333 videos")
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
-               test_substitutions, test_budget):
+               test_substitutions, test_budget, test_reallocation, test_concurrency):
         fn()
     print()
     if FAILURES:

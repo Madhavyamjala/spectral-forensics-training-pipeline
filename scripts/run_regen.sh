@@ -14,7 +14,8 @@
 # Inspection (no side effects):
 #   bash scripts/run_regen.sh --plan      the 33,333-video allocation
 #   bash scripts/run_regen.sh --adapters  per-model status: slot, renderer, videos, GPU-hours
-#   bash scripts/run_regen.sh --budget 84 which models fit in 84 h on 3 GPUs
+#   bash scripts/run_regen.sh --budget 84 which models fit in 84 h
+#   bash scripts/run_regen.sh --eta      time to produce the full 33,333
 #
 # Any extra arguments are passed through to main.py, e.g.
 #   bash scripts/run_regen.sh --generate --set generation.only_models='[inswapper]'
@@ -29,8 +30,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-# GPUs 0 and 1 run the vLLM workers - never touch them.
-export CSF_TRAIN_GPUS="${CSF_TRAIN_GPUS:-2,3,4}"
+# GPU 0 is left to the vLLM workers.
+export CSF_TRAIN_GPUS="${CSF_TRAIN_GPUS:-1,2,3,4}"
 
 PHASE="${1:---all}"; shift || true
 
@@ -53,7 +54,10 @@ case "$PHASE" in
   --adapters) exec "$PY" -m csf.generation.adapters ;;
   --budget)
     HOURS="${1:-84}"
-    exec "$PY" -m csf.generation.budget --hours "$HOURS" --gpus 3
+    exec "$PY" -m csf.generation.budget --hours "$HOURS" --gpus 4 --workers-per-gpu 4
+    ;;
+  --eta)
+    exec "$PY" -m csf.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
     ;;
   --kinetics) gen_stage kinetics "$@" ;;
   --generate) gen_stage generate "$@" ;;

@@ -107,37 +107,83 @@ generation:
 Leave it `false` (the default) and the slot is simply skipped. Decide before generating, not
 after.
 
-## 2a. Fitting the run into a week
+## 2a. Reaching the full 33,333
 
-Running every wired model costs **≈523 GPU-hours - about 7.3 days on three GPUs**, before any
-training. That does not fit a one-week end-to-end target, so the model set is chosen up front:
+Six slots cannot be filled at any compute budget. To still produce the number the document
+specifies, `generation.reallocate_unfillable` (on by default) re-apportions each family's target
+across the models in that family that *do* run. Family totals and source-group mixes are
+preserved exactly; only the per-pipeline split changes.
 
-```bash
-python -m csf.generation.budget --hours 84 --gpus 3       # preview
+```
+face_swap                        6250   dreamid_v=2344, reface=1953, inswapper=1953
+facial_reenactment               5250   liveportrait=1750, fomm=1750, tpsmm=1750
+lip_sync                         5250   wav2lip=1313, musetalk=1313, latentsync=1312, sadtalker=1312
+expression_attribute_editing     4750   liveportrait_expr=2500, styleganex=2250
+object_insertion_removal         3500   propainter_object=900, diffueraser=900, vace=1700
+background_manipulation          3000   bg_real_composite/flux/svd/propainter = 750 each
+video_inpainting                 3000   propainter_inpaint=900, e2fgvi_hq=750, sttn=650, fuseformer=700
+video_to_video                   2333   tokenflow=785, vace=1548
+TOTAL                           33333   24 distinct renderers
 ```
 
-Selection is two-phase, because raw efficiency alone would spend everything on the cheap face
-models and leave video-to-video empty:
+Set it to `false` to leave the unfillable slots empty and produce 26,828 instead.
 
-1. **diversity floor** - guarantee at least `budget_diversity_floor` (default 2) *distinct
-   renderers* per family. Renderers, not slots: two VACE slots are one mechanism.
-2. **efficiency fill** - spend the rest on videos-per-GPU-hour.
+## 2b. Per-GPU concurrency
 
-At 84 h × 3 GPUs this selects **18 models, 18,941 videos (56.8%), 240 GPU-hours**, with every
-family covered by at least two renderers except expression editing (which has only one wired
-model in total).
+The scheduler runs several workers of the same model on one card. This is not a micro-
+optimisation: an H200 has 143 GB and INSwapper needs ~3 GB, so one worker per card leaves the
+GPU almost entirely idle. The small nets are latency-bound anyway — most of a job is video
+decoding and face detection on the CPU — so they scale nearly linearly. Diffusion samplers
+already saturate the SMs and gain far less, but their VRAM footprint caps the worker count, so
+one formula covers both:
 
-This is preferred over relying on `deadline_hours`, which stops whichever group is in flight when
-it fires and so shapes the dataset by scheduling order. Set
-`generation.budget_wall_clock_hours: null` to run everything and accept the extra days.
+```
+workers = clamp(gpu_vram_gb * 0.85 / adapter.vram_gb, 1, max_workers_per_gpu)
+```
+
+Measured on a stub workload: **3.81× throughput at 4 workers**, with no duplicated or lost jobs.
+
+### Time to the full 33,333
+
+```
+workers/GPU   effective GPU-h   wall clock on 4 GPUs
+          1             612             6.4 days
+          2             419             4.4 days
+          4             377             3.9 days      <- default
+          6             377             3.9 days      (concurrency saturates)
+```
+
+```bash
+python -m csf.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
+```
+
+Raise `generation.max_workers_per_gpu` past 4 and nothing improves — the diffusion models are
+compute-bound by then. Getting below ~3.9 days needs more GPUs, not more workers.
+
+## 2c. Fitting a smaller window
+
+If you would rather cap wall-clock time than produce everything, set
+`generation.budget_wall_clock_hours`. The planner then picks the model set up front, keeping at
+least `budget_diversity_floor` (default 2) *distinct renderers* per family — renderers, not
+slots, since two VACE slots are one mechanism — and spending the rest on volume.
+
+```bash
+python -m csf.generation.budget --hours 84 --gpus 3      # 18 models, 18,941 videos
+```
+
+This is preferred over `deadline_hours`, which stops whichever group is in flight when it fires
+and so shapes the dataset by scheduling order. `deadline_hours` remains as a hard backstop.
 
 ## 3. Hardware assumptions
 
-Written for `tfgpu.cs.fiu.edu`: 6 × H200 NVL (143 GB). **GPUs 0 and 1 are held by vLLM workers**,
-so everything here uses **GPUs 2, 3 and 4** and never touches the others.
+Written for `tfgpu.cs.fiu.edu`: 6 × H200 NVL (143 GB). The default config uses **GPUs 1–4**,
+leaving GPU 0 to the vLLM workers.
 
-- Generation pins its own workers via `generation.gpus: [2, 3, 4]`.
-- Training uses `CUDA_VISIBLE_DEVICES=2,3,4` (`CSF_TRAIN_GPUS` overrides it).
+- Generation pins its own workers via `generation.gpus: [1, 2, 3, 4]`, with
+  `max_workers_per_gpu: 4` processes on each.
+- Training uses `CUDA_VISIBLE_DEVICES=1,2,3,4` (`CSF_TRAIN_GPUS` overrides it).
+- Adding GPUs is the only way below ~3.9 days for the full set; more workers per GPU does not
+  help once the diffusion models dominate.
 
 Disk: budget ~1.2 TB — Kinetics source clips (~250 GB after filtering), the 33k generated videos
 (~350 GB), the per-model environments (~120 GB, mostly duplicated torch builds), and the feature
@@ -217,7 +263,12 @@ cache/regen/envs/videoinpaint/repos/E2FGVI/release_model/E2FGVI-HQ-CVPR22.pth
 cache/regen/envs/videoinpaint/repos/STTN/checkpoints/sttn.pth
 cache/regen/envs/videoinpaint/repos/FuseFormer/checkpoints/fuseformer.pth
 cache/regen/envs/tpsmm/repos/TPSMM/checkpoints/vox.pth.tar
+cache/regen/envs/stylegan/repos/StyleGANEX/pretrained_models/styleganex_editing.pt
 ```
+
+StyleGANEX is worth the manual step specifically: it is the expression family's only second
+mechanism. Without it, reallocation sends all 4,750 of that family's videos through LivePortrait
+alone, and the per-method breakdown for the family becomes meaningless.
 
 Everything else fetches itself. Two adapters call an upstream downloader during the env build
 (SadTalker's `download_models.sh`, LivePortrait's `huggingface-cli download`); if those fail, the

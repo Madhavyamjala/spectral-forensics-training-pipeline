@@ -83,6 +83,26 @@ class BudgetPlan:
                 "selected": self.selected, "skipped": self.skipped, "unwired": self.unwired}
 
 
+#: Renderers whose jobs saturate the GPU's SMs - diffusion samplers. Extra concurrent workers
+#: buy them little, whereas the small GAN/ONNX nets spend most of a job decoding video and
+#: detecting faces on the CPU and scale nearly linearly.
+SATURATING = {"dreamid_v", "vace", "bg_svd_video", "bg_flux_image", "tokenflow", "latentsync",
+              "diffueraser", "reface", "musetalk"}
+SPEEDUP_SATURATING = 1.3
+SPEEDUP_LATENCY_BOUND = 3.5
+
+
+def effective_speedup(model: str, workers_per_gpu: int) -> float:
+    """Throughput multiplier from running `workers_per_gpu` workers of `model` on one card."""
+    if workers_per_gpu <= 1:
+        return 1.0
+    a = ADAPTERS.get(model)
+    runs = a.runs if a is not None else model
+    ceiling = SPEEDUP_SATURATING if (runs in SATURATING or model in SATURATING) \
+        else SPEEDUP_LATENCY_BOUND
+    return min(float(workers_per_gpu), ceiling)
+
+
 def model_costs(targets: Optional[Dict[str, int]] = None) -> List[ModelCost]:
     per_model = videos_per_model(targets)
     out = []
@@ -173,17 +193,60 @@ def family_breakdown(p: BudgetPlan, targets: Optional[Dict[str, int]] = None
     return out
 
 
+def wall_clock_estimate(gpus: int, workers_per_gpu: int, allowed: Optional[set] = None,
+                        targets: Optional[Dict[str, int]] = None) -> Dict[str, object]:
+    """Wall-clock hours for a model set, accounting for per-GPU concurrency.
+
+    With `allowed`, each family's target is re-apportioned across the runnable models (the
+    `reallocate_unfillable` behaviour), so the totals reflect what will actually be generated.
+    """
+    targets = targets or S.FAMILY_TARGETS
+    counts: Dict[str, int] = {}
+    if allowed is None:
+        counts = {k: v for k, v in videos_per_model(targets).items() if ADAPTERS[k].implemented}
+    else:
+        for family in S.FAMILY_LIST:
+            pipelines = S.family_pipelines(family, allowed)
+            _, cols, _ = S.family_matrix(family, targets[family.key], allowed)
+            for pipe, n in zip(pipelines, cols):
+                counts[pipe.key] = n
+    serial = sum(n * ADAPTERS[k].cost_s / 3600.0 for k, n in counts.items())
+    effective = sum(n * ADAPTERS[k].cost_s / 3600.0 / effective_speedup(k, workers_per_gpu)
+                    for k, n in counts.items())
+    return {"videos": sum(counts.values()),
+            "gpu_hours_serial": round(serial, 1),
+            "gpu_hours_effective": round(effective, 1),
+            "gpus": gpus, "workers_per_gpu": workers_per_gpu,
+            "wall_clock_hours": round(effective / max(1, gpus), 1),
+            "wall_clock_days": round(effective / max(1, gpus) / 24.0, 2)}
+
+
 def _main() -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description="Fit the generation run into a wall-clock budget")
     ap.add_argument("--hours", type=float, default=84.0, help="wall-clock hours available")
     ap.add_argument("--gpus", type=int, default=3)
+    ap.add_argument("--workers-per-gpu", type=int, default=1)
+    ap.add_argument("--reallocate", action="store_true",
+                    help="re-apportion unfillable slots onto runnable models (full 33,333)")
     ap.add_argument("--floor", type=int, default=DIVERSITY_FLOOR,
                     help="distinct mechanisms to guarantee per family")
     ap.add_argument("--pin", default="", help="comma-separated models to always include")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    if args.reallocate:
+        allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+        est = wall_clock_estimate(args.gpus, args.workers_per_gpu, allowed=allowed)
+        print(f"Reallocated plan (every family reaches its specified size)\n")
+        print(f"  videos                 : {est['videos']:,}")
+        print(f"  cost, 1 worker/GPU     : {est['gpu_hours_serial']:,} GPU-hours")
+        print(f"  cost, {args.workers_per_gpu} workers/GPU    : "
+              f"{est['gpu_hours_effective']:,} GPU-hours effective")
+        print(f"  wall clock on {args.gpus} GPUs   : {est['wall_clock_hours']:,} h "
+              f"= {est['wall_clock_days']} days")
+        return 0
 
     budget = args.hours * args.gpus
     pinned = [s.strip() for s in args.pin.split(",") if s.strip()]

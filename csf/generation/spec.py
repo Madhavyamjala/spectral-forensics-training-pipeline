@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # --------------------------------------------------------------------------------------
 # apportionment helpers
@@ -586,22 +586,45 @@ FAMILY_TARGETS: Dict[str, int] = family_targets()
 # --------------------------------------------------------------------------------------
 
 
-def family_matrix(family: Family, target: int) -> Tuple[List[int], List[int], List[List[int]]]:
-    """(row totals, column totals, cells) for one family scaled to `target` videos."""
+def family_pipelines(family: Family, allowed: Optional[Set[str]] = None) -> List[Pipeline]:
+    """The family's pipelines, optionally restricted to a set of runnable models.
+
+    Six of the document's models have no runnable public release. Restricting to the rest and
+    re-apportioning is what lets a family still hit its specified total: the family size and its
+    source-content mix are preserved exactly, and only the per-pipeline split changes.
+    """
+    if allowed is None:
+        return list(family.pipelines)
+    kept = [p for p in family.pipelines if p.key in allowed]
+    if not kept:
+        raise ValueError(f"family {family.key!r} has no runnable pipeline in {sorted(allowed)}")
+    return kept
+
+
+def family_matrix(family: Family, target: int, allowed: Optional[Set[str]] = None
+                  ) -> Tuple[List[int], List[int], List[List[int]]]:
+    """(row totals, column totals, cells) for one family scaled to `target` videos.
+
+    With `allowed`, the target is redistributed across only those pipelines, so the family still
+    produces `target` videos even though some of its models cannot be run.
+    """
+    pipelines = family_pipelines(family, allowed)
     rows = apportion(target, [g.weight for g in family.source_groups])
-    cols = apportion(target, [p.weight for p in family.pipelines])
+    cols = apportion(target, [p.weight for p in pipelines])
     return rows, cols, cross_split(rows, cols)
 
 
-def build_plan(targets: Dict[str, int] | None = None) -> List[Cell]:
+def build_plan(targets: Dict[str, int] | None = None,
+               allowed: Optional[Set[str]] = None) -> List[Cell]:
     """Flat list of every (family, source group, model) bucket with its video count."""
     targets = targets or FAMILY_TARGETS
     cells: List[Cell] = []
     for family in FAMILY_LIST:
         target = targets[family.key]
-        _, _, grid = family_matrix(family, target)
+        pipelines = family_pipelines(family, allowed)
+        _, _, grid = family_matrix(family, target, allowed)
         for i, group in enumerate(family.source_groups):
-            for j, pipe in enumerate(family.pipelines):
+            for j, pipe in enumerate(pipelines):
                 if grid[i][j] > 0:
                     cells.append(Cell(family.key, group.key, pipe.key, grid[i][j],
                                       family.source_filter, group.labels))

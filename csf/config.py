@@ -176,6 +176,15 @@ class GenerationConfig:
     budget_wall_clock_hours: Optional[float] = None
     budget_diversity_floor: int = 2                           # distinct renderers per family
     budget_pin_models: List[str] = field(default_factory=list)
+    # Six of the document's models have no runnable release. With this set, each family's
+    # target is re-apportioned across the models that DO run, so every family still reaches the
+    # size the document specifies instead of coming up short.
+    reallocate_unfillable: bool = True
+    # Per-GPU concurrency. One worker per card leaves a 143 GB H200 almost idle on a 3 GB model,
+    # and the small nets are latency-bound (video decode, face detection) rather than
+    # compute-bound, so several in parallel scale nearly linearly.
+    gpu_vram_gb: float = 143.0
+    max_workers_per_gpu: int = 4
     # REFace's checkpoint is trained on CelebAMask-HQ: non-commercial research only. Its
     # adapter refuses to start unless this is set explicitly.
     accept_noncommercial: bool = False

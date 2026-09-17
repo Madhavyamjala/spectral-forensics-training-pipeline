@@ -289,7 +289,11 @@ ENVS: Dict[str, EnvSpec] = {
         name="stylegan", torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
                       "dlib", "tqdm"),
-        repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),)),
+        repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
+        note="Checkpoints are Drive-hosted upstream; stage "
+             "repos/StyleGANEX/pretrained_models/styleganex_editing.pt by hand. Wiring this "
+             "gives the expression family a second mechanism - without it, reallocation puts "
+             "all 4,750 of its videos through LivePortrait alone."),
     "ganimation": EnvSpec(
         name="ganimation", torch=TORCH_LEGACY, torch_index=LEGACY_INDEX,
         requirements=("opencv-python-headless", "numpy<2", "scipy", "imageio[ffmpeg]"),
@@ -326,9 +330,11 @@ ENVS: Dict[str, EnvSpec] = {
 # --------------------------------------------------------------------------------------
 
 def _a(key: str, family: str, env: str, worker: str, *, tier: int = 1, implemented: bool = True,
-       actual_model: str = "", cost_s: float = 60.0, note: str = "", **options) -> Adapter:
+       actual_model: str = "", cost_s: float = 60.0, vram_gb: float = 8.0, note: str = "",
+       **options) -> Adapter:
     return Adapter(key=key, family=family, env_name=env, worker=worker, implemented=implemented,
-                   tier=tier, actual_model=actual_model, cost_s=cost_s, options=options, note=note)
+                   tier=tier, actual_model=actual_model, cost_s=cost_s, vram_gb=vram_gb,
+                   options=options, note=note)
 
 
 #: Slots the specification names but that have no runnable public release. Each is filled by a
@@ -339,108 +345,110 @@ def _a(key: str, family: str, env: str, worker: str, *, tier: int = 1, implement
 ADAPTERS: Dict[str, Adapter] = {a.key: a for a in [
     # ---- background manipulation (3,000) ----
     _a("bg_real_composite", "background_manipulation", "sam2_diffusers", "worker_background.py",
-       cost_s=25.0, mode="real_composite"),
+       cost_s=25.0, mode="real_composite", vram_gb=6.0),
     _a("bg_flux_image", "background_manipulation", "sam2_diffusers", "worker_background.py",
-       cost_s=45.0, mode="flux_image", flux_id="black-forest-labs/FLUX.1-schnell", steps=4),
+       cost_s=45.0, mode="flux_image", flux_id="black-forest-labs/FLUX.1-schnell", steps=4, vram_gb=26.0),
     _a("bg_svd_video", "background_manipulation", "sam2_diffusers", "worker_background.py",
        cost_s=120.0, mode="svd_video", svd_id="stabilityai/stable-video-diffusion-img2vid-xt",
-       steps=25),
+       steps=25, vram_gb=24.0),
     _a("bg_propainter_recon", "background_manipulation", "propainter", "worker_propainter.py",
-       cost_s=70.0, mode="background_reconstruct"),
+       cost_s=70.0, mode="background_reconstruct", vram_gb=12.0),
 
     # ---- face swap (6,250) ----
-    _a("inswapper", "face_swap", "insightface", "worker_inswapper.py", cost_s=8.0),
+    _a("inswapper", "face_swap", "insightface", "worker_inswapper.py", cost_s=8.0, vram_gb=3.0),
     _a("simswap", "face_swap", "dreamid", "worker_dreamid.py", actual_model="dreamid_v",
        cost_s=150.0,
        note="SimSwap's weights are Drive-only. DreamID-V stands in: same identity-injection "
-            "role, DiT instead of GAN, 99.9% vs 95.24% ID retrieval."),
+            "role, DiT instead of GAN, 99.9% vs 95.24% ID retrieval.", vram_gb=22.0),
     _a("faceshifter", "face_swap", "reface", "worker_reface.py", actual_model="reface",
        cost_s=20.0,
        note="FaceShifter released no inference checkpoint. REFace stands in (diffusion "
-            "swap). NON-COMMERCIAL training data - see the env note."),
+            "swap). NON-COMMERCIAL training data - see the env note.", vram_gb=12.0),
     _a("face_transformer", "face_swap", "reface", "worker_unimplemented.py", tier=2,
        implemented=False,
        note="No maintained public release, and every candidate substitute duplicates a "
-            "mechanism already covered by inswapper/DreamID-V/REFace."),
+            "mechanism already covered by inswapper/DreamID-V/REFace.", vram_gb=12.0),
 
     # ---- facial reenactment (5,250) ----
-    _a("fomm", "facial_reenactment", "fomm", "worker_fomm.py", cost_s=25.0),
+    _a("fomm", "facial_reenactment", "fomm", "worker_fomm.py", cost_s=25.0, vram_gb=5.0),
     _a("face2face", "facial_reenactment", "liveportrait", "worker_liveportrait.py",
        actual_model="liveportrait", cost_s=20.0, mode="reenact",
        note="Face2Face was never publicly released. LivePortrait stands in: implicit-keypoint "
-            "animation with stitching/retargeting, distinct from FOMM's local affine warping."),
+            "animation with stitching/retargeting, distinct from FOMM's local affine warping.", vram_gb=6.0),
     _a("pirenderer", "facial_reenactment", "tpsmm", "worker_tpsmm.py", actual_model="tpsmm",
        cost_s=20.0,
        note="PIRenderer's checkpoints are Drive-hosted. TPSMM stands in - thin-plate-spline "
-            "warping, a different basis from FOMM. Its checkpoint also needs staging."),
+            "warping, a different basis from FOMM. Its checkpoint also needs staging.", vram_gb=5.0),
     _a("face2face_rho", "facial_reenactment", "tpsmm", "worker_unimplemented.py", tier=2,
        implemented=False,
        note="No unattended weight path, and the available substitutes are already used by the "
-            "face2face and pirenderer slots."),
+            "face2face and pirenderer slots.", vram_gb=5.0),
 
     # ---- lip-sync (5,250) - fully covered ----
-    _a("wav2lip", "lip_sync", "wav2lip", "worker_wav2lip.py", cost_s=30.0),
+    _a("wav2lip", "lip_sync", "wav2lip", "worker_wav2lip.py", cost_s=30.0, vram_gb=5.0),
     _a("musetalk", "lip_sync", "musetalk", "worker_musetalk.py", cost_s=25.0,
-       note="Genuinely available: download script pulls every component from the Hub."),
+       note="Genuinely available: download script pulls every component from the Hub.", vram_gb=11.0),
     _a("videoretalking", "lip_sync", "latentsync", "worker_latentsync.py",
        actual_model="latentsync", cost_s=60.0,
        note="VideoReTalking's bundle is Drive-hosted. LatentSync 1.6 stands in and beats it on "
-            "every reported metric (HDTF FID 7.03 vs 9.5, SyncConf 8.9 vs 7.5, FVD 193 vs 271)."),
+            "every reported metric (HDTF FID 7.03 vs 9.5, SyncConf 8.9 vs 7.5, FVD 193 vs 271).", vram_gb=15.0),
     _a("sadtalker", "lip_sync", "sadtalker", "worker_sadtalker.py", cost_s=90.0,
-       note="Genuinely available: Apache-2.0, download_models.sh pulls from GitHub Releases."),
+       note="Genuinely available: Apache-2.0, download_models.sh pulls from GitHub Releases.", vram_gb=9.0),
 
     # ---- expression / attribute editing (4,750) ----
     _a("ganimation", "expression_attribute_editing", "liveportrait", "worker_liveportrait.py",
        actual_model="liveportrait_expr", cost_s=20.0, mode="expression",
        note="GANimation published no weights. LivePortrait's retargeting ratios give the same "
-            "continuous expression-magnitude control the slot calls for."),
-    _a("styleganex", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
-       tier=2, implemented=False, note="Needs StyleGANEX + pSp weights staged manually."),
+            "continuous expression-magnitude control the slot calls for.", vram_gb=6.0),
+    _a("styleganex", "expression_attribute_editing", "stylegan", "worker_styleganex.py",
+       cost_s=35.0,
+       note="Weights are Drive-hosted and must be staged manually (see the env note), but it is "
+            "the family's only second mechanism, so it is worth the manual step.", vram_gb=10.0),
     _a("latent_transformer", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
-       tier=2, implemented=False, note="No unattended weight path."),
+       tier=2, implemented=False, note="No unattended weight path.", vram_gb=10.0),
     _a("vq_facial_editing", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",
-       tier=2, implemented=False, note="Never publicly released."),
+       tier=2, implemented=False, note="Never publicly released.", vram_gb=10.0),
 
     # ---- object insertion / removal (3,500) - fully covered ----
     _a("propainter_object", "object_insertion_removal", "propainter", "worker_propainter.py",
-       cost_s=70.0, mode="object"),
+       cost_s=70.0, mode="object", vram_gb=12.0),
     _a("object_wiper", "object_insertion_removal", "diffueraser", "worker_diffueraser.py",
        actual_model="diffueraser", cost_s=120.0,
        note="Object-WIPER has no public code. DiffuEraser stands in: diffusion removal, a "
-            "different artifact class from ProPainter's flow propagation."),
+            "different artifact class from ProPainter's flow propagation.", vram_gb=20.0),
     _a("anyv2v_object", "object_insertion_removal", "vace", "worker_vace.py",
        actual_model="vace", cost_s=180.0, task="inpainting",
-       note="AnyV2V needs an I2V backbone staged. VACE stands in for mask-guided insertion."),
+       note="AnyV2V needs an I2V backbone staged. VACE stands in for mask-guided insertion.", vram_gb=22.0),
     _a("videocomposer", "object_insertion_removal", "vace", "worker_vace.py",
        actual_model="vace", cost_s=180.0, task="inpainting",
        note="VideoComposer's weights need a manual request. VACE's reference-guided masked "
-            "editing covers the same conditioning."),
+            "editing covers the same conditioning.", vram_gb=22.0),
 
     # ---- video inpainting (3,000) - fully covered ----
     _a("propainter_inpaint", "video_inpainting", "propainter", "worker_propainter.py",
-       cost_s=70.0, mode="inpaint"),
+       cost_s=70.0, mode="inpaint", vram_gb=12.0),
     _a("e2fgvi_hq", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=45.0,
-       model="e2fgvi_hq"),
+       model="e2fgvi_hq", vram_gb=9.0),
     _a("sttn", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=35.0,
-       model="sttn"),
+       model="sttn", vram_gb=7.0),
     _a("fuseformer", "video_inpainting", "videoinpaint", "worker_videoinpaint.py", cost_s=40.0,
-       model="fuseformer"),
+       model="fuseformer", vram_gb=8.0),
 
     # ---- video-to-video (2,333) ----
     _a("tokenflow", "video_to_video", "tokenflow", "worker_tokenflow.py", cost_s=240.0,
-       sd_id="stabilityai/stable-diffusion-2-1-base", steps=50),
+       sd_id="stabilityai/stable-diffusion-2-1-base", steps=50, vram_gb=16.0),
     _a("insv2v", "video_to_video", "vace", "worker_vace.py", actual_model="vace", cost_s=180.0,
        task="depth",
        note="InsV2V's weights are Drive-hosted. VACE stands in for prompt-driven whole-frame "
-            "transformation."),
+            "transformation.", vram_gb=22.0),
     _a("anyv2v_style", "video_to_video", "vace", "worker_vace.py", actual_model="vace",
        cost_s=180.0, task="depth",
-       note="Same substitution as the object slot; recorded as vace in the manifest."),
+       note="Same substitution as the object slot; recorded as vace in the manifest.", vram_gb=22.0),
     _a("vid2vid", "video_to_video", "vid2vid", "worker_unimplemented.py", tier=2,
        implemented=False,
        note="NVIDIA vid2vid needs per-dataset training and has no general pretrained release. "
             "Left as an honest gap: every substitute would be another diffusion model, and the "
-            "slot exists precisely to contribute a non-diffusion GAN artifact class."),
+            "slot exists precisely to contribute a non-diffusion GAN artifact class.", vram_gb=12.0),
 ]}
 
 
