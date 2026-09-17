@@ -44,6 +44,7 @@ def video_root_for(cfg) -> Path:
 
 
 def _check_video_root(cfg) -> Path:
+    """Validate and return the configured source-video directory."""
     root = video_root_for(cfg)
     expected = Path(cfg.paths.video_dir)
     if root.resolve() != expected.resolve():
@@ -77,6 +78,7 @@ def stage_prefetch(cfg) -> Dict[str, object]:
 
 
 def stage_kinetics(cfg) -> Dict[str, object]:
+    """Acquire and filter Kinetics source clips for generation."""
     gen = cfg.generation
     cache = Path(cfg.paths.cache_dir)
     targets = S.family_targets(gen.total_videos)
@@ -115,6 +117,7 @@ def stage_kinetics(cfg) -> Dict[str, object]:
 
 
 def _filter_models(jobs, only: Sequence[str], skip: Sequence[str]):
+    """Filter jobs to an optional set of model names."""
     if only:
         jobs = [j for j in jobs if j.model in set(only)]
         log.info("generation.only_models -> %d job(s) for %s", len(jobs), sorted(set(only)))
@@ -181,6 +184,7 @@ def plan_jobs(cfg, rebuild: bool = False):
 
 
 def stage_generate(cfg) -> Dict[str, object]:
+    """Plan and execute the configured video generation jobs."""
     from csf.generation.scheduler import GenerationScheduler, Ledger
 
     gen = cfg.generation
@@ -229,6 +233,7 @@ def stage_generate(cfg) -> Dict[str, object]:
 
 
 def stage_regen_manifest(cfg) -> Dict[str, object]:
+    """Rebuild manifest and metadata files from generated videos."""
     from csf.generation.manifest_build import build_manifest, write_report
 
     gen = cfg.generation
@@ -250,6 +255,7 @@ def stage_regen_manifest(cfg) -> Dict[str, object]:
 
 
 def stage_push_dataset(cfg) -> Optional[str]:
+    """Publish regenerated dataset artifacts when pushing is enabled."""
     from csf.generation.upload import push_interactive
 
     if not cfg.generation.push.enabled:

@@ -26,10 +26,12 @@ MAX_FRAMES = 200
 
 class State:
     def __init__(self, repo: Path, ckpt_dir: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt_dir = repo, ckpt_dir
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("SadTalker")
     require(repo / "inference.py", "SadTalker inference script")
     ckpt_dir = repo / "checkpoints"
@@ -52,6 +54,7 @@ def _best_frame(frames):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("audio_path") or ""
     if not donor or not Path(donor).exists() or donor == src:

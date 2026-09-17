@@ -28,6 +28,7 @@ from _common import (emit, env_root, has_audio, note, read_video, require, serve
 
 class State:
     def __init__(self, app, swapper):
+        """Store the reusable components required by this model worker."""
         self.app = app
         self.swapper = swapper
         self._identity_cache = {}
@@ -51,6 +52,7 @@ class State:
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     from insightface.app import FaceAnalysis
     from insightface.model_zoo import get_model
 
@@ -64,6 +66,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     target_path = payload["source_path"]
     donor_path = payload.get("driving_path") or target_path
     frames, fps = read_video(target_path, max_side=1280)

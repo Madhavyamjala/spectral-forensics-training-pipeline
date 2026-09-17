@@ -31,10 +31,12 @@ MAX_FRAMES = 100
 
 class State:
     def __init__(self, repo: Path, weights: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.weights = repo, weights
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("DiffuEraser")
     script = repo / "run_diffueraser.py"
     if not script.exists():
@@ -50,6 +52,7 @@ def load() -> State:
 
 
 def _moving_object_mask(frames, seed: int):
+    """Build a deterministic moving mask for object removal."""
     acc = np.zeros(frames[0].shape[:2], np.float32)
     step = max(1, len(frames) // 12)
     for i in range(step, len(frames), step):
@@ -66,6 +69,7 @@ def _moving_object_mask(frames, seed: int):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     frames, fps = read_video(src, max_frames=MAX_FRAMES, max_side=MAX_SIDE)
     h, w = frames[0].shape[:2]

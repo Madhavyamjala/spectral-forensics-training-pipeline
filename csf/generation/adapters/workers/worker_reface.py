@@ -32,10 +32,12 @@ MAX_SIDE = 640
 
 class State:
     def __init__(self, repo: Path, ckpt: Path, script: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt, self.script = repo, ckpt, script
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     if os.environ.get("CSF_ACCEPT_NONCOMMERCIAL", "").lower() not in ("1", "true", "yes"):
         raise RuntimeError(
             "REFace's checkpoint is trained on CelebAMask-HQ, which permits NON-COMMERCIAL "
@@ -56,6 +58,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("driving_path") or ""
     if not donor or not Path(donor).exists() or donor == src:

@@ -27,10 +27,12 @@ MAX_FRAMES = 200
 
 class State:
     def __init__(self, repo: Path, unet: Path, unet_cfg: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.unet, self.unet_cfg = repo, unet, unet_cfg
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("MuseTalk")
     require(repo / "scripts" / "inference.py", "MuseTalk inference script")
     unet = require(repo / "models" / "musetalkV15" / "unet.pth", "MuseTalk v1.5 UNet")
@@ -40,6 +42,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     donor = payload.get("audio_path") or ""
     if not donor or not Path(donor).exists() or donor == src:
