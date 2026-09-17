@@ -89,8 +89,19 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
-        note="Checkpoints for these three are Google-Drive hosted upstream; stage them into "
-             "repos/<name>/release_model/ before running (see the runbook).",
+        weights=(
+            WeightFile(dest="repos/E2FGVI/release_model/E2FGVI-HQ-CVPR22.pth",
+                       staged_name="e2fgvi_hq.pth",
+                       where="https://github.com/MCG-NKU/E2FGVI (Google Drive / OneDrive link "
+                             "in the README)"),
+            WeightFile(dest="repos/STTN/checkpoints/sttn.pth", staged_name="sttn.pth",
+                       where="https://github.com/researchmm/STTN (Drive link in the README)"),
+            WeightFile(dest="repos/FuseFormer/checkpoints/fuseformer.pth",
+                       staged_name="fuseformer.pth",
+                       where="https://github.com/ruiliu-ai/FuseFormer (Drive link in README)"),
+        ),
+        note="All three checkpoints are Drive-hosted upstream, so they are staged by hand into "
+             "generation.staged_weights_dir and copied into place by the build.",
     ),
 
     # --- Wav2Lip ------------------------------------------------------------------------
@@ -272,8 +283,11 @@ ENVS: Dict[str, EnvSpec] = {
                       "pyyaml", "scipy", "matplotlib", "tqdm"),
         repos=(GitRepo("https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model.git",
                        name="TPSMM"),),
-        note="MIT. Checkpoints are Tsinghua-Cloud/Drive hosted upstream - stage "
-             "repos/TPSMM/checkpoints/vox.pth.tar manually (see docs/REGENERATION.md).",
+        weights=(WeightFile(dest="repos/TPSMM/checkpoints/vox.pth.tar",
+                            staged_name="vox.pth.tar",
+                            where="https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model "
+                                  "(Tsinghua Cloud / Google Drive link in the README)"),),
+        note="MIT. The vox checkpoint is Tsinghua-Cloud/Drive hosted, so it is staged by hand.",
     ),
 
     # --- tier-2 environments (declared, adapters not wired) -------------------------------
@@ -288,10 +302,34 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
                       "dlib", "tqdm"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
-        note="Checkpoints are Drive-hosted upstream; stage "
-             "repos/StyleGANEX/pretrained_models/styleganex_editing.pt by hand. Wiring this "
-             "gives the expression family a second mechanism - without it, reallocation puts "
-             "all 4,750 of its videos through LivePortrait alone."),
+        weights=(
+            # Upstream releases one checkpoint PER EDITING DIRECTION, not one "editing" model:
+            # styleganex_edit_age.pt and styleganex_edit_hair.pt are the only two video-editing
+            # directions published, which is what the worker may claim to produce.
+            WeightFile(dest="repos/StyleGANEX/pretrained_models/styleganex_edit_age.pt",
+                       staged_name="styleganex_edit_age.pt",
+                       where="https://github.com/williamyang1991/StyleGANEX (Drive link in the "
+                             "README, 'Video editing' section)"),
+            WeightFile(dest="repos/StyleGANEX/pretrained_models/styleganex_edit_hair.pt",
+                       staged_name="styleganex_edit_hair.pt",
+                       where="https://github.com/williamyang1991/StyleGANEX (Drive link in the "
+                             "README, 'Video editing' section)"),
+        ),
+        # video_editing.py needs dlib's 68-point landmark predictor and fetches it with the
+        # `wget` package if absent. Place it during the build instead, so a job never blocks on
+        # a download - it is a plain URL, just bz2-compressed.
+        post_install=(("-c",
+                       "import bz2,os,urllib.request,pathlib;"
+                       "d=pathlib.Path(os.environ['CSF_ENV_ROOT'])/'repos'/'StyleGANEX'/"
+                       "'pretrained_models';d.mkdir(parents=True,exist_ok=True);"
+                       "t=d/'shape_predictor_68_face_landmarks.dat';"
+                       "raw=urllib.request.urlopen('http://dlib.net/files/"
+                       "shape_predictor_68_face_landmarks.dat.bz2',timeout=300).read() "
+                       "if not t.exists() else b'';"
+                       "t.write_bytes(bz2.decompress(raw)) if raw else None"),),
+        note="Drive-hosted; staged by hand. Upstream publishes ONE checkpoint PER DIRECTION, "
+             "and the only video-editing directions released are age and hair colour - so this "
+             "renderer can honestly produce those two variants and no others."),
     "ganimation": EnvSpec(
         name="ganimation", torch=TORCH_LEGACY, torch_index=LEGACY_INDEX,
         requirements=("opencv-python-headless", "numpy<2", "scipy", "imageio[ffmpeg]"),
@@ -329,11 +367,11 @@ ENVS: Dict[str, EnvSpec] = {
 
 def _a(key: str, family: str, env: str, worker: str, *, tier: int = 1, implemented: bool = True,
        actual_model: str = "", cost_s: float = 60.0, vram_gb: float = 8.0, note: str = "",
-       **options) -> Adapter:
+       variants: tuple = (), **options) -> Adapter:
     """Construct an adapter declaration with concise registry syntax."""
     return Adapter(key=key, family=family, env_name=env, worker=worker, implemented=implemented,
                    tier=tier, actual_model=actual_model, cost_s=cost_s, vram_gb=vram_gb,
-                   options=options, note=note)
+                   options=options, variants=tuple(variants), note=note)
 
 
 #: Slots the specification names but that have no runnable public release. Each is filled by a
@@ -397,10 +435,18 @@ ADAPTERS: Dict[str, Adapter] = {a.key: a for a in [
     # ---- expression / attribute editing (4,750) ----
     _a("ganimation", "expression_attribute_editing", "liveportrait", "worker_liveportrait.py",
        actual_model="liveportrait_expr", cost_s=20.0, mode="expression",
+       # LivePortrait deforms an existing face: it drives expression, gaze and mouth shape. It
+       # has no notion of age or hair colour, so those two variants must not be routed here -
+       # it would emit a video labelled "age" that contains no ageing at all.
+       variants=("smile_happiness", "sadness_crying", "anger", "surprise",
+                 "eye_gaze_modification", "mouth_expression_modification"),
        note="GANimation published no weights. LivePortrait's retargeting ratios give the same "
             "continuous expression-magnitude control the slot calls for.", vram_gb=6.0),
     _a("styleganex", "expression_attribute_editing", "stylegan", "worker_styleganex.py",
        cost_s=35.0,
+       # The opposite half: each released checkpoint carries one editing direction, and only
+       # age and hair colour are published for video.
+       variants=("age", "hair_color"),
        note="Weights are Drive-hosted and must be staged manually (see the env note), but it is "
             "the family's only second mechanism, so it is worth the manual step.", vram_gb=10.0),
     _a("latent_transformer", "expression_attribute_editing", "stylegan", "worker_unimplemented.py",

@@ -253,7 +253,8 @@ def stage_generate(cfg) -> Dict[str, object]:
         video_root=root, envs_root=Path(gen.envs_root), log_dir=log_dir, gpus=gen.gpus,
         job_timeout=gen.job_timeout_s, fail_fast=gen.fail_fast, min_free_gb=gen.min_free_gb,
         offline=gen.offline, deadline_hours=gen.deadline_hours,
-        gpu_vram_gb=gen.gpu_vram_gb, max_workers_per_gpu=gen.max_workers_per_gpu)
+        gpu_vram_gb=gen.gpu_vram_gb, max_workers_per_gpu=gen.max_workers_per_gpu,
+        staged_dir=Path(gen.staged_weights_dir) if gen.staged_weights_dir else None)
     ledger = Ledger(Path(gen.ledger))
 
     summary = scheduler.run(jobs, ledger, retry_failed=gen.retry_failed,

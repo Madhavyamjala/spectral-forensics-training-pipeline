@@ -1162,6 +1162,53 @@ def test_env_interpreter() -> None:
     check("a venv that is not its own venv is recreated", "recreating it" in build_src)
 
 
+def test_variant_capability() -> None:
+    """No job may carry a manipulation_type its renderer cannot actually perform."""
+    print("variant capability")
+    from csf.generation.jobs import variant_pools
+
+    allowed = {k for k, a in ADAPTERS.items() if a.implemented}
+    jobs = build_jobs(synthetic_pool(400), S.FAMILY_TARGETS, seed=42, allowed_models=allowed)
+    bad = [j for j in jobs if j.variant and ADAPTERS[j.model].variants
+           and j.variant not in ADAPTERS[j.model].variants]
+    check("every job's variant is one its renderer supports", not bad,
+          str([(j.model, j.variant) for j in bad[:3]]))
+
+    expr = [j for j in jobs if j.family == "expression_attribute_editing"]
+    by_model = defaultdict(set)
+    for job in expr:
+        by_model[job.model].add(job.variant)
+    check("StyleGANEX only renders its two released directions",
+          by_model["styleganex"] == {"age", "hair_color"}, str(sorted(by_model["styleganex"])))
+    check("LivePortrait never renders age or hair colour",
+          not ({"age", "hair_color"} & by_model["ganimation"]), str(sorted(by_model["ganimation"])))
+    check("a variant no renderer supports is dropped, not faked",
+          "facial_attributes" not in {j.variant for j in expr})
+
+    # the worker tables must agree with what the registry advertises
+    lp = (Path(__file__).resolve().parents[1] / "csf/generation/adapters/workers"
+          / "worker_liveportrait.py").read_text(encoding="utf-8")
+    check("LivePortrait has no no-op retargeting entry",
+          '"hair_color": (0.0, 0.0)' not in lp)
+    check("LivePortrait refuses a variant it cannot perform", "cannot produce the" in lp)
+    sg = (Path(__file__).resolve().parents[1] / "csf/generation/adapters/workers"
+          / "worker_styleganex.py").read_text(encoding="utf-8")
+    check("StyleGANEX maps each variant to a released checkpoint",
+          "styleganex_edit_age.pt" in sg and "styleganex_edit_hair.pt" in sg)
+    check("StyleGANEX calls the repo's real video-editing entry point",
+          "video_editing.py" in sg and "--task" not in sg)
+
+    # family totals must survive the re-routing exactly
+    fam = S.FAMILIES["expression_attribute_editing"]
+    capacity = {"styleganex": 2250, "ganimation": 2500}
+    pools = variant_pools(fam, capacity, seed=1)
+    check("every pipeline's capacity is filled exactly",
+          all(len(pools[m]) == n for m, n in capacity.items()),
+          str({m: len(v) for m, v in pools.items()}))
+    check("a pipeline with no declared capability may use any variant",
+          len(set(variant_pools(fam, {"inswapper": 100}, seed=1)["inswapper"])) > 1)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
@@ -1169,7 +1216,7 @@ def main() -> int:
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
-               test_stage_staleness, test_env_interpreter):
+               test_stage_staleness, test_env_interpreter, test_variant_capability):
         fn()
     print()
     if FAILURES:

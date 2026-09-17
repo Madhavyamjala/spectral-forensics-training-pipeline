@@ -293,13 +293,15 @@ class GenerationScheduler:
     def __init__(self, video_root: Path, envs_root: Path, log_dir: Path, gpus: Sequence[int],
                  job_timeout: int = 1800, fail_fast: int = 8, min_free_gb: float = 50.0,
                  offline: bool = False, deadline_hours: Optional[float] = None,
-                 gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1):
+                 gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1,
+                 staged_dir: Optional[Path] = None):
         """Configure generation paths, limits, GPUs, and worker concurrency."""
         # Absolute, always. Workers are launched with cwd set to their env root, so a relative
         # output path would land under cache/.../envs/<env>/ instead of the video root - the
         # driver then records "ok" for a file it cannot find. Same reasoning as the interpreter.
         self.video_root = Path(os.path.abspath(video_root))
         self.envs_root = Path(envs_root)
+        self.staged_dir = Path(os.path.abspath(staged_dir)) if staged_dir else None
         self.log_dir = Path(log_dir)
         self.gpus = list(gpus)
         self.job_timeout = job_timeout
@@ -377,7 +379,8 @@ class GenerationScheduler:
                   ledger: Ledger, progress: Progress, specs) -> None:
         """Run assigned model groups sequentially on one GPU."""
         pool = WorkerPool(self.envs_root, self.log_dir, max_resident=self.max_workers_per_gpu,
-                          job_timeout=self.job_timeout, offline=self.offline)
+                          job_timeout=self.job_timeout, offline=self.offline,
+                          staged_dir=self.staged_dir)
         try:
             for model in models:
                 if self.deadline and time.monotonic() > self.deadline:

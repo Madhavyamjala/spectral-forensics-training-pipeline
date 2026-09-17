@@ -78,6 +78,12 @@ class WeightFile:
     hf_repo: Optional[str] = None     # or a Hugging Face repo id
     hf_file: Optional[str] = None
     hf_type: str = "model"
+    #: Filename to look for in the staging directory (generation.staged_weights_dir) instead of
+    #: downloading. Several upstream projects host their checkpoints on Google Drive, Tsinghua
+    #: Cloud or OneDrive, none of which can be fetched unattended - you download them once by
+    #: hand, drop them in one folder, and the build copies them into place.
+    staged_name: Optional[str] = None
+    where: str = ""                   # where to obtain it, quoted in the error when it is absent
 
 
 @dataclass
@@ -125,7 +131,8 @@ class EnvSpec:
             "requirements": list(self.requirements),
             "repos": [[r.url, r.commit] for r in self.repos],
             "hub_repos": list(self.hub_repos),
-            "weights": [[w.dest, w.url, w.hf_repo, w.hf_file] for w in self.weights],
+            "weights": [[w.dest, w.url, w.hf_repo, w.hf_file, w.staged_name]
+                        for w in self.weights],
             "post_install": [list(c) for c in self.post_install],
             "verify_imports": list(self.verify_imports),
         }, sort_keys=True)
@@ -370,6 +377,29 @@ def _verify_imports(py: Path, modules: Sequence[str], label: str) -> None:
             f"effect; rebuild with --force.")
 
 
+def _staged_file(weight: WeightFile, staged_dir: Optional[Path], env_name: str) -> Path:
+    """Locate a manually downloaded checkpoint, or explain precisely how to supply it."""
+    name = weight.staged_name or Path(weight.dest).name
+    where = f" Get it from: {weight.where}" if weight.where else ""
+    if staged_dir is None:
+        raise EnvBuildError(
+            f"Env '{env_name}' needs the checkpoint '{name}', which cannot be downloaded "
+            f"unattended, but no staging directory is configured. Set "
+            f"generation.staged_weights_dir to a folder holding it.{where}")
+    staged_dir = Path(staged_dir)
+    # accept the file at the top level or one level down, so model_paths/ may be organised
+    candidates = [staged_dir / name, *sorted(staged_dir.glob(f"*/{name}"))]
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    present = sorted(p.name for p in staged_dir.glob("*") if p.is_file()) \
+        if staged_dir.is_dir() else []
+    have = ", ".join(present) if present else "none (the directory is empty or missing)"
+    raise EnvBuildError(
+        f"Env '{env_name}' needs '{name}' in the staging directory {staged_dir}, and it is not "
+        f"there.{where} Files currently staged: {have}")
+
+
 def _fetch(url: str, dest: Path) -> None:
     """Download an asset atomically when it is not already cached."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -384,8 +414,8 @@ def _fetch(url: str, dest: Path) -> None:
             shutil.copyfileobj(resp, fh)
 
 
-def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
-              offline: bool = False) -> ReadyEnv:
+def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool = False,
+              staged_dir: Optional[Path] = None) -> ReadyEnv:
     """Create (or reuse) the venv, repos and weights for one adapter."""
     # Absolute, always. The worker is launched with cwd set to this directory, so a relative
     # interpreter path would resolve against the env itself and disappear - the env builds
@@ -495,7 +525,11 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             announce(f"{Path(weight.dest).name} already present")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if weight.url:
+        if weight.staged_name:
+            src = _staged_file(weight, staged_dir, spec.name)
+            announce(f"copying {weight.staged_name} from the staging directory")
+            shutil.copy2(src, dest)
+        elif weight.url:
             announce(f"downloading {Path(weight.dest).name}")
             with Heartbeat(f"downloading {Path(weight.dest).name}"):
                 _fetch(weight.url, dest)
@@ -609,6 +643,8 @@ def _main() -> int:
     ap.add_argument("--build", default="", help="env or adapter name, or 'all'")
     ap.add_argument("--envs-root", default="./cache/generation/envs")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--staged-weights-dir", default="./model_paths",
+                    help="folder holding checkpoints that cannot be downloaded unattended")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--doctor", default="", help="env or adapter name, or 'all': check what is "
                                                  "actually installed in each built env")
@@ -668,7 +704,8 @@ def _main() -> int:
     failures = []
     for spec in wanted:
         try:
-            build_env(spec, root, force=args.force)
+            build_env(spec, root, force=args.force,
+                      staged_dir=Path(args.staged_weights_dir))
         except EnvBuildError as exc:
             failures.append((spec.name, str(exc)[:400]))
             log.error("Env '%s' failed to build: %s", spec.name, exc)

@@ -176,6 +176,69 @@ def object_operations(target: int, allowed: Optional[Set[str]] = None) -> Dict[s
     return out
 
 
+def variant_pools(family, capacity: Dict[str, int], seed: int) -> Dict[str, List[str]]:
+    """Per-pipeline variant pools that respect what each renderer can actually produce.
+
+    Variants are the `manipulation_type` recorded in the manifest. Drawing them from one
+    family-wide pool and handing them round-robin to whichever model comes next produces
+    mislabelled data whenever a renderer cannot perform the variant it is given: LivePortrait
+    warps an existing face, so an "age" job it renders contains no ageing; StyleGANEX's released
+    video checkpoints carry one editing direction each (age, hair colour), so a "smile" job it
+    renders is not a smile edit. Both still emit a plausible video, which is the dangerous part.
+
+    Pipelines are filled in order of how constrained they are - fewest supported variants first,
+    because they have the least freedom - and each one splits its whole job count across the
+    variants it supports in proportion to what those variants still need. A pipeline's capacity
+    is always filled, so family totals never move; what shifts is the variant mix, and by how
+    much is logged.
+    """
+    from csf.generation.adapters import ADAPTERS
+
+    names = [n for n, _ in family.variants]
+    total = sum(capacity.values())
+    target = dict(zip(names, S.apportion(total, [float(w) for _, w in family.variants])))
+    supports = {m: [v for v in names
+                    if not (ADAPTERS[m].variants if m in ADAPTERS else ())
+                    or v in ADAPTERS[m].variants]
+                for m in capacity}
+
+    orphans = [v for v in names if not any(v in supports[m] for m in capacity)]
+    remaining = dict(target)
+    pools: Dict[str, List[str]] = {}
+    for model in sorted(capacity, key=lambda m: (len(supports[m]), m)):
+        room, options = capacity[model], supports[model] or names
+        # follow what these variants still need; once a variant is satisfied everywhere, fall
+        # back to the family's original weights so the split stays meaningful
+        weights = [float(remaining.get(v, 0)) for v in options]
+        if sum(weights) <= 0:
+            weights = [float(dict(family.variants).get(v, 1)) for v in options]
+        pool: List[str] = []
+        for variant, n in zip(options, S.apportion(room, weights)):
+            pool.extend([variant] * n)
+            remaining[variant] = max(0, remaining.get(variant, 0) - n)
+        _rng(seed, family.key, "variants", model).shuffle(pool)
+        pools[model] = pool
+
+    realised: Dict[str, int] = defaultdict(int)
+    for pool in pools.values():
+        for variant in pool:
+            realised[variant] += 1
+    if orphans:
+        log.warning("%s: no wired renderer can produce %s - the spec's %d video(s) for those "
+                    "went to variants that can be produced honestly. Wiring a model that "
+                    "supports them is the only way to get them back.", family.key,
+                    ", ".join(f"{v} ({target[v]})" for v in orphans),
+                    sum(target[v] for v in orphans))
+    drift = {v: (realised.get(v, 0), target[v]) for v in names
+             if abs(realised.get(v, 0) - target[v]) > max(5, 0.1 * target[v])}
+    if drift:
+        log.warning("%s: variant mix shifted because renderers differ in what they support "
+                    "(%s). Family totals are unchanged.", family.key,
+                    "; ".join(f"{v}: {got} vs {want} planned" for v, (got, want) in
+                              sorted(drift.items())))
+    return pools
+
+
 def _weighted_pool(target: int, pairs: Sequence[Tuple[str, float]]) -> List[str]:
     names = [n for n, _ in pairs]
     counts = S.apportion(target, [w for _, w in pairs])
@@ -340,10 +403,11 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
         rows, cols, grid = S.family_matrix(family, target, allowed_models)
 
         # secondary breakdowns, drawn per family then consumed per cell
-        variant_pool: List[str] = []
+        pipeline_variants: Dict[str, List[str]] = {}
         if family.variants:
-            variant_pool = _weighted_pool(target, [(n, float(w)) for n, w in family.variants])
-            _rng(seed, family.key, "variants").shuffle(variant_pool)
+            capacity = {pipe.key: sum(grid[r][c] for r in range(len(rows)))
+                        for c, pipe in enumerate(pipelines)}
+            pipeline_variants = variant_pools(family, capacity, seed)
         mask_sizes = _weighted_pool(target, S.INPAINT_MASK_SIZES) if family.key == "video_inpainting" else []
         mask_motions = _weighted_pool(target, S.INPAINT_MASK_MOTION) if family.key == "video_inpainting" else []
         if mask_sizes:
@@ -356,6 +420,7 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
         op_cursor: Dict[str, int] = defaultdict(int)
 
         v_cursor = 0
+        variant_cursor: Dict[str, int] = defaultdict(int)
         for i, group in enumerate(family.source_groups):
             for j, pipe in enumerate(pipelines):
                 n = grid[i][j]
@@ -378,8 +443,10 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
                         source_label=str(clip["label"]),
                         seed=rng.randrange(1 << 30),
                     )
-                    if variant_pool:
-                        job.variant = variant_pool[v_cursor % len(variant_pool)]
+                    pool = pipeline_variants.get(pipe.key)
+                    if pool:
+                        job.variant = pool[variant_cursor[pipe.key] % len(pool)]
+                        variant_cursor[pipe.key] += 1
                         v_cursor += 1
                     if mask_sizes:
                         job.mask_size = mask_sizes[(v_cursor - 1) % len(mask_sizes)]

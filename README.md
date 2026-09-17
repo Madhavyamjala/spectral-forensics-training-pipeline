@@ -324,6 +324,24 @@ dataset card carries the required credit, licence link and statement of changes 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.
 
+### Checkpoints you have to stage by hand
+
+Six checkpoints are hosted on Google Drive / Tsinghua Cloud and cannot be fetched unattended.
+Download them once, drop them in `model_paths/` (`generation.staged_weights_dir`) under these exact
+names, and the env build copies them where each repo expects them:
+
+| File in `model_paths/` | Needed by | Source |
+|---|---|---|
+| `e2fgvi_hq.pth` | video inpainting (E2FGVI-HQ) | [MCG-NKU/E2FGVI](https://github.com/MCG-NKU/E2FGVI) |
+| `sttn.pth` | video inpainting (STTN) | [researchmm/STTN](https://github.com/researchmm/STTN) |
+| `fuseformer.pth` | video inpainting (FuseFormer) | [ruiliu-ai/FuseFormer](https://github.com/ruiliu-ai/FuseFormer) |
+| `vox.pth.tar` | reenactment (TPSMM) | [yoyo-nb/Thin-Plate-Spline-Motion-Model](https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model) |
+| `styleganex_edit_age.pt` | expression editing (age) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+| `styleganex_edit_hair.pt` | expression editing (hair colour) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+
+A missing file fails that env's build with the filename and where to get it, rather than failing
+its jobs later. Subfolders are fine — `model_paths/styleganex/styleganex_edit_age.pt` is found too.
+
 ## 5. Training profiles and tuning
 
 `configs/test.yaml` is tuned for a single 12 GB card: 4-bit NF4 QLoRA for both VLMs, 8 frames per

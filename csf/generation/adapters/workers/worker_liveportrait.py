@@ -31,11 +31,17 @@ MAX_FRAMES = 160
 MAX_SIDE = 720
 
 #: (eye ratio, lip ratio) per expression variant - the magnitude the job asked for.
+#:
+#: Retargeting moves eyelids and lips on the face that is already there. It cannot change age,
+#: hair colour or add an accessory, so those variants are deliberately absent and a job asking
+#: for one is refused rather than rendered. The previous table mapped hair_color to (0.0, 0.0),
+#: which would have written out an unmodified clip labelled as a hair-colour edit - a sample
+#: with no manipulation in it at all, in a dataset whose entire purpose is detecting
+#: manipulation.
 EXPRESSION_RETARGET = {
     "smile_happiness": (0.0, 0.5), "sadness_crying": (-0.2, -0.3), "anger": (-0.3, -0.2),
     "surprise": (0.6, 0.4), "eye_gaze_modification": (0.5, 0.0),
-    "mouth_expression_modification": (0.0, 0.6), "age": (0.1, 0.1),
-    "hair_color": (0.0, 0.0), "facial_attributes": (0.2, 0.2),
+    "mouth_expression_modification": (0.0, 0.6),
 }
 
 
@@ -95,7 +101,13 @@ def render(state: State, payload: dict) -> dict:
                         target_identity=Path(src).stem, driving_identity=Path(driving).stem)
         elif mode == "expression":
             variant = payload.get("variant") or "smile_happiness"
-            eye, lip = EXPRESSION_RETARGET.get(variant, (0.2, 0.3))
+            if variant not in EXPRESSION_RETARGET:
+                raise RuntimeError(
+                    f"LivePortrait retargeting cannot produce the '{variant}' variant - it "
+                    f"deforms the face that is already in the frame. Supported: "
+                    f"{sorted(EXPRESSION_RETARGET)}. This job should have been routed to a "
+                    f"renderer that performs that edit.")
+            eye, lip = EXPRESSION_RETARGET[variant]
             magnitude = float((payload.get("metadata") or {}).get("edit_magnitude", 0.5) or 0.5)
             # drive the clip with itself, then let retargeting supply the edit
             cmd += ["-d", str(source_mp4),

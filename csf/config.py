@@ -189,6 +189,10 @@ class GenerationConfig:
     # clips that existed when it was written. Job ids are derived from the assignment, so
     # re-planning starts the ledger fresh for anything that moved.
     rebuild_jobs: bool = False
+    #: Where to find checkpoints that cannot be downloaded unattended (Google Drive, Tsinghua
+    #: Cloud, OneDrive). Download them once by hand, drop them in this folder under the exact
+    #: filename the adapter expects, and the env build copies them into place.
+    staged_weights_dir: str = "./model_paths"
     keep_old_edited: bool = False
     only_models: List[str] = field(default_factory=list)      # restrict the run to these models
     skip_models: List[str] = field(default_factory=list)

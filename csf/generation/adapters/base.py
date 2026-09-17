@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from csf.generation.envs import EnvSpec, ReadyEnv, build_env
 from csf.logging_utils import get_logger
@@ -75,6 +75,14 @@ class Adapter:
     cost_s: float = 60.0                       # measured/estimated seconds per video, for planning
     vram_gb: float = 8.0                       # peak VRAM per worker, for per-GPU concurrency
     options: Dict[str, object] = field(default_factory=dict)
+    #: Family variants this renderer can genuinely produce. Empty = all of them.
+    #:
+    #: This is a dataset-correctness control, not an optimisation. Variants are the
+    #: `manipulation_type` recorded in the manifest, and a renderer that cannot perform one will
+    #: still emit a video if handed the job - a video labelled "age" that LivePortrait produced
+    #: by warping expression, or "smile" from a StyleGANEX checkpoint whose only direction is
+    #: hair colour. Every downstream per-type analysis would then be measuring mislabelled data.
+    variants: Tuple[str, ...] = ()
     note: str = ""
 
     @property
@@ -310,13 +318,15 @@ class WorkerPool:
     """
 
     def __init__(self, envs_root: Path, log_dir: Path, max_resident: int = 1,
-                 job_timeout: int = 1800, offline: bool = False):
+                 job_timeout: int = 1800, offline: bool = False,
+                 staged_dir: "Optional[Path]" = None):
         """Initialize the resident worker pool and environment builder."""
         self.envs_root = Path(envs_root)
         self.log_dir = Path(log_dir)
         self.max_resident = max(1, max_resident)
         self.job_timeout = job_timeout
         self.offline = offline
+        self.staged_dir = Path(staged_dir) if staged_dir else None
         self._workers: Dict[tuple, WorkerProcess] = {}
         self._order: List[tuple] = []
         self._envs: Dict[str, ReadyEnv] = {}
@@ -326,7 +336,8 @@ class WorkerPool:
         """Build or reuse the environment required by an adapter."""
         with self._lock:
             if spec.name not in self._envs:
-                self._envs[spec.name] = build_env(spec, self.envs_root, offline=self.offline)
+                self._envs[spec.name] = build_env(spec, self.envs_root, offline=self.offline,
+                                                  staged_dir=self.staged_dir)
             return self._envs[spec.name]
 
     def get(self, adapter: Adapter, spec: EnvSpec, gpu: int, slot: int = 0) -> WorkerProcess:
