@@ -140,13 +140,29 @@ class ReadyEnv:
     repos: Dict[str, Path]
 
     def environ(self) -> Dict[str, str]:
-        """Return environment variables for commands in the ready environment."""
-        env = os.environ.copy()
+        """Environment variables for commands run inside this env, isolated from the driver's.
+
+        The whole point of a per-model env is that its torch, numpy and opencv are the ones the
+        model was written against. An inherited `PYTHONPATH` quietly defeats that - the driver
+        runs from its own venv (often inside conda on a cluster), and anything on its
+        PYTHONPATH lands ahead of the env's own site-packages, so the worker imports the
+        driver's torch 2.14 / numpy 2 instead of the 2.4.1 / numpy<2 it pinned. The symptom is
+        not an ImportError but a crash inside the model, which is far harder to trace back.
+
+        So PYTHONPATH is rebuilt from the cloned repos alone, `PYTHONHOME` (which some module
+        systems and conda setups export, and which breaks a venv interpreter outright) is
+        dropped, and user site-packages are switched off.
+        """
+        env = _clean_environ()
+        venv_bin = Path(self.python).parent
+        env["VIRTUAL_ENV"] = str(venv_bin.parent)
+        env["PATH"] = os.pathsep.join([str(venv_bin), env.get("PATH", "")]).rstrip(os.pathsep)
+        # make the cloned repos importable without each worker hard-coding paths. This
+        # *replaces* any inherited PYTHONPATH rather than prepending to it.
+        env["PYTHONPATH"] = os.pathsep.join(str(p) for p in self.repos.values())
+        if not env["PYTHONPATH"]:
+            env.pop("PYTHONPATH")
         env.update(self.spec.env_vars)
-        # make the cloned repos importable without each worker hard-coding paths
-        extra = os.pathsep.join(str(p) for p in self.repos.values())
-        if extra:
-            env["PYTHONPATH"] = os.pathsep.join(filter(None, (extra, env.get("PYTHONPATH", ""))))
         env.setdefault("CSF_ENV_ROOT", str(self.root))
         return env
 
@@ -200,10 +216,25 @@ def _venv_python(root: Path) -> Path:
     return Path(os.path.abspath(Path(root) / name))
 
 
+def _clean_environ() -> Dict[str, str]:
+    """os.environ minus the interpreter state that would leak the driver's packages in.
+
+    `pip install` decides "Requirement already satisfied" from the target interpreter's
+    sys.path, so an inherited PYTHONPATH pointing at the driver's site-packages makes pip skip
+    packages that are not in the venv at all - the env then looks built and fails at import.
+    """
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONSTARTUP", None)
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 def _probe(py: Path, code: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Run a one-liner inside an env's interpreter and return the completed process."""
     return subprocess.run([str(py), "-c", code], capture_output=True, text=True, timeout=timeout,
-                          check=False)
+                          check=False, env=_clean_environ())
 
 
 def _venv_is_sane(py: Path, venv_dir: Path) -> bool:
@@ -363,18 +394,21 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
     else:
         announce("virtual environment already present")
     _ensure_pip(py, f"env '{spec.name}'")
+    build_env_vars = _clean_environ()
     _run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
-         what=announce("upgrading pip"), timeout=1800)
+         what=announce("upgrading pip"), timeout=1800, env=build_env_vars)
 
     if spec.torch:
         cmd = [py, "-m", "pip", "install", *spec.torch.split()]
         if spec.torch_index:
             cmd += ["--index-url", spec.torch_index]
-        _run(cmd, what=announce(f"installing {spec.torch.split()[0]} (several GB)"), timeout=7200)
+        _run(cmd, what=announce(f"installing {spec.torch.split()[0]} (several GB)"),
+             timeout=7200, env=build_env_vars)
 
     if spec.requirements:
         _run([py, "-m", "pip", "install", *spec.requirements],
-             what=announce(f"installing {len(spec.requirements)} requirement(s)"), timeout=7200)
+             what=announce(f"installing {len(spec.requirements)} requirement(s)"), timeout=7200,
+             env=build_env_vars)
 
     repos: Dict[str, Path] = {}
     for repo in spec.repos:
@@ -404,7 +438,8 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             code = ("from huggingface_hub import hf_hub_download; import shutil; "
                     f"p=hf_hub_download({weight.hf_repo!r}, {weight.hf_file!r}, "
                     f"repo_type={weight.hf_type!r}); shutil.copy2(p, {str(dest)!r})")
-            _run([py, "-c", code], what=f"fetching {weight.hf_file}", timeout=7200)
+            _run([py, "-c", code], what=f"fetching {weight.hf_file}", timeout=7200,
+                 env=build_env_vars)
         else:
             raise EnvBuildError(f"Weight {weight.dest} for env {spec.name} has no url or hf_repo")
 
@@ -412,11 +447,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
     # CSF_ENV_ROOT, which is otherwise only injected at worker launch - set it here too, and put
     # the venv's bin dir first so `huggingface-cli` resolves to this env's copy.
     if spec.post_install:
-        hook_env = os.environ.copy()
-        hook_env.update(spec.env_vars)
-        hook_env["CSF_ENV_ROOT"] = str(root)
-        hook_env["PATH"] = os.pathsep.join(
-            [str(py.parent), hook_env.get("PATH", "")]).rstrip(os.pathsep)
+        hook_env = ReadyEnv(spec, root, py, repos).environ()
         for cmd in spec.post_install:
             _run([py, *cmd], cwd=root, env=hook_env,
                  what=announce("running the post-install hook (may download weights)"),

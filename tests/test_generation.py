@@ -1023,6 +1023,33 @@ def test_env_interpreter() -> None:
         missing = diagnose([EnvSpec(name="nope", torch="")], Path(tmp))["nope"]
         check("an env that was never built reads as missing", missing["verdict"] == "missing")
 
+    # a worker must not inherit the driver's interpreter state: the driver runs from its own
+    # venv (often inside conda), and its PYTHONPATH would shadow the env's pinned packages
+    saved = {k: os.environ.get(k) for k in ("PYTHONPATH", "PYTHONHOME")}
+    try:
+        os.environ["PYTHONPATH"] = "/driver/site-packages"
+        os.environ["PYTHONHOME"] = "/conda/base"
+        from csf.generation.envs import ReadyEnv
+        ready = ReadyEnv(EnvSpec(name="x", torch=""), Path("/envs/x"),
+                         Path("/envs/x/venv/bin/python"), {"r": Path("/envs/x/repos/r")})
+        env = ready.environ()
+        check("the driver's PYTHONPATH does not reach the worker",
+              env["PYTHONPATH"] == str(Path("/envs/x/repos/r")), env.get("PYTHONPATH", ""))
+        check("PYTHONHOME is dropped", "PYTHONHOME" not in env)
+        check("user site-packages are switched off", env.get("PYTHONNOUSERSITE") == "1")
+        check("the env's bin dir leads PATH",
+              env["PATH"].split(os.pathsep)[0] == "/envs/x/venv/bin")
+        check("VIRTUAL_ENV points at the venv", env.get("VIRTUAL_ENV") == "/envs/x/venv")
+        no_repos = ReadyEnv(EnvSpec(name="x", torch=""), Path("/envs/x"),
+                            Path("/envs/x/venv/bin/python"), {}).environ()
+        check("an env with no repos sets no PYTHONPATH at all", "PYTHONPATH" not in no_repos)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     body = inspect.getsource(_venv_python).split('"""')[-1]      # skip the docstring's prose
     check("the interpreter path is never resolved through its symlink",
           ".resolve()" not in body and "os.path.abspath" in body)
