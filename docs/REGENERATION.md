@@ -476,7 +476,8 @@ rather than missing ones. Dry-run first with `--set generation.push.dry_run=true
 | `ffprobe was not found` warning | The pool still builds via OpenCV, but codec/bitrate/audio are recorded as unknown **and the generation workers need ffmpeg to encode**. Install it before the `generate` stage. |
 | `No clips were downloaded to ...` | The download genuinely produced nothing - check `hf_repo` / `local_root` / `mirror_base` and your Hub login. |
 | `N label(s) the spec needs have no file in this mirror` | Those Kinetics classes are spelled differently (or absent) upstream. The sampler redistributes within each source group, so a few are harmless. |
-| `Only N clips pass the 'face' filter` | No face detector in the driver env. `pip install insightface` or `mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. |
+| `Only N clips pass the 'face' filter` | No face detector in the **driver** environment (the adapter envs have their own). `pip install insightface onnxruntime` or `pip install mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. Without it the face families fall back to the unfiltered pool and their workers will reject clips with no face. |
+| `The interpreter for env 'X' is missing` | The env did not finish building. Rebuild it: `python -m csf.generation.envs --build X --force`. |
 | A whole model group fails instantly | Usually a missing weight. Read `runs/regen/logs/generation/worker_<model>_gpu<N>.log` — the worker names the file it wanted. |
 | `group abandoned after N consecutive failures` | `fail_fast` tripped. The group is skipped, the run continues; fix the cause and re-run with `retry_failed=true`. |
 | `NotImplemented[<model>]` | Tier-2 model. Expected — see §2. |

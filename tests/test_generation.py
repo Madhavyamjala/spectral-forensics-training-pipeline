@@ -817,12 +817,70 @@ def test_progress() -> None:
           "CSF_NO_PROGRESS" in inspect.getsource(P))
 
 
+def test_env_paths() -> None:
+    """Env paths must be absolute: workers are launched with cwd set to the env root."""
+    print("environment paths")
+    import inspect
+    import shutil as _shutil
+    import tempfile
+
+    import csf.generation.envs as E
+    from csf.generation.adapters import base as adapter_base
+
+    with tempfile.TemporaryDirectory() as tmp:
+        rel = os.path.relpath(tmp, os.getcwd())
+        original = E._run
+        try:
+            def fake_run(cmd, cwd=None, env=None, timeout=3600, what=""):
+                if "virtual environment" in what or "venv" in what:
+                    py = E._venv_python(Path(cmd[-1]))
+                    py.parent.mkdir(parents=True, exist_ok=True)
+                    py.write_text("#!/bin/sh")
+                    py.chmod(0o755)
+            E._run = fake_run
+            ready = E.build_env(E.EnvSpec(name="probe", torch="", requirements=()), Path(rel))
+        finally:
+            E._run = original
+
+        check("the env root is absolute", Path(ready.root).is_absolute(), str(ready.root))
+        check("the interpreter path is absolute", Path(ready.python).is_absolute(),
+              str(ready.python))
+        # the actual failure: the worker is spawned with cwd=env.root
+        check("the interpreter resolves from inside the env root",
+              (Path(ready.root) / ready.python).exists() or Path(ready.python).exists())
+
+    check("the worker is launched with cwd set to the env root",
+          "cwd=str(self.env.root)" in inspect.getsource(adapter_base.WorkerProcess.start))
+    check("a missing interpreter is refused before spawning",
+          "is missing at" in inspect.getsource(adapter_base.WorkerPool._get_locked))
+    check("an env is not marked ready without its interpreter",
+          "interpreter is missing at" in inspect.getsource(E.build_env))
+
+
+def test_no_job_left_behind() -> None:
+    """However a worker group ends, every job it held must reach the ledger."""
+    print("job accounting")
+    import inspect
+
+    from csf.generation import scheduler as S_
+
+    src = inspect.getsource(S_.GenerationScheduler._run_group)
+    check("slot failures are caught rather than killing the thread",
+          "except Exception as exc:" in src and "_slot_loop" in src)
+    check("an unexpected slot crash drains the queue", "worker slot crashed" in src)
+    check("the group sweeps anything left unattempted", "never attempted" in src)
+    check("OSError from a missing interpreter is handled",
+          "AdapterError, EnvBuildError, OSError" in src)
+    check("workers are capped at the number of jobs", "min(len(jobs)," in src)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
-               test_ffmpeg_resolution, test_worker_inputs, test_progress):
+               test_ffmpeg_resolution, test_worker_inputs, test_progress,
+               test_env_paths, test_no_job_left_behind):
         fn()
     print()
     if FAILURES:
