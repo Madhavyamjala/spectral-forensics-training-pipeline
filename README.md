@@ -151,6 +151,25 @@ python -m csf.env_check
 `python -m csf.env_check` checks the GPU, bf16 support, a real CUDA matmul, a bitsandbytes 4-bit
 forward pass, OpenCV's ffmpeg backend and your Hub login. Fix anything it reports before going on.
 
+### No root, or conda is broken?
+
+ffmpeg does not have to be installed system-wide. `requirements.txt` includes `imageio-ffmpeg`,
+which ships a **static ffmpeg binary as a normal wheel** — no root, no conda, no module system:
+
+```bash
+pip install imageio-ffmpeg
+```
+
+The pipeline finds it automatically. Resolution order is `CSF_FFMPEG` / `CSF_FFPROBE` → `PATH` →
+the bundled binary, and startup reports which it picked. `imageio-ffmpeg` bundles ffmpeg but not
+ffprobe, so container metadata is parsed from `ffmpeg -i` instead — slightly less precise, and
+otherwise identical. If you would rather point at an existing build:
+
+```bash
+export CSF_FFMPEG=/path/to/ffmpeg
+export CSF_FFPROBE=/path/to/ffprobe
+```
+
 ### Accept the gated licence
 
 `meta-llama/Llama-3.2-11B-Vision-Instruct` is gated. Open its

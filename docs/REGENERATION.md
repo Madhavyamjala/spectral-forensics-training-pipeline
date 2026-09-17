@@ -52,7 +52,9 @@ If the mirror cannot satisfy some labels, the CVDF S3 shards
 Kinetics is already extracted on the cluster, and nothing is downloaded at all.
 
 The `kinetics` stage needs the `datasets` package (`pip install datasets`, already in
-`requirements.txt`).
+`requirements.txt`), and ffmpeg for encoding. ffmpeg is resolved from `CSF_FFMPEG`/`CSF_FFPROBE`,
+then `PATH`, then the static binary that `imageio-ffmpeg` ships — so `pip install imageio-ffmpeg`
+is enough on a machine where you cannot install system packages.
 
 ### Licence
 
@@ -409,7 +411,9 @@ rather than missing ones. Dry-run first with `--set generation.push.dry_run=true
 | `peft is not installed` / `bitsandbytes is required` on a generation-only run | Fixed: preflight now only demands the training stack when a training stage is selected. If you still see it, you have a training stage in `--stage`. |
 | `generation.gpus ... names GPU(s) [n]` | Those ids do not exist in this process. Usually `CUDA_VISIBLE_DEVICES` is set and has renumbered them. |
 | `N clip(s) are present ... but none could be read` | ffprobe is missing and OpenCV cannot decode them either. Install ffmpeg (`conda install -c conda-forge ffmpeg`), or set `generation.kinetics.probe_clips=false` to build the pool without container metadata. |
-| `ffprobe is not on PATH` warning | The pool still builds via OpenCV, but codec/bitrate/audio are recorded as unknown **and the generation workers need ffmpeg to encode**. Install it before the `generate` stage. |
+| `NoBaseEnvironmentError` from conda | Do not fight conda: `pip install imageio-ffmpeg` gives a static ffmpeg with no root and no conda, and the pipeline finds it automatically. |
+| `No ffmpeg binary could be found` | As above, or set `CSF_FFMPEG` / `CSF_FFPROBE` to existing binaries. |
+| `ffprobe was not found` warning | The pool still builds via OpenCV, but codec/bitrate/audio are recorded as unknown **and the generation workers need ffmpeg to encode**. Install it before the `generate` stage. |
 | `No clips were downloaded to ...` | The download genuinely produced nothing - check `hf_repo` / `local_root` / `mirror_base` and your Hub login. |
 | `N label(s) the spec needs have no file in this mirror` | Those Kinetics classes are spelled differently (or absent) upstream. The sampler redistributes within each source group, so a few are harmless. |
 | `Only N clips pass the 'face' filter` | No face detector in the driver env. `pip install insightface` or `mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. |

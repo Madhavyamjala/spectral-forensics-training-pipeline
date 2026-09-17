@@ -13,6 +13,7 @@ clip leaks across the train/valid/test boundary.
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import sys
@@ -635,11 +636,73 @@ def test_probe_fallback() -> None:
         check("probe_clips=false still writes a usable pool", len(rows) == 3, str(len(rows)))
 
 
+def test_ffmpeg_resolution() -> None:
+    """ffmpeg must be usable without root, conda, or anything on PATH."""
+    print("ffmpeg resolution")
+    import subprocess as _sp
+    import sys as _sys
+    import types as _types
+
+    import csf.generation.ffmpeg_tools as F
+
+    orig_usable, orig_run = F._usable, _sp.run
+    orig_module = _sys.modules.get("imageio_ffmpeg")
+    try:
+        fake = _types.ModuleType("imageio_ffmpeg")
+        fake.get_ffmpeg_exe = lambda: "/opt/fake/ffmpeg"
+        _sys.modules["imageio_ffmpeg"] = fake
+        F._usable = lambda p: "/opt/fake/ffmpeg" if p == "/opt/fake/ffmpeg" else None
+        F.ffmpeg_exe.cache_clear()
+        F.ffprobe_exe.cache_clear()
+        check("falls back to the imageio-ffmpeg binary",
+              F.ffmpeg_exe() == "/opt/fake/ffmpeg", str(F.ffmpeg_exe()))
+        check("have_ffmpeg is true with only the bundled binary", F.have_ffmpeg())
+        check("ffprobe stays None, since imageio-ffmpeg ships none",
+              F.ffprobe_exe() is None)
+
+        F._usable = lambda p: p or None
+        os.environ["CSF_FFMPEG"] = "/custom/ffmpeg"
+        F.ffmpeg_exe.cache_clear()
+        check("an explicit CSF_FFMPEG wins", F.ffmpeg_exe() == "/custom/ffmpeg")
+
+        sample = ("  Duration: 00:00:10.05, start: 0.000000, bitrate: 502 kb/s\n"
+                  "  Stream #0:0(und): Video: h264 (High), yuv420p, 340x256 "
+                  "[SAR 1:1 DAR 85:64], 497 kb/s, 25 fps, 25 tbr\n"
+                  "  Stream #0:1(und): Audio: aac (LC), 44100 Hz, stereo, fltp, 128 kb/s")
+        _sp.run = lambda *a, **k: _types.SimpleNamespace(stderr=sample, stdout="", returncode=1)
+        meta = F.probe_with_ffmpeg(Path("x.mp4"))
+        check("ffmpeg -i yields geometry without ffprobe",
+              meta and meta["width"] == 340 and meta["height"] == 256, str(meta))
+        check("it parses duration, fps and codec",
+              meta["duration_sec"] == 10.05 and meta["fps"] == 25.0
+              and meta["codec"] == "h264", str(meta))
+        check("it detects the audio track", meta["has_audio"] is True)
+        check("the backend is labelled", meta.get("probe") == "ffmpeg")
+    finally:
+        os.environ.pop("CSF_FFMPEG", None)
+        F._usable, _sp.run = orig_usable, orig_run
+        if orig_module is None:
+            _sys.modules.pop("imageio_ffmpeg", None)
+        else:
+            _sys.modules["imageio_ffmpeg"] = orig_module
+        F.ffmpeg_exe.cache_clear()
+        F.ffprobe_exe.cache_clear()
+
+    # the workers carry their own copy, since they cannot import csf
+    common = (Path(__file__).resolve().parent.parent / "csf" / "generation" / "adapters"
+              / "workers" / "_common.py").read_text(encoding="utf-8")
+    check("workers resolve ffmpeg rather than hardcoding it",
+          'subprocess.run(["ffmpeg"' not in common and '["ffprobe"' not in common)
+    check("workers fall back to imageio-ffmpeg too", "imageio_ffmpeg" in common)
+    check("workers honour CSF_FFMPEG", "CSF_FFMPEG" in common)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
-               test_metadata_merge, test_stage_scoping, test_probe_fallback):
+               test_metadata_merge, test_stage_scoping, test_probe_fallback,
+               test_ffmpeg_resolution):
         fn()
     print()
     if FAILURES:
