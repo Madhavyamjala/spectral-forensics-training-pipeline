@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from csf.generation import progress
 from csf.logging_utils import get_logger
 
 log = get_logger("generation.prefetch")
@@ -232,7 +233,7 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
     log.info("Prefetch: %d Hub asset(s) for stage %r", len(assets), stage)
 
     blocked: Dict[str, str] = {}
-    for a in assets:
+    for a in progress.track(assets, "checking access", unit="repo", log_every=5):
         reason = check_access(a, token)
         if reason:
             blocked[a.repo_id] = reason
@@ -251,19 +252,22 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
     if dry_run:
         return {"assets": len(assets), "blocked": blocked, "dry_run": True}
 
+    todo = [a for a in assets if a.repo_id not in blocked]
     results, failed, total_gb = [], [], 0.0
-    for a in assets:
-        if a.repo_id in blocked:
-            continue
-        log.info("Fetching %s ...", a.repo_id)
-        r = fetch(a, token)
-        results.append(r)
-        if r.get("ok"):
-            total_gb += float(r.get("size_gb") or 0.0)
-            log.info("  %s -> %.2f GB in %.0fs", a.repo_id, r["size_gb"], r["seconds"])
-        else:
-            failed.append(r)
-            log.error("  %s FAILED: %s", a.repo_id, r.get("error"))
+    with progress.bar(len(todo), "downloading repos", "repo", log_every=1) as pbar:
+        for a in todo:
+            pbar.set_postfix_str(a.repo_id[:40])
+            log.info("Fetching %s ...", a.repo_id)
+            with progress.Heartbeat(f"downloading {a.repo_id}"):
+                r = fetch(a, token)
+            pbar.update(1)
+            results.append(r)
+            if r.get("ok"):
+                total_gb += float(r.get("size_gb") or 0.0)
+                log.info("  %s -> %.2f GB in %.0fs", a.repo_id, r["size_gb"], r["seconds"])
+            else:
+                failed.append(r)
+                log.error("  %s FAILED: %s", a.repo_id, r.get("error"))
 
     report = {"assets": len(assets), "fetched": len(results) - len(failed),
               "failed": [f["repo_id"] for f in failed], "blocked": blocked,

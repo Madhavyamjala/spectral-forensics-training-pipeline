@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from csf.generation.adapters import ADAPTERS, WorkerPool, adapter_for, env_specs
 from csf.generation.adapters.base import AdapterError
 from csf.generation.envs import EnvBuildError
+from csf.generation import progress as progress_ui
 from csf.generation.jobs import Job
 from csf.logging_utils import get_logger
 
@@ -164,14 +165,30 @@ def balance(groups: Dict[str, List[Job]], gpus: Sequence[int]) -> Dict[int, List
 
 
 class Progress:
+    """Live progress across every GPU, as a bar when attached to a terminal.
+
+    All GPU threads share one counter, so the bar reflects the whole run rather than any single
+    worker - which is what matters when the ETA is measured in days.
+    """
+
     def __init__(self, total: int):
-        """Initialize thread-safe counters for a generation run."""
+        """Initialize thread-safe counters and the shared progress bar."""
         self.total = total
         self.ok = 0
         self.failed = 0
         self.started = time.monotonic()
         self._lock = threading.Lock()
         self._last_log = 0.0
+        self._bar_cm = progress_ui.bar(total, "generating", "video", log_every=50,
+                                       log_seconds=300)
+        self._bar = self._bar_cm.__enter__()
+
+    def close(self) -> None:
+        """Tear the bar down; never let display trouble mask a run's result."""
+        try:
+            self._bar_cm.__exit__(None, None, None)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     def update(self, ok: bool) -> None:
         """Record one outcome and periodically report progress."""
@@ -181,8 +198,10 @@ class Progress:
             else:
                 self.failed += 1
             done = self.ok + self.failed
+            self._bar.update(1)
+            self._bar.set_postfix_str(f"ok {self.ok:,} failed {self.failed:,}")
             now = time.monotonic()
-            if done % 50 == 0 or now - self._last_log > 300:
+            if done % 200 == 0 or now - self._last_log > 900:
                 self._last_log = now
                 elapsed = now - self.started
                 rate = done / max(1e-6, elapsed)
@@ -255,6 +274,7 @@ class GenerationScheduler:
             threads.append(t)
         for t in threads:
             t.join()
+        progress.close()
 
         summary = {"generated": progress.ok, "failed": progress.failed,
                    "pending_at_start": pending,

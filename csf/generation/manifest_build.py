@@ -32,6 +32,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from csf.generation import progress
 from csf.generation.jobs import Job
 from csf.generation.kinetics import probe_video, sha256_file
 from csf.logging_utils import get_logger
@@ -158,6 +159,10 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
     missing_file = 0
     failed = 0
     unreadable = 0
+    ok_records = [(jid, rec) for jid, rec in ledger.items() if rec.get("ok")]
+    log.info("Probing and hashing %d generated video(s)", len(ok_records))
+    pbar_cm = progress.bar(len(ok_records), "probing videos", "video", log_every=250)
+    pbar = pbar_cm.__enter__()
     for job_id, rec in ledger.items():
         job = by_id.get(job_id)
         if job is None:
@@ -165,6 +170,7 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
         if not rec.get("ok"):
             failed += 1
             continue
+        pbar.update(1)
         path = Path(rec.get("output_path") or (video_root / job.repo_path))
         if not path.exists() or path.stat().st_size == 0:
             missing_file += 1
@@ -181,6 +187,7 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
             meta_rows.append(metadata_row(job, path, probed, digest, rendered,
                                           rec.get("seconds")))
 
+    pbar_cm.__exit__(None, None, None)
     log.info("Regenerated rows: %d usable | %d failed | %d recorded-ok but file missing | "
              "%d unreadable", len(new_rows), failed, missing_file, unreadable)
     if not new_rows:
