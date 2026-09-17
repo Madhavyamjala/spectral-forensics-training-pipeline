@@ -61,6 +61,7 @@ class ClipFeatures:
 
     # ---- qualification rules ----
     def qualifies(self, name: str) -> bool:
+        """Return whether the clip satisfies a named source group."""
         if self.error:
             return False
         if name == "any":
@@ -84,11 +85,13 @@ class _Detector:
     """Lazily-initialised face detector, chosen by what the worker process can import."""
 
     def __init__(self, prefer_gpu: bool = False):
+        """Initialize the lazy detector with the preferred device policy."""
         self.kind = "none"
         self._impl = None
         self._prefer_gpu = prefer_gpu
 
     def _init(self):
+        """Load available face and object detector backends."""
         if self._impl is not None or self.kind == "failed":
             return
         try:
@@ -172,6 +175,7 @@ _DETECTOR: Optional[_Detector] = None
 
 
 def _detector() -> _Detector:
+    """Return the process-wide lazily initialized detector."""
     global _DETECTOR
     if _DETECTOR is None:
         _DETECTOR = _Detector(prefer_gpu=os.environ.get("CSF_FILTER_GPU") == "1")
@@ -254,6 +258,7 @@ def score_clip(clip_id: str, label: str, path: str, num_frames: int = 12,
 
 
 def _score_one(args) -> Dict[str, object]:
+    """Extract filter features for one source clip."""
     clip_id, label, path, num_frames, need_faces = args
     try:
         return asdict(score_clip(clip_id, label, path, num_frames, need_faces))
@@ -315,7 +320,9 @@ def score_pool(pool_csv: Path, out_csv: Path, workers: int = 8, num_frames: int 
 
 
 def _row_qualifies(row: Dict[str, object], name: str) -> bool:
+    """Return whether a serialized feature row qualifies for a source group."""
     def num(key, default=0.0):
+        """Coerce a row value to float, falling back to the supplied default."""
         try:
             return float(row.get(key) or default)
         except (TypeError, ValueError):
@@ -332,9 +339,11 @@ def _row_qualifies(row: Dict[str, object], name: str) -> bool:
 
 
 def load_features(path: Path) -> List[Dict[str, object]]:
+    """Load clip feature rows from a JSON Lines file."""
     with open(Path(path), newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
 
 
 def qualifying(features: Sequence[Dict[str, object]], name: str) -> List[Dict[str, object]]:
+    """Index qualifying clips by source group."""
     return [r for r in features if _row_qualifies(r, name)]

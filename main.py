@@ -65,6 +65,7 @@ STAGES = GENERATION_STAGES + TRAINING_STAGES
 
 
 def parse_args():
+    """Parse command-line arguments for the pipeline entry point."""
     ap = argparse.ArgumentParser(description="Chrono-Spectral Forensics pipeline")
     ap.add_argument("--config", required=True)
     ap.add_argument("--stage", default="all")
@@ -74,6 +75,7 @@ def parse_args():
 
 
 def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch random number generators."""
     import numpy as np
     import torch
     random.seed(seed)
@@ -83,7 +85,7 @@ def seed_everything(seed: int) -> None:
 
 
 def preflight(cfg, dist_info, log, selected=None) -> None:
-    """Check the environment for the stages actually being run.
+    """Validate runtime dependencies and report available resources, for the selected stages.
 
     Scoped deliberately. The generation stages schedule subprocesses that each bring their own
     virtual environment, so they need ffmpeg and disk, not peft/torchvision/bitsandbytes. Demanding
@@ -206,6 +208,7 @@ def check_gated_access(model_id: str, log) -> None:
 
 
 def main() -> int:
+    """Run the selected stages of the forensics pipeline."""
     args = parse_args()
     from csf.config import load_config
     cfg = load_config(args.config, args.overrides)
@@ -248,6 +251,7 @@ def main() -> int:
     state = RunState(work_dir)
 
     def should_run(name: str) -> bool:
+        """Return whether a selected stage still needs to run."""
         state.reload()
         if name not in selected:
             return False
@@ -259,6 +263,7 @@ def main() -> int:
         return True
 
     def mark(name: str, **info) -> None:
+        """Persist a completed stage on the main process and synchronize workers."""
         if dist_info.is_main:
             state.mark(name, info)
         barrier()

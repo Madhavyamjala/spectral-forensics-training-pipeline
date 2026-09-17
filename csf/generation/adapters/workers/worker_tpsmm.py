@@ -27,10 +27,12 @@ MAX_FRAMES = 120
 
 class State:
     def __init__(self, repo: Path, ckpt: Path, config: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt, self.config = repo, ckpt, config
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("TPSMM")
     require(repo / "demo.py", "TPSMM demo script")
     ckpt = require(repo / "checkpoints" / "vox.pth.tar",
@@ -42,6 +44,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     driving = payload.get("driving_path") or ""
     if not driving or not Path(driving).exists() or driving == src:

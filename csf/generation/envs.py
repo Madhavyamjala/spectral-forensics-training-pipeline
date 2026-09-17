@@ -50,6 +50,7 @@ class GitRepo:
 
     @property
     def folder(self) -> str:
+        """Return the checkout directory name for this repository."""
         return self.name or Path(self.url.rstrip("/")).stem.replace(".git", "")
 
 
@@ -80,6 +81,7 @@ class EnvSpec:
     note: str = ""
 
     def digest(self) -> str:
+        """Return a stable digest of inputs that define this environment."""
         payload = json.dumps({
             "python": self.python, "torch": self.torch, "torch_index": self.torch_index,
             "requirements": list(self.requirements),
@@ -99,6 +101,7 @@ class ReadyEnv:
     repos: Dict[str, Path]
 
     def environ(self) -> Dict[str, str]:
+        """Return environment variables for commands in the ready environment."""
         env = os.environ.copy()
         env.update(self.spec.env_vars)
         # make the cloned repos importable without each worker hard-coding paths
@@ -116,6 +119,7 @@ class ReadyEnv:
 
 def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None,
          timeout: int = 3600, what: str = "") -> None:
+    """Run a subprocess and raise a contextual environment-build error on failure."""
     log.debug("$ %s", " ".join(str(c) for c in cmd))
     try:
         proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
@@ -129,10 +133,12 @@ def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str,
 
 
 def _venv_python(root: Path) -> Path:
+    """Return the Python executable path for a virtual environment."""
     return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 def _fetch(url: str, dest: Path) -> None:
+    """Download an asset atomically when it is not already cached."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if shutil.which("curl"):
         _run(["curl", "-fsSL", "--retry", "5", "--retry-delay", "5", "-o", str(dest), url],

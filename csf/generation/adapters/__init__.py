@@ -326,6 +326,7 @@ ENVS: Dict[str, EnvSpec] = {
 def _a(key: str, family: str, env: str, worker: str, *, tier: int = 1, implemented: bool = True,
        actual_model: str = "", cost_s: float = 60.0, vram_gb: float = 8.0, note: str = "",
        **options) -> Adapter:
+    """Construct an adapter declaration with concise registry syntax."""
     return Adapter(key=key, family=family, env_name=env, worker=worker, implemented=implemented,
                    tier=tier, actual_model=actual_model, cost_s=cost_s, vram_gb=vram_gb,
                    options=options, note=note)
@@ -447,6 +448,7 @@ ADAPTERS: Dict[str, Adapter] = {a.key: a for a in [
 
 
 def adapter_for(model_key: str) -> Adapter:
+    """Return the adapter registered for a specification model."""
     try:
         return ADAPTERS[model_key]
     except KeyError:
@@ -512,6 +514,7 @@ def cost_estimate(targets: Dict[str, int] | None = None, gpus: int = 3) -> Dict[
 
 
 def _main() -> None:
+    """Print the adapter coverage and estimated generation cost report."""
     cov = coverage()
     per_model = videos_per_model()
     print(f"{'slot':<22}{'runs as':<18}{'family':<30}{'env':<15}{'videos':>8}{'GPU-h':>8}")

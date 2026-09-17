@@ -122,6 +122,7 @@ def read_video(path: str, max_frames: int = 0, max_side: int = 0) -> Tuple[List[
 
 
 def _even(n: int) -> int:
+    """Round a dimension down to the nearest positive even integer."""
     return n if n % 2 == 0 else n - 1
 
 
@@ -174,6 +175,7 @@ _FFMPEG: Optional[bool] = None
 
 
 def _have_ffmpeg() -> bool:
+    """Return whether the ffmpeg executable is available."""
     global _FFMPEG
     if _FFMPEG is None:
         try:
@@ -197,6 +199,7 @@ def extract_audio(video_path: str, out_wav: str, sample_rate: int = 16000) -> Op
 
 
 def has_audio(video_path: str) -> bool:
+    """Return whether the video contains an audio stream."""
     if not _have_ffmpeg():
         return False
     proc = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
@@ -275,6 +278,7 @@ def synth_masks(n_frames: int, height: int, width: int, size_class: str = "mediu
 
 def mask_from_boxes(boxes: Sequence[Tuple[int, int, int, int]], height: int, width: int,
                     dilate: int = 9) -> np.ndarray:
+    """Rasterize bounding boxes into per-frame binary masks."""
     mask = np.zeros((height, width), dtype=np.uint8)
     for x, y, w, h in boxes:
         cv2.rectangle(mask, (int(x), int(y)), (int(x + w), int(y + h)), 255, -1)
@@ -290,6 +294,7 @@ def feather(mask: np.ndarray, radius: int = 9) -> np.ndarray:
 
 
 def write_masks(masks: Sequence[np.ndarray], folder: str) -> str:
+    """Write binary masks to a numbered PNG sequence."""
     Path(folder).mkdir(parents=True, exist_ok=True)
     for i, m in enumerate(masks):
         cv2.imwrite(str(Path(folder) / f"{i:05d}.png"), m)
@@ -297,6 +302,7 @@ def write_masks(masks: Sequence[np.ndarray], folder: str) -> str:
 
 
 def write_frames(frames: Sequence[np.ndarray], folder: str) -> str:
+    """Write video frames to a numbered PNG sequence."""
     Path(folder).mkdir(parents=True, exist_ok=True)
     for i, f in enumerate(frames):
         cv2.imwrite(str(Path(folder) / f"{i:05d}.png"), cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
@@ -304,6 +310,7 @@ def write_frames(frames: Sequence[np.ndarray], folder: str) -> str:
 
 
 def read_frames(folder: str) -> List[np.ndarray]:
+    """Read a numbered image sequence from a directory."""
     files = sorted(Path(folder).glob("*.png")) + sorted(Path(folder).glob("*.jpg"))
     out = []
     for f in files:
@@ -314,11 +321,13 @@ def read_frames(folder: str) -> List[np.ndarray]:
 
 
 def scratch(job_id: str) -> tempfile.TemporaryDirectory:
+    """Create and return a clean scratch directory for a job."""
     safe = "".join(c if c.isalnum() else "_" for c in str(job_id))[:60]
     return tempfile.TemporaryDirectory(prefix=f"csfgen_{safe}_")
 
 
 def env_root() -> Path:
+    """Return the configured root of the model environment."""
     return Path(os.environ.get("CSF_ENV_ROOT", "."))
 
 
@@ -335,6 +344,7 @@ def repo_path(name: str) -> Path:
 
 
 def require(path: Path, what: str) -> Path:
+    """Return a required path or raise when it does not exist."""
     if not Path(path).exists():
         raise RuntimeError(f"{what} is missing at {path}. Stage it before running this adapter "
                            f"(see docs/REGENERATION.md).")

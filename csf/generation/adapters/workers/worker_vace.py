@@ -36,10 +36,12 @@ WIDTH, HEIGHT = 832, 480
 
 class State:
     def __init__(self, repo: Path, ckpt_dir: Path):
+        """Store the reusable components required by this model worker."""
         self.repo, self.ckpt_dir = repo, ckpt_dir
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("VACE")
     require(repo / "vace" / "vace_wan_inference.py", "VACE inference script")
     ckpt_dir = Path(os.environ.get("CSF_ENV_ROOT", ".")) / "weights" / "Wan2.1-VACE-1.3B"
@@ -78,6 +80,7 @@ def _insertion_mask(frames, seed: int):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     opts = payload.get("options") or {}
     task = opts.get("task", "inpainting")
     src = payload["source_path"]

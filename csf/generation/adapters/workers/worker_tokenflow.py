@@ -31,10 +31,12 @@ N_FRAMES = 40                      # TokenFlow inverts every frame; 40 keeps a j
 
 class State:
     def __init__(self, repo: Path, sd_id: str):
+        """Store the reusable components required by this model worker."""
         self.repo, self.sd_id = repo, sd_id
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("TokenFlow")
     require(repo / "run_tokenflow_pnp.py", "TokenFlow driver script")
     require(repo / "preprocess.py", "TokenFlow preprocess script")
@@ -44,6 +46,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     prompt = payload.get("prompt") or "in the style of an oil painting"
     seed = int(payload.get("seed") or 0)

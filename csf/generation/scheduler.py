@@ -86,6 +86,7 @@ class Ledger:
     """Append-only record of every job outcome; the source of truth for resuming."""
 
     def __init__(self, path: Path):
+        """Load prior outcomes and open the append-only generation ledger."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
@@ -105,6 +106,7 @@ class Ledger:
                      sum(1 for v in self.done.values() if v))
 
     def record(self, outcome: Outcome) -> None:
+        """Append an outcome unless its job has already been recorded."""
         with self._lock:
             self.done[outcome.job_id] = outcome.ok
             with open(self.path, "a", encoding="utf-8") as fh:
@@ -115,9 +117,11 @@ class Ledger:
                                      "metadata": outcome.metadata}) + "\n")
 
     def succeeded(self, job_id: str) -> bool:
+        """Return whether a job has a recorded successful outcome."""
         return self.done.get(job_id) is True
 
     def seen(self, job_id: str) -> bool:
+        """Return whether a job has any recorded outcome."""
         return job_id in self.done
 
 
@@ -161,6 +165,7 @@ def balance(groups: Dict[str, List[Job]], gpus: Sequence[int]) -> Dict[int, List
 
 class Progress:
     def __init__(self, total: int):
+        """Initialize thread-safe counters for a generation run."""
         self.total = total
         self.ok = 0
         self.failed = 0
@@ -169,6 +174,7 @@ class Progress:
         self._last_log = 0.0
 
     def update(self, ok: bool) -> None:
+        """Record one outcome and periodically report progress."""
         with self._lock:
             if ok:
                 self.ok += 1
@@ -191,6 +197,7 @@ class GenerationScheduler:
                  job_timeout: int = 1800, fail_fast: int = 8, min_free_gb: float = 50.0,
                  offline: bool = False, deadline_hours: Optional[float] = None,
                  gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1):
+        """Configure generation paths, limits, GPUs, and worker concurrency."""
         self.video_root = Path(video_root)
         self.envs_root = Path(envs_root)
         self.log_dir = Path(log_dir)
@@ -206,9 +213,11 @@ class GenerationScheduler:
         self._fail_lock = threading.Lock()
 
     def output_path(self, job: Job) -> Path:
+        """Return the destination video path for a job."""
         return self.video_root / "AI Edited" / job.family / f"{job.video_id}.mp4"
 
     def _disk_ok(self) -> bool:
+        """Return whether enough free disk space remains for generation."""
         try:
             free_gb = shutil.disk_usage(self.video_root).free / 2 ** 30
         except OSError:
@@ -220,6 +229,7 @@ class GenerationScheduler:
         return True
 
     def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = False) -> Dict[str, object]:
+        """Schedule all pending jobs and return an execution summary."""
         groups = group_jobs(jobs, ledger, retry_failed)
         if not groups:
             log.info("Nothing to do: every job is already recorded in the ledger")
@@ -254,6 +264,7 @@ class GenerationScheduler:
 
     def _gpu_loop(self, gpu: int, models: Sequence[str], groups: Dict[str, List[Job]],
                   ledger: Ledger, progress: Progress, specs) -> None:
+        """Run assigned model groups sequentially on one GPU."""
         pool = WorkerPool(self.envs_root, self.log_dir, max_resident=self.max_workers_per_gpu,
                           job_timeout=self.job_timeout, offline=self.offline)
         try:
@@ -268,6 +279,7 @@ class GenerationScheduler:
 
     def _run_group(self, gpu: int, model: str, jobs: List[Job], pool: WorkerPool, ledger: Ledger,
                    progress: Progress, specs) -> None:
+        """Run one model group across the allowed concurrent workers."""
         adapter = adapter_for(model)
         spec = specs[adapter.env_name]
         slots = concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu)
@@ -293,6 +305,7 @@ class GenerationScheduler:
         streak_lock = threading.Lock()
 
         def slot_loop(slot: int) -> None:
+            """Consume jobs on one worker slot until completion or group abandonment."""
             try:
                 worker = pool.get(adapter, spec, gpu, slot)
             except (AdapterError, EnvBuildError) as exc:
@@ -368,6 +381,7 @@ class GenerationScheduler:
 
     def _run_one(self, worker, pool: WorkerPool, adapter, spec, gpu: int, job: Job,
                  out: Path, slot: int = 0) -> Outcome:
+        """Run one job, restarting a failed worker once."""
         payload = adapter.payload(job, out, gpu)
         for attempt in (1, 2):
             try:
@@ -389,10 +403,12 @@ class GenerationScheduler:
         return Outcome(job.job_id, False, error="exhausted retries")
 
     def _note_failure(self, job: Job, error: str) -> None:
+        """Add a job failure to the thread-safe diagnostic list."""
         with self._fail_lock:
             self.failures.append((job.job_id, job.model, error[:300]))
 
     def write_failures(self, path: Path) -> Optional[Path]:
+        """Write recorded generation failures to CSV when present."""
         if not self.failures:
             return None
         import csv

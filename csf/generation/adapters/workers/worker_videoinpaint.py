@@ -36,10 +36,12 @@ SPECS = {
 
 class State:
     def __init__(self, name: str, repo: Path, ckpt: Path, spec: dict):
+        """Store the reusable components required by this model worker."""
         self.name, self.repo, self.ckpt, self.spec = name, repo, ckpt, spec
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     name = os.environ.get("CSF_ADAPTER", "")
     spec = SPECS.get(name)
     if spec is None:
@@ -54,6 +56,7 @@ def load() -> State:
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
     frames, fps = read_video(src, max_frames=MAX_FRAMES, max_side=MAX_SIDE)
     h, w = frames[0].shape[:2]

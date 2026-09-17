@@ -21,6 +21,7 @@ REASON = ("no runnable public release wired up for this model - see the registry
 
 
 def main() -> int:
+    """Report that the requested model worker is not implemented."""
     model = os.environ.get("CSF_ADAPTER", "unimplemented")
     note(f"worker_unimplemented: refusing all jobs for '{model}' ({REASON})")
     emit({"event": "ready", "model": model, "device": os.environ.get("CSF_GPU", "?"),

@@ -41,10 +41,12 @@ EXPRESSION_RETARGET = {
 
 class State:
     def __init__(self, repo: Path, mode: str):
+        """Store the reusable components required by this model worker."""
         self.repo, self.mode = repo, mode
 
 
 def load() -> State:
+    """Load the model and return its reusable worker state."""
     repo = repo_path("LivePortrait")
     require(repo / "inference.py", "LivePortrait inference script")
     weights = repo / "pretrained_weights"
@@ -58,6 +60,7 @@ def load() -> State:
 
 
 def _collect(out_dir: Path, exclude_concat: bool = True):
+    """Find the video artifact produced by the upstream model."""
     mp4s = sorted(out_dir.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
     if exclude_concat:
         plain = [p for p in mp4s if "concat" not in p.name]
@@ -66,6 +69,7 @@ def _collect(out_dir: Path, exclude_concat: bool = True):
 
 
 def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
     opts = payload.get("options") or {}
     mode = opts.get("mode", "reenact")
     src = payload["source_path"]
