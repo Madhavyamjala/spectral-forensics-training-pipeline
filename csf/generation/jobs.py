@@ -455,6 +455,15 @@ def _bind_extras(job: Job, family: S.Family, pipe: S.Pipeline, allocator: ClipAl
         prompts = BACKGROUND_PROMPTS.get(pipe.key)
         if prompts:
             job.prompt = rng.choice(list(prompts))
+        if pipe.key == "bg_real_composite":
+            # Pipeline A composites the foreground onto a *different real* clip and uses no
+            # generative model at all, so it needs a second source clip as the background plate.
+            # Without one the worker has nothing to composite onto.
+            plate = allocator.any_clip(rng, job.source_clip_id, "any")
+            if plate is not None:
+                job.driving_clip_id = str(plate["clip_id"])
+                job.driving_path = str(plate["path"])
+                meta["background_plate_id"] = job.driving_clip_id
         meta.update(segmentation_model="sam2", background_source=pipe.key, composite_mode=pipe.key)
 
     elif family.key == "video_to_video":
