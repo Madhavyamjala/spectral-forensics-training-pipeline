@@ -13,6 +13,7 @@ clip leaks across the train/valid/test boundary.
 
 from __future__ import annotations
 
+import inspect
 import os
 import random
 import re
@@ -848,9 +849,12 @@ def test_env_paths() -> None:
         try:
             def fake_run(cmd, cwd=None, env=None, timeout=3600, what=""):
                 if "virtual environment" in what or "venv" in what:
-                    py = E._venv_python(Path(cmd[-1]))
+                    venv_dir = Path(cmd[-1])
+                    py = E._venv_python(venv_dir)
                     py.parent.mkdir(parents=True, exist_ok=True)
-                    py.write_text("#!/bin/sh")
+                    # stand in for a real interpreter: the build probes it with
+                    # `-c "import sys; print(sys.prefix)"` to confirm it runs as its own venv
+                    py.write_text(f'#!/bin/sh\necho "{venv_dir.resolve()}"\n')
                     py.chmod(0o755)
             E._run = fake_run
             ready = E.build_env(E.EnvSpec(name="probe", torch="", requirements=()), Path(rel))
@@ -987,6 +991,65 @@ def test_stage_staleness() -> None:
           "_stale_reason(name, cfg, state.info(name))" in src)
 
 
+def test_env_interpreter() -> None:
+    """The venv interpreter path must stay inside the venv, symlink and all."""
+    print("env interpreter")
+    import subprocess
+    import tempfile
+
+    from csf.generation.envs import EnvSpec, _venv_is_sane, _venv_python, diagnose
+
+    with tempfile.TemporaryDirectory() as tmp:
+        venv = Path(tmp) / "env" / "venv"
+        (venv / "bin").mkdir(parents=True)
+        # a venv's bin/python is a symlink to the base interpreter; resolving it walks out of
+        # the environment and silently runs the system Python instead (no pip, no packages).
+        link = venv / "bin" / "python"
+        link.symlink_to(sys.executable)
+        py = _venv_python(venv)
+        check("the interpreter path stays inside the venv", str(py).startswith(str(venv)),
+              str(py))
+        check("the path is absolute", py.is_absolute())
+        check("the symlink is not followed", py.resolve() != py or not link.is_symlink())
+        check("a venv with no pyvenv.cfg is reported as not its own venv",
+              not _venv_is_sane(py, venv))
+
+        spec = EnvSpec(name="env", torch="", requirements=())
+        report = diagnose([spec], Path(tmp))["env"]
+        check("the doctor reports a broken env as broken", report["verdict"] == "broken",
+              str(report))
+        check("the doctor names the interpreter it checked", report["python"] == str(py))
+
+        missing = diagnose([EnvSpec(name="nope", torch="")], Path(tmp))["nope"]
+        check("an env that was never built reads as missing", missing["verdict"] == "missing")
+
+    body = inspect.getsource(_venv_python).split('"""')[-1]      # skip the docstring's prose
+    check("the interpreter path is never resolved through its symlink",
+          ".resolve()" not in body and "os.path.abspath" in body)
+
+    # the derived import check has to cover what the workers actually import
+    specs = env_specs()
+    check("every env checks for cv2 when it installs opencv",
+          all("cv2" in sp.checks() for sp in specs.values()
+              if any("opencv" in r for r in sp.requirements)))
+    check("every env with torch checks for torch",
+          all("torch" in sp.checks() for sp in specs.values() if sp.torch))
+    check("sam2_diffusers checks the modules its worker imports",
+          {"cv2", "torch", "diffusers"} <= set(specs["sam2_diffusers"].checks()))
+    check("an explicit verify_imports overrides the derived set",
+          EnvSpec(name="x", torch="t", verify_imports=("only_this",)).checks() == ("only_this",))
+    check("verify_imports is part of the env digest",
+          EnvSpec(name="x", verify_imports=("a",)).digest()
+          != EnvSpec(name="x", verify_imports=("b",)).digest())
+
+    # the build must confirm the env works rather than trusting its own marker
+    build_src = inspect.getsource(__import__("csf.generation.envs", fromlist=["build_env"]).build_env)
+    check("a ready marker is re-verified before the env is handed out",
+          "_venv_is_sane(py, venv_dir)" in build_src and "_verify_imports" in build_src)
+    check("pip is bootstrapped when the venv has none", "_ensure_pip(py," in build_src)
+    check("a venv that is not its own venv is recreated", "recreating it" in build_src)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
@@ -994,7 +1057,7 @@ def main() -> int:
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
-               test_stage_staleness):
+               test_stage_staleness, test_env_interpreter):
         fn()
     print()
     if FAILURES:

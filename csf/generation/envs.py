@@ -24,13 +24,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from csf.generation.progress import Heartbeat
 from csf.logging_utils import get_logger
@@ -38,6 +39,19 @@ from csf.logging_utils import get_logger
 log = get_logger("generation.envs")
 
 DEFAULT_TORCH_INDEX = "https://download.pytorch.org/whl/cu121"
+
+
+#: requirement -> module name, for the derived import check. Only unambiguous, directly
+#: installed packages belong here; anything installed transitively or through a git URL is
+#: left out so the check cannot fail on something the env never promised.
+_IMPORT_NAMES: Dict[str, str] = {
+    "opencv-python": "cv2", "opencv-python-headless": "cv2", "opencv-contrib-python": "cv2",
+    "numpy": "numpy", "pillow": "PIL", "scipy": "scipy", "scikit-image": "skimage",
+    "imageio": "imageio", "diffusers": "diffusers", "transformers": "transformers",
+    "accelerate": "accelerate", "safetensors": "safetensors", "insightface": "insightface",
+    "onnxruntime": "onnxruntime", "onnxruntime-gpu": "onnxruntime", "librosa": "librosa",
+    "huggingface-hub": "huggingface_hub", "einops": "einops", "omegaconf": "omegaconf",
+}
 
 
 class EnvBuildError(RuntimeError):
@@ -80,7 +94,29 @@ class EnvSpec:
     #: Hub repos a post-install hook pulls. Declared explicitly so the prefetch stage can check
     #: access to them up front - parsing them out of the hook's command line is fragile.
     hub_repos: Sequence[str] = ()
+    #: Modules the worker imports at startup. Checked inside the env before it is marked ready,
+    #: so a half-installed env fails at build time (where the error names the env and can be
+    #: retried) instead of at job time as a bare ModuleNotFoundError from 200 workers.
+    verify_imports: Sequence[str] = ()
     note: str = ""
+
+    def checks(self) -> Tuple[str, ...]:
+        """Modules this env must be able to import.
+
+        Declared explicitly via `verify_imports`, or derived from the requirements when it is
+        not. The derived set is deliberately small - packages that are installed directly and
+        whose import name is unambiguous - because a false failure here would rebuild a good
+        env for no reason.
+        """
+        if self.verify_imports:
+            return tuple(self.verify_imports)
+        mods: List[str] = ["torch"] if self.torch else []
+        for req in self.requirements:
+            name = re.split(r"[=<>!\[ ]", req.strip(), 1)[0].lower()
+            mod = _IMPORT_NAMES.get(name)
+            if mod and mod not in mods:
+                mods.append(mod)
+        return tuple(mods)
 
     def digest(self) -> str:
         """Return a stable digest of inputs that define this environment."""
@@ -91,6 +127,7 @@ class EnvSpec:
             "hub_repos": list(self.hub_repos),
             "weights": [[w.dest, w.url, w.hf_repo, w.hf_file] for w in self.weights],
             "post_install": [list(c) for c in self.post_install],
+            "verify_imports": list(self.verify_imports),
         }, sort_keys=True)
         return hashlib.blake2b(payload.encode(), digest_size=8).hexdigest()
 
@@ -146,9 +183,100 @@ def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str,
 
 
 def _venv_python(root: Path) -> Path:
-    """Absolute path to a venv's interpreter."""
-    """Return the Python executable path for a virtual environment."""
-    return (Path(root) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")).resolve()
+    """Absolute path to a venv's interpreter, WITHOUT resolving symlinks.
+
+    `bin/python` inside a venv is a symlink to the base interpreter, so `Path.resolve()` walks
+    straight out of the environment and hands back `/usr/bin/python3.x`. Running that binary
+    skips the venv entirely: none of its packages are importable and it has no pip, which is
+    exactly the "No module named pip" / "No module named 'cv2'" pair this produced on every
+    job. `abspath` normalises the path (absolute, no `..`) without following the link, so the
+    interpreter keeps running as its own venv.
+
+    It only bites after the first build: before the venv exists there is no symlink to follow,
+    so `resolve()` returned the right path and the env built perfectly - then every later run
+    used the system Python.
+    """
+    name = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    return Path(os.path.abspath(Path(root) / name))
+
+
+def _probe(py: Path, code: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run a one-liner inside an env's interpreter and return the completed process."""
+    return subprocess.run([str(py), "-c", code], capture_output=True, text=True, timeout=timeout,
+                          check=False)
+
+
+def _venv_is_sane(py: Path, venv_dir: Path) -> bool:
+    """Whether `py` really runs as this venv rather than as the base interpreter.
+
+    A venv whose `pyvenv.cfg` is missing or points at a moved interpreter still has a working
+    `bin/python` symlink - it simply resolves to the system Python, with none of the packages
+    that were installed into the venv. That is how an env that "built fine" ends up raising
+    `No module named 'cv2'` for every job, and why the error names /usr/bin/python3.x.
+    """
+    if not py.exists():
+        return False
+    try:
+        proc = _probe(py, "import sys; print(sys.prefix)")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        return Path(proc.stdout.strip()).resolve() == Path(venv_dir).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _ensure_pip(py: Path, label: str) -> None:
+    """Make sure `py -m pip` works, bootstrapping it when the venv was built without it.
+
+    Several distributions ship `venv` without `ensurepip` (Debian's python3-venv, RHEL's
+    platform-python), and `python -m venv` then produces a venv with no pip at all. The
+    subsequent install fails with a message that names the *base* interpreter, which sends you
+    looking at the wrong Python entirely.
+    """
+    try:
+        if _probe(py, "import pip").returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EnvBuildError(f"{label}: cannot run {py}: {exc}") from exc
+
+    log.warning("%s: the virtual environment has no pip (this Python's venv module was built "
+                "without ensurepip) - bootstrapping it", label)
+    if _probe(py, "import ensurepip; ensurepip.bootstrap(upgrade=True)", timeout=600).returncode == 0 \
+            and _probe(py, "import pip").returncode == 0:
+        return
+
+    get_pip = Path(py).parent.parent / "get-pip.py"
+    try:
+        _fetch("https://bootstrap.pypa.io/get-pip.py", get_pip)
+        _run([py, str(get_pip)], what=f"{label}: bootstrapping pip", timeout=900)
+    except EnvBuildError as exc:
+        raise EnvBuildError(
+            f"{label}: the virtual environment has no pip and it could not be bootstrapped "
+            f"({exc}). Install the venv/ensurepip package for this Python "
+            f"(Debian/Ubuntu: python3-venv, RHEL: python3-pip), or point "
+            f"generation.envs at a Python that has it.") from exc
+    if _probe(py, "import pip").returncode != 0:
+        raise EnvBuildError(f"{label}: pip is still missing after bootstrapping")
+
+
+def _verify_imports(py: Path, modules: Sequence[str], label: str) -> None:
+    """Fail the build if the env cannot import what its worker needs."""
+    if not modules:
+        return
+    code = "import " + ", ".join(modules)
+    try:
+        proc = _probe(py, code, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EnvBuildError(f"{label}: import check could not run: {exc}") from exc
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise EnvBuildError(
+            f"{label}: the environment is built but cannot import {', '.join(modules)} - "
+            f"{tail[-1] if tail else 'unknown error'}. The requirements install did not take "
+            f"effect; rebuild with --force.")
 
 
 def _fetch(url: str, dest: Path) -> None:
@@ -184,8 +312,20 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
         except json.JSONDecodeError:
             state = {}
         if state.get("digest") == want and py.exists():
-            return ReadyEnv(spec, root, py,
-                            {r.folder: repos_dir / r.folder for r in spec.repos})
+            # the marker says "built"; confirm it still *works* before handing workers an env
+            # that would fail on every job. Cheap (two subprocess imports) next to a job.
+            if not _venv_is_sane(py, venv_dir):
+                log.warning("Env '%s' is marked ready but %s does not run as its own venv "
+                            "(moved or half-created) -> rebuilding", spec.name, py)
+            else:
+                try:
+                    _verify_imports(py, spec.checks(), f"env '{spec.name}'")
+                    return ReadyEnv(spec, root, py,
+                                    {r.folder: repos_dir / r.folder for r in spec.repos})
+                except EnvBuildError as exc:
+                    log.warning("%s -> rebuilding", exc)
+            force = True
+            shutil.rmtree(venv_dir, ignore_errors=True)
         if state.get("digest") != want and state:
             log.info("Env '%s' spec changed (%s -> %s) -> rebuilding", spec.name,
                      state.get("digest"), want)
@@ -207,12 +347,22 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
         log.info("[%s  step %d/%d] %s", spec.name, step[0], steps, label)
         return label
 
+    if py.exists() and not _venv_is_sane(py, venv_dir):
+        log.warning("Env '%s': %s exists but does not run as its own venv - recreating it",
+                    spec.name, py)
+        shutil.rmtree(venv_dir, ignore_errors=True)
     if not py.exists():
         base = spec.python or sys.executable
         _run([base, "-m", "venv", str(venv_dir)],
              what=announce("creating the virtual environment"), timeout=600)
+        if not _venv_is_sane(py, venv_dir):
+            raise EnvBuildError(
+                f"Env '{spec.name}': `{base} -m venv {venv_dir}` did not produce a usable "
+                f"environment. Check that the venv module works on this machine "
+                f"(some distributions need python3-venv / ensurepip installed).")
     else:
         announce("virtual environment already present")
+    _ensure_pip(py, f"env '{spec.name}'")
     _run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
          what=announce("upgrading pip"), timeout=1800)
 
@@ -277,6 +427,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             f"Environment '{spec.name}' finished building but its interpreter is missing at "
             f"{py}. The venv step probably failed silently - check that `python -m venv` works "
             f"on this machine (some distributions need python3-venv / ensurepip installed).")
+    _verify_imports(py, spec.checks(), f"env '{spec.name}'")
     marker.write_text(json.dumps({"digest": want, "name": spec.name, "python": str(py),
                                   "root": str(root),
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),
@@ -302,6 +453,44 @@ def env_status(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, str]:
     return out
 
 
+def diagnose(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, Dict[str, object]]:
+    """Report what is actually wrong with each env, without building anything.
+
+    `env_status` only reads the readiness marker, which is exactly the thing that lies when a
+    build half-succeeded. This runs the interpreter.
+    """
+    out: Dict[str, Dict[str, object]] = {}
+    for spec in specs:
+        root = (Path(envs_root) / spec.name).resolve()
+        venv_dir = root / "venv"
+        py = _venv_python(venv_dir)
+        info: Dict[str, object] = {"root": str(root), "python": str(py),
+                                   "marker": (root / ".csf_ready.json").exists(),
+                                   "interpreter": py.exists()}
+        if not py.exists():
+            info["verdict"] = "missing"
+            out[spec.name] = info
+            continue
+        info["own_venv"] = _venv_is_sane(py, venv_dir)
+        try:
+            pip = _probe(py, "import pip; print(pip.__version__)")
+            info["pip"] = pip.stdout.strip() if pip.returncode == 0 else "MISSING"
+        except (OSError, subprocess.SubprocessError) as exc:
+            info["pip"] = f"error: {exc}"
+        missing = []
+        for mod in spec.checks():
+            try:
+                if _probe(py, f"import {mod}").returncode != 0:
+                    missing.append(mod)
+            except (OSError, subprocess.SubprocessError):
+                missing.append(mod)
+        info["missing_imports"] = missing
+        info["verdict"] = ("ok" if info["own_venv"] and info["pip"] != "MISSING" and not missing
+                           else "broken")
+        out[spec.name] = info
+    return out
+
+
 def _main() -> int:
     """`python -m csf.generation.envs --build <name|all>` pre-builds envs before a run."""
     import argparse
@@ -313,10 +502,45 @@ def _main() -> int:
     ap.add_argument("--envs-root", default="./cache/generation/envs")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--doctor", default="", help="env or adapter name, or 'all': check what is "
+                                                 "actually installed in each built env")
     args = ap.parse_args()
 
     specs = env_specs()
     root = Path(args.envs_root)
+
+    def _select(name: str) -> List[EnvSpec]:
+        if name == "all":
+            return list(specs.values())
+        if name in specs:
+            return [specs[name]]
+        return [specs[ADAPTERS[name].env_name]] if name in ADAPTERS else []
+
+    if args.doctor:
+        wanted = _select(args.doctor)
+        if not wanted:
+            print(f"Unknown env/adapter {args.doctor!r}. Known envs: {sorted(specs)}")
+            return 2
+        report = diagnose(wanted, root)
+        bad = 0
+        for name in sorted(report):
+            info = report[name]
+            print(f"{str(info['verdict']):>7}  {name}")
+            print(f"         python: {info['python']}"
+                  f"{'' if info.get('interpreter') else '   (does not exist)'}")
+            if info.get("interpreter"):
+                if not info.get("own_venv"):
+                    print("         WARNING: this interpreter does not run as its own venv - "
+                          "packages installed into it are invisible")
+                print(f"         pip: {info.get('pip')}")
+                missing = info.get("missing_imports") or []
+                print(f"         cannot import: {', '.join(missing) if missing else '-'}")
+            if info["verdict"] != "ok":
+                bad += 1
+                print(f"         fix: python -m csf.generation.envs --build {name} --force "
+                      f"--envs-root {root}")
+        return 1 if bad else 0
+
     if args.status or not args.build:
         status = env_status(list(specs.values()), root)
         for name in sorted(status):
@@ -325,9 +549,7 @@ def _main() -> int:
         print(f"\n{implemented}/{len(ADAPTERS)} adapters implemented; {len(specs)} environments")
         return 0
 
-    wanted = list(specs.values()) if args.build == "all" else \
-        [specs[k] for k in specs if k == args.build] or \
-        ([specs[ADAPTERS[args.build].env_name]] if args.build in ADAPTERS else [])
+    wanted = _select(args.build)
     if not wanted:
         print(f"Unknown env/adapter {args.build!r}. Known envs: {sorted(specs)}")
         return 2
