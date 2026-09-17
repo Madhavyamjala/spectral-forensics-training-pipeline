@@ -144,9 +144,13 @@ def render(state: State, payload: dict) -> dict:
 
     write_video(result, payload["output_path"], fps=fps,
                 audio_from=src if has_audio(src) else None)
+    detected = sum(1 for b in dboxes if b is not None)
     return {"reenactment_model": "fomm", "target_video_id": Path(src).stem,
             "driving_video_id": Path(driving).stem,
+            "target_identity": Path(src).stem, "driving_identity": Path(driving).stem,
             "face_size": round(max(w, h) / max(1, min(base.shape[:2])), 4),
+            # frames of the driving clip with no detectable face
+            "occlusion_level": round(1.0 - detected / max(1, len(drive)), 4),
             "frames": len(result)}
 
 

@@ -127,7 +127,10 @@ def render(state: State, payload: dict) -> dict:
             "mask_size_class": payload.get("mask_size", ""),
             "mask_motion_pattern": payload.get("mask_motion", ""),
             "mask_area_frac": round(float(np.mean([m.astype(bool).mean() for m in masks])), 4),
-            "operation": payload.get("operation", ""), "frames": len(result)}
+            "operation": payload.get("operation", ""),
+            # how long the masked region persists, which the spec tracks for object edits
+            "track_length": sum(1 for m in masks if m.any()),
+            "inpaint_target": payload.get("variant", ""), "frames": len(result)}
 
 
 if __name__ == "__main__":

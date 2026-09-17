@@ -236,10 +236,11 @@ def stage_regen_manifest(cfg) -> Dict[str, object]:
     out = Path(gen.manifest_out)
     report = build_manifest(old_manifest=Path(cfg.data.manifest), jobs=jobs,
                             ledger_path=Path(gen.ledger), video_root=video_root_for(cfg),
-                            out_path=out, keep_old_edited=gen.keep_old_edited)
+                            out_path=out, keep_old_edited=gen.keep_old_edited,
+                            metadata_path=Path(gen.metadata_out) if gen.metadata_out else None)
     write_report(report, Path(cfg.paths.work_dir) / "metrics" / "regeneration_report.json")
-    log.info("Manifest rebuilt at %s. Point data.manifest at it for training:\n"
-             "    --set data.manifest=%s", out, out)
+    log.info("Manifest rebuilt at %s (per-video metadata: %s). Point data.manifest at it for "
+             "training:\n    --set data.manifest=%s", out, report.get("metadata_csv"), out)
     return report
 
 

@@ -166,6 +166,9 @@ class GenerationConfig:
     jobs_csv: str = "./cache/regen/jobs.csv"
     ledger: str = "./cache/regen/ledger.jsonl"
     manifest_out: str = "manifest_regen.csv"
+    #: Per-video metadata for artifact-attribution analysis, written alongside the manifest.
+    #: Empty => metadata.csv next to manifest_out.
+    metadata_out: str = ""
     job_timeout_s: int = 1800
     fail_fast: int = 8
     min_free_gb: float = 50.0

@@ -87,7 +87,8 @@ def render(state: State, payload: dict) -> dict:
             write_video(drive_frames, str(driving_mp4), fps=fps)
             cmd += ["-d", str(driving_mp4), "--flag_relative_motion", "true"]
             meta.update(reenactment_model="liveportrait",
-                        driving_video_id=Path(driving).stem, target_video_id=Path(src).stem)
+                        driving_video_id=Path(driving).stem, target_video_id=Path(src).stem,
+                        target_identity=Path(src).stem, driving_identity=Path(driving).stem)
         elif mode == "expression":
             variant = payload.get("variant") or "smile_happiness"
             eye, lip = EXPRESSION_RETARGET.get(variant, (0.2, 0.3))
@@ -98,7 +99,9 @@ def render(state: State, payload: dict) -> dict:
                     "--eye_retargeting_multiplier", f"{1.0 + eye * magnitude:.3f}",
                     "--lip_retargeting_multiplier", f"{1.0 + lip * magnitude:.3f}"]
             meta.update(edit_model="liveportrait_expr", manipulation_type=variant,
-                        edit_magnitude=magnitude, eye_ratio=eye, lip_ratio=lip)
+                        edit_magnitude=magnitude, eye_ratio=eye, lip_ratio=lip,
+                        # retargeting edits the face in place, so identity is preserved
+                        identity_preserved=True)
         else:
             raise RuntimeError(f"unknown liveportrait mode {mode!r}")
 

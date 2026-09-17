@@ -74,7 +74,8 @@ def render(state: State, payload: dict) -> dict:
     if source_face is None:
         raise RuntimeError("no usable source identity face found in the donor clip")
 
-    swapped, hit, qualities, sizes, yaws = [], 0, [], [], []
+    swapped, hit, qualities, sizes = [], 0, [], []
+    yaws, pitches, rolls = [], [], []
     for frame in frames:
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         faces = state.app.get(bgr)
@@ -87,9 +88,13 @@ def render(state: State, payload: dict) -> dict:
             x1, y1, x2, y2 = biggest.bbox
             qualities.append(float(biggest.det_score))
             sizes.append(float(max(x2 - x1, y2 - y1)) / max(1.0, min(frame.shape[:2])))
+            # buffalo_l returns a full (pitch, yaw, roll) pose, so record all three rather
+            # than just yaw - the specification asks for all of them per video
             pose = getattr(biggest, "pose", None)
-            if pose is not None:
+            if pose is not None and len(pose) >= 3:
+                pitches.append(float(pose[0]))
                 yaws.append(float(pose[1]))
+                rolls.append(float(pose[2]))
         swapped.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
     if hit == 0:
@@ -105,7 +110,12 @@ def render(state: State, payload: dict) -> dict:
         "target_face_quality": round(float(np.mean(qualities)), 4) if qualities else 0.0,
         "source_face_quality": round(float(source_face.det_score), 4),
         "face_size": round(float(np.mean(sizes)), 4) if sizes else 0.0,
-        "yaw": round(float(np.mean(yaws)), 3) if yaws else 0.0,
+        "yaw": round(float(np.mean(yaws)), 3) if yaws else "",
+        "pitch": round(float(np.mean(pitches)), 3) if pitches else "",
+        "roll": round(float(np.mean(rolls)), 3) if rolls else "",
+        # frames where no face was found at all - the closest honest proxy for occlusion this
+        # pipeline can measure without a dedicated occlusion model
+        "occlusion_level": round(1.0 - hit / max(1, len(frames)), 4),
         "frames": len(swapped),
     }
 

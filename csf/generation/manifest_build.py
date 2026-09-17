@@ -65,7 +65,9 @@ def read_ledger(path: Path) -> Dict[str, dict]:
     return out
 
 
-def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
+def _row_for(job: Job, path: Path, meta: dict,
+             probed: Optional[Dict[str, object]] = None,
+             digest: Optional[str] = None) -> Optional[Dict[str, object]]:
     """One manifest row.
 
     `model` and `generator_edit_method` record the model that *actually rendered* the video,
@@ -82,10 +84,11 @@ def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
     adapter = ADAPTERS.get(job.model)
     actual = adapter.runs if adapter is not None else job.model
     substituted = bool(adapter is not None and adapter.substituted)
-    probed = probe_video(path)
+    probed = probed if probed is not None else probe_video(path)
     if probed is None:
         log.debug("Generated file is unreadable, dropping from the manifest: %s", path)
         return None
+    digest = digest if digest is not None else sha256_file(path)
     row: Dict[str, object] = {
         "class": "ai_edited",
         "generator_edit_method": actual,
@@ -98,7 +101,7 @@ def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
         "codec": probed["codec"],
         "bitrate": probed["bitrate"],
         "has_audio": probed["has_audio"],
-        "sha256": sha256_file(path),
+        "sha256": digest,
         "family": job.family,
         "model": actual,
         "spec_model": job.model,
@@ -120,8 +123,13 @@ def _row_for(job: Job, path: Path, meta: dict) -> Optional[Dict[str, object]]:
 
 def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, video_root: Path,
                    out_path: Path, keep_old_edited: bool = False,
-                   workers: int = 8) -> Dict[str, object]:
-    """Write the new manifest; returns a report dict."""
+                   workers: int = 8, metadata_path: Optional[Path] = None) -> Dict[str, object]:
+    """Write the new manifest and the per-video metadata file; returns a report dict.
+
+    Both come out of one pass over the produced videos. Probing and hashing 33,333 files is the
+    expensive part of this stage, so the container fingerprint and digest are computed once and
+    shared, rather than each writer walking the tree itself.
+    """
     old_manifest, out_path, video_root = Path(old_manifest), Path(out_path), Path(video_root)
     ledger = read_ledger(ledger_path)
 
@@ -142,10 +150,14 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
         log.warning("Old manifest %s not found - the new manifest will contain only the "
                     "regenerated ai_edited rows", old_manifest)
 
+    from csf.generation.metadata import coverage, metadata_row, write_metadata
+
     by_id = {j.job_id: j for j in jobs}
     new_rows: List[Dict[str, object]] = []
+    meta_rows: List[Dict[str, object]] = []
     missing_file = 0
     failed = 0
+    unreadable = 0
     for job_id, rec in ledger.items():
         job = by_id.get(job_id)
         if job is None:
@@ -157,12 +169,20 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
         if not path.exists() or path.stat().st_size == 0:
             missing_file += 1
             continue
-        row = _row_for(job, path, rec.get("metadata") or {})
+        probed = probe_video(path)
+        if probed is None:
+            unreadable += 1
+            continue
+        digest = sha256_file(path)
+        rendered = rec.get("metadata") or {}
+        row = _row_for(job, path, rendered, probed, digest)
         if row is not None:
             new_rows.append(row)
+            meta_rows.append(metadata_row(job, path, probed, digest, rendered,
+                                          rec.get("seconds")))
 
-    log.info("Regenerated rows: %d usable | %d failed | %d recorded-ok but file missing",
-             len(new_rows), failed, missing_file)
+    log.info("Regenerated rows: %d usable | %d failed | %d recorded-ok but file missing | "
+             "%d unreadable", len(new_rows), failed, missing_file, unreadable)
     if not new_rows:
         raise RuntimeError("No regenerated videos are usable - refusing to write a manifest with "
                            "an empty ai_edited class. Check the generation ledger and failures.csv.")
@@ -181,7 +201,14 @@ def build_manifest(old_manifest: Path, jobs: Sequence[Job], ledger_path: Path, v
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
+    meta_out = Path(metadata_path) if metadata_path else out_path.with_name("metadata.csv")
+    # same disposition as the manifest: the old ai_edited rows describe files that no longer
+    # exist, while real / ai_generated rows are not ours to discard
+    write_metadata(meta_rows, meta_out, keep_old_edited=keep_old_edited)
+
     report = _report(rows, new_rows, old_counts, failed, missing_file)
+    report["metadata_csv"] = str(meta_out)
+    report["metadata_coverage"] = coverage(meta_rows)
     log.info("New manifest written: %s\n%s", out_path, json.dumps(report, indent=2)[:1500])
     return report
 
