@@ -408,6 +408,10 @@ rather than missing ones. Dry-run first with `--set generation.push.dry_run=true
 | Runs on `cuda:0` when you asked for another card | Set `generation.driver_gpu` (or `CSF_DRIVER_GPU=2`). A single-process run has no `LOCAL_RANK`, so it defaults to device 0. |
 | `peft is not installed` / `bitsandbytes is required` on a generation-only run | Fixed: preflight now only demands the training stack when a training stage is selected. If you still see it, you have a training stage in `--stage`. |
 | `generation.gpus ... names GPU(s) [n]` | Those ids do not exist in this process. Usually `CUDA_VISIBLE_DEVICES` is set and has renumbered them. |
+| `N clip(s) are present ... but none could be read` | ffprobe is missing and OpenCV cannot decode them either. Install ffmpeg (`conda install -c conda-forge ffmpeg`), or set `generation.kinetics.probe_clips=false` to build the pool without container metadata. |
+| `ffprobe is not on PATH` warning | The pool still builds via OpenCV, but codec/bitrate/audio are recorded as unknown **and the generation workers need ffmpeg to encode**. Install it before the `generate` stage. |
+| `No clips were downloaded to ...` | The download genuinely produced nothing - check `hf_repo` / `local_root` / `mirror_base` and your Hub login. |
+| `N label(s) the spec needs have no file in this mirror` | Those Kinetics classes are spelled differently (or absent) upstream. The sampler redistributes within each source group, so a few are harmless. |
 | `Only N clips pass the 'face' filter` | No face detector in the driver env. `pip install insightface` or `mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. |
 | A whole model group fails instantly | Usually a missing weight. Read `runs/regen/logs/generation/worker_<model>_gpu<N>.log` — the worker names the file it wanted. |
 | `group abandoned after N consecutive failures` | `fail_fast` tripped. The group is skipped, the run continues; fix the cause and re-run with `retry_failed=true`. |

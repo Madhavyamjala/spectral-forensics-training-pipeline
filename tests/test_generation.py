@@ -561,11 +561,85 @@ def test_stage_scoping() -> None:
     check("generation.gpus is validated", "_check_generation_gpus" in src)
 
 
+def test_probe_fallback() -> None:
+    """A missing ffprobe must degrade the metadata, not empty the source pool."""
+    print("container probe")
+    import shutil as _shutil
+    import subprocess as _sp
+    import tempfile
+
+    import csf.generation.kinetics as K
+
+    original_run = _sp.run
+    original_cv = K._probe_with_opencv
+    try:
+        # ffprobe absent, OpenCV able to read: must still return metadata
+        _sp.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("ffprobe"))
+        K._probe_with_opencv = lambda p: {"duration_sec": 10.0, "width": 340, "height": 256,
+                                          "fps": 25.0, "codec": "unknown", "bitrate": 0,
+                                          "has_audio": False, "probe": "opencv"}
+        K._FFPROBE_WARNED = False
+        meta = K.probe_video(Path("clip.mp4"))
+        check("falls back to OpenCV when ffprobe is missing",
+              meta is not None and meta.get("probe") == "opencv")
+        check("the fallback still yields usable geometry",
+              meta["width"] == 340 and meta["fps"] == 25.0)
+
+        # neither backend can read it: None, so the caller can drop the clip
+        K._probe_with_opencv = lambda p: None
+        check("an undecodable file still returns None", K.probe_video(Path("bad.mp4")) is None)
+    finally:
+        _sp.run = original_run
+        K._probe_with_opencv = original_cv
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        # nothing downloaded
+        pool = K.SourcePool(root / "a")
+        try:
+            pool.write_pool(["playing guitar"])
+            check("an empty directory raises", False)
+        except RuntimeError as exc:
+            check("an empty directory says nothing was downloaded",
+                  "No clips were downloaded" in str(exc), str(exc)[:80])
+
+        # files present, none decodable - the case that used to say "run the kinetics stage"
+        pool = K.SourcePool(root / "b")
+        d = pool.clips_dir / "playing guitar"
+        d.mkdir(parents=True)
+        for i in range(5):
+            (d / f"c{i}.mp4").write_bytes(b"not a video")
+        try:
+            pool.write_pool(["playing guitar"])
+            check("undecodable clips raise", False)
+        except RuntimeError as exc:
+            msg = str(exc)
+            check("the message reports how many clips are present", "5 clip(s) are present" in msg,
+                  msg[:90])
+            check("it does not tell you to re-run the stage you are in",
+                  "Run the 'kinetics' stage first" not in msg)
+            check("it names ffmpeg as the usual cause", "ffmpeg" in msg)
+            check("it offers probe_clips=false as an escape", "probe_clips=false" in msg)
+
+        # probing disabled: the pool builds regardless
+        pool = K.SourcePool(root / "c")
+        d = pool.clips_dir / "playing guitar"
+        d.mkdir(parents=True)
+        for i in range(3):
+            (d / f"c{i}.mp4").write_bytes(b"x" * 10)
+        out = pool.write_pool(["playing guitar"], probe=False)
+        import csv as _csv
+        with open(out, newline="", encoding="utf-8") as fh:
+            rows = list(_csv.DictReader(fh))
+        check("probe_clips=false still writes a usable pool", len(rows) == 3, str(len(rows)))
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
-               test_metadata_merge, test_stage_scoping):
+               test_metadata_merge, test_stage_scoping, test_probe_fallback):
         fn()
     print()
     if FAILURES:
