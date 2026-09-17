@@ -74,6 +74,9 @@ class EnvSpec:
     weights: Sequence[WeightFile] = ()
     env_vars: Dict[str, str] = field(default_factory=dict)
     post_install: Sequence[Sequence[str]] = ()    # extra commands run inside the env
+    #: Hub repos a post-install hook pulls. Declared explicitly so the prefetch stage can check
+    #: access to them up front - parsing them out of the hook's command line is fragile.
+    hub_repos: Sequence[str] = ()
     note: str = ""
 
     def digest(self) -> str:
@@ -81,6 +84,7 @@ class EnvSpec:
             "python": self.python, "torch": self.torch, "torch_index": self.torch_index,
             "requirements": list(self.requirements),
             "repos": [[r.url, r.commit] for r in self.repos],
+            "hub_repos": list(self.hub_repos),
             "weights": [[w.dest, w.url, w.hf_repo, w.hf_file] for w in self.weights],
             "post_install": [list(c) for c in self.post_install],
         }, sort_keys=True)

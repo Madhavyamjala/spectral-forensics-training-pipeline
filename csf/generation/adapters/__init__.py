@@ -177,6 +177,7 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),),
         post_install=(("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
                              "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),),
+        hub_repos=(),   # its downloader pulls from GitHub Releases, not the Hub
         note="Apache-2.0 (non-commercial restriction was removed upstream). Its own "
              "download_models.sh pulls every checkpoint from GitHub Releases.",
     ),
@@ -191,6 +192,7 @@ ENVS: Dict[str, EnvSpec] = {
         post_install=(("-c", "import subprocess,os;r=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','LivePortrait');"
                              "subprocess.run(['huggingface-cli','download','KlingTeam/LivePortrait',"
                              "'--local-dir','pretrained_weights'],cwd=r,check=True)"),),
+        hub_repos=("KlingTeam/LivePortrait",),
         note="Drives both reenactment (v2v) and expression editing (retargeting ratios).",
     ),
 
@@ -205,6 +207,7 @@ ENVS: Dict[str, EnvSpec] = {
         post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
                              "'Wan-AI/Wan2.1-VACE-1.3B','--local-dir',"
                              "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','Wan2.1-VACE-1.3B')],check=True)"),),
+        hub_repos=("Wan-AI/Wan2.1-VACE-1.3B",),
         note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
              "prompt-driven V2V, so it fills several slots the document's models cannot.",
     ),
@@ -220,6 +223,7 @@ ENVS: Dict[str, EnvSpec] = {
         post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
                              "'lixiaowen/diffuEraser','--local-dir',"
                              "os.path.join(os.environ['CSF_ENV_ROOT'],'repos','DiffuEraser','weights','diffuEraser')],check=True)"),),
+        hub_repos=("lixiaowen/diffuEraser",),
         note="Apache-2.0. Diffusion removal - a different artifact class from ProPainter's "
              "flow propagation, which is why it is worth a slot of its own.",
     ),
@@ -235,6 +239,7 @@ ENVS: Dict[str, EnvSpec] = {
         post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
                              "'XuGuo699/DreamID-V','--local-dir',"
                              "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','DreamID-V')],check=True)"),),
+        hub_repos=("XuGuo699/DreamID-V",),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
     ),
@@ -274,17 +279,6 @@ ENVS: Dict[str, EnvSpec] = {
                       "imageio[ffmpeg]"),
         repos=(GitRepo("https://github.com/neuralchen/SimSwap.git", name="SimSwap"),),
         note="Weights (arcface + 512 checkpoint) are hosted on Google Drive / OneDrive upstream."),
-    "sadtalker": EnvSpec(
-        name="sadtalker", torch=TORCH_CU121,
-        requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]",
-                      "scipy", "yacs", "pydub", "kornia", "face-alignment", "tqdm"),
-        repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),
-               GitRepo("https://github.com/OpenTalker/video-retalking.git", name="VideoReTalking"))),
-    "musetalk": EnvSpec(
-        name="musetalk", torch=TORCH_CU121,
-        requirements=("diffusers>=0.30", "transformers>=4.44", "accelerate", "opencv-python-headless",
-                      "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]", "einops", "omegaconf"),
-        repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),)),
     "stylegan": EnvSpec(
         name="stylegan", torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
