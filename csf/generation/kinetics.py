@@ -12,9 +12,12 @@ It stops as soon as every label quota is met, so a run that needs 60k clips does
 241 training shards.
 
 Sources, in preference order:
-  1. `local_root`   - an already-extracted Kinetics-400 tree on the cluster (nothing downloaded)
-  2. `mirror_base`  - CVDF-style HTTP mirror of shards + annotation CSVs (the default)
-  3. `hf_repo`      - a Hugging Face dataset mirror, fetched with the Hub client
+  1. `local_root` - an already-extracted Kinetics-400 tree on the cluster (nothing downloaded)
+  2. `hf_repo`    - a Hugging Face mirror (the default, `liuhuanjim013/kinetics400`). Community
+                    mirrors differ in layout, so `probe_hf_layout` inspects the repo and picks
+                    the right reader: one file per clip, tar/zip shards, or parquet with the
+                    video inline.
+  3. `mirror_base` - the CVDF S3 shards, kept as a fallback
 
 Everything is resumable: extracted clips and a JSON ledger live under `<cache>/kinetics/`, and
 re-running skips shards that were already consumed.
@@ -343,34 +346,234 @@ class SourcePool:
             log.warning("Shard %s could not be read (%s) -> skipped", shard.name, exc)
         return kept
 
-    # ---------------- source 3: Hugging Face mirror ----------------
+    # ---------------- source 3: Hugging Face mirror (primary) ----------------
 
-    def ingest_hf(self, repo_id: str, wanted: Dict[str, int], revision: Optional[str] = None) -> Dict[str, int]:
-        """Pull clips from a Hugging Face dataset mirror that stores them under <label>/ folders."""
-        from huggingface_hub import HfApi, hf_hub_download
+    def probe_hf_layout(self, repo_id: str, revision: Optional[str] = None
+                        ) -> Tuple[str, List[str]]:
+        """Work out how a Hugging Face Kinetics mirror stores its clips.
 
-        counts = {label: self._count_on_disk(label) for label in wanted}
+        Community mirrors are not consistent - some store `<split>/<label>/<clip>.mp4`, some ship
+        WebDataset tar shards, some publish parquet with the video inline. Rather than hard-code
+        one layout and fail on the others, list the repo once and classify what is actually
+        there. Returns (layout, files).
+        """
+        from huggingface_hub import HfApi
+
         files = HfApi().list_repo_files(repo_id, repo_type="dataset", revision=revision)
+        videos = [f for f in files if Path(f).suffix.lower() in VIDEO_EXTS]
+        archives = [f for f in files if f.endswith((".tar", ".tar.gz", ".tgz", ".zip"))]
+        parquet = [f for f in files if f.endswith(".parquet")]
+
+        if videos:
+            # label-foldered only if the parent directory looks like a Kinetics class
+            labelled = [f for f in videos if len(Path(f).parts) >= 2]
+            layout = "label_folders" if labelled else "flat_videos"
+            log.info("HF mirror %s: %d video file(s), layout=%s", repo_id, len(videos), layout)
+            return layout, videos
+        if archives:
+            log.info("HF mirror %s: %d archive shard(s)", repo_id, len(archives))
+            return "archives", archives
+        if parquet:
+            log.info("HF mirror %s: %d parquet file(s)", repo_id, len(parquet))
+            return "parquet", parquet
+        raise RuntimeError(
+            f"Could not find videos, archives or parquet in dataset {repo_id}. Files seen: "
+            f"{files[:20]}. Point generation.kinetics.hf_repo at a different mirror, or set "
+            f"generation.kinetics.local_root to an already-extracted tree.")
+
+    def ingest_hf(self, repo_id: str, wanted: Dict[str, int], revision: Optional[str] = None,
+                  annotations: Optional[Dict[str, Annotation]] = None,
+                  workdir: Optional[Path] = None) -> Dict[str, int]:
+        """Fill the pool from a Hugging Face mirror, whichever layout it uses."""
+        layout, files = self.probe_hf_layout(repo_id, revision)
+        if layout in ("label_folders", "flat_videos"):
+            return self._hf_individual(repo_id, files, wanted, revision, layout, annotations)
+        if layout == "archives":
+            return self._hf_archives(repo_id, files, wanted, revision, annotations, workdir)
+        return self._hf_parquet(repo_id, files, wanted, revision)
+
+    # -- layout: one file per clip ------------------------------------------------------
+
+    def _hf_individual(self, repo_id: str, files: Sequence[str], wanted: Dict[str, int],
+                       revision: Optional[str], layout: str,
+                       annotations: Optional[Dict[str, Annotation]]) -> Dict[str, int]:
+        from huggingface_hub import hf_hub_download
+
         by_label: Dict[str, List[str]] = {}
         for f in files:
-            p = Path(f)
-            if p.suffix.lower() not in VIDEO_EXTS or len(p.parts) < 2:
+            path = Path(f)
+            label = None
+            if layout == "label_folders":
+                for part in reversed(path.parts[:-1]):
+                    cand = normalize_label(part)
+                    if cand in wanted:
+                        label = cand
+                        break
+            if label is None and annotations:
+                ann = annotations.get(path.stem)
+                label = ann.label if ann else None
+            if label in wanted:
+                by_label.setdefault(label, []).append(f)
+
+        matched = sum(len(v) for v in by_label.values())
+        log.info("HF mirror: %d file(s) match the %d label(s) the spec needs", matched, len(wanted))
+        if matched == 0:
+            raise RuntimeError(
+                f"No file in {repo_id} matched any of the {len(wanted)} Kinetics classes the "
+                f"spec needs. The mirror may use different class spellings - check a few paths "
+                f"and adjust csf/generation/spec.py, or use a different mirror.")
+
+        counts = {label: self._count_on_disk(label) for label in wanted}
+        for label, repo_paths in sorted(by_label.items()):
+            need = wanted[label] - counts.get(label, 0)
+            if need <= 0:
                 continue
-            by_label.setdefault(normalize_label(p.parts[-2]), []).append(f)
-        for label, need in wanted.items():
-            have = counts.get(label, 0)
             dest_dir = self.clips_dir / label.replace("/", "_")
             dest_dir.mkdir(parents=True, exist_ok=True)
-            for repo_path in sorted(by_label.get(label, []))[:max(0, need - have)]:
+            taken = 0
+            for repo_path in sorted(repo_paths):
+                if taken >= need:
+                    break
                 dest = dest_dir / f"{Path(repo_path).stem}.mp4"
                 if dest.exists():
                     continue
                 try:
-                    got = hf_hub_download(repo_id, repo_path, repo_type="dataset", revision=revision)
+                    got = hf_hub_download(repo_id, repo_path, repo_type="dataset",
+                                          revision=revision)
                     shutil.copy2(got, dest)
                     counts[label] = counts.get(label, 0) + 1
-                except Exception as exc:                      # noqa: BLE001 - mirror layouts vary
-                    log.warning("HF mirror fetch failed for %s: %s", repo_path, str(exc)[:160])
+                    taken += 1
+                except Exception as exc:                      # noqa: BLE001 - keep going
+                    log.warning("HF fetch failed for %s: %s", repo_path, str(exc)[:160])
+            self.ledger["counts"] = counts
+            self._save_ledger()
+            log.info("  %-34s %4d/%-4d clips", label, counts.get(label, 0), wanted[label])
+        return counts
+
+    # -- layout: tar / zip shards -------------------------------------------------------
+
+    def _hf_archives(self, repo_id: str, shards: Sequence[str], wanted: Dict[str, int],
+                     revision: Optional[str], annotations: Optional[Dict[str, Annotation]],
+                     workdir: Optional[Path]) -> Dict[str, int]:
+        """Stream shards: download one, keep the clips we need, delete it."""
+        from huggingface_hub import hf_hub_download
+
+        counts = {label: self._count_on_disk(label) for label in wanted}
+        done: Set[str] = set(self.ledger.get("shards_done", []))
+        tmp_root = Path(workdir) if workdir else self.root / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        annotations = annotations or {}
+
+        for shard in sorted(shards):
+            if all(counts.get(k, 0) >= v for k, v in wanted.items()):
+                log.info("All label quotas satisfied -> stopping shard download")
+                break
+            if shard in done:
+                continue
+            try:
+                local = Path(hf_hub_download(repo_id, shard, repo_type="dataset",
+                                             revision=revision))
+            except Exception as exc:                          # noqa: BLE001
+                log.warning("Could not fetch shard %s: %s", shard, str(exc)[:160])
+                continue
+
+            kept = (self._consume_zip(local, wanted, counts, annotations)
+                    if shard.endswith(".zip")
+                    else self._consume_shard(local, wanted, counts, annotations))
+            # hf_hub_download caches into the hub cache; drop it so disk stays bounded
+            try:
+                local.unlink(missing_ok=True)
+            except OSError:
+                pass
+            done.add(shard)
+            self.ledger["shards_done"] = sorted(done)
+            self.ledger["counts"] = counts
+            self._save_ledger()
+            remaining = sum(max(0, v - counts.get(k, 0)) for k, v in wanted.items())
+            log.info("Shard %s: kept %d | pool %d | still needed %d",
+                     Path(shard).name, kept, sum(counts.values()), remaining)
+        return counts
+
+    def _consume_zip(self, archive: Path, wanted: Dict[str, int], counts: Dict[str, int],
+                     annotations: Dict[str, Annotation]) -> int:
+        import zipfile
+
+        kept = 0
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                for info in zf.infolist():
+                    if info.is_dir() or Path(info.filename).suffix.lower() not in VIDEO_EXTS:
+                        continue
+                    clip_id, label = _label_of(info.filename, annotations)
+                    if not label or wanted.get(label, 0) <= counts.get(label, 0):
+                        continue
+                    dest_dir = self.clips_dir / label.replace("/", "_")
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest = dest_dir / f"{clip_id}.mp4"
+                    if dest.exists():
+                        continue
+                    with zf.open(info) as src, tempfile.NamedTemporaryFile(
+                            dir=dest_dir, delete=False) as tmp:
+                        shutil.copyfileobj(src, tmp, length=1 << 20)
+                        tmp_path = Path(tmp.name)
+                    if tmp_path.stat().st_size == 0:
+                        tmp_path.unlink(missing_ok=True)
+                        continue
+                    tmp_path.replace(dest)
+                    counts[label] = counts.get(label, 0) + 1
+                    kept += 1
+        except (zipfile.BadZipFile, OSError) as exc:
+            log.warning("Zip %s could not be read (%s) -> skipped", archive.name, exc)
+        return kept
+
+    # -- layout: parquet ----------------------------------------------------------------
+
+    def _hf_parquet(self, repo_id: str, files: Sequence[str],
+                    wanted: Dict[str, int], revision: Optional[str]) -> Dict[str, int]:
+        """Stream a parquet-backed mirror through `datasets`, writing out the video bytes."""
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise RuntimeError(
+                f"{repo_id} stores its clips in parquet, which needs the `datasets` package:\n"
+                f"    pip install datasets\n"
+                f"Alternatively point generation.kinetics.hf_repo at a mirror that ships video "
+                f"files, or set generation.kinetics.local_root.") from exc
+
+        counts = {label: self._count_on_disk(label) for label in wanted}
+        ds = load_dataset(repo_id, split="train", streaming=True, revision=revision)
+        label_key = video_key = None
+        written = 0
+        for row in ds:
+            if label_key is None:
+                label_key = next((k for k in ("label", "labels", "class", "category", "action")
+                                  if k in row), None)
+                video_key = next((k for k in ("video", "mp4", "clip", "bytes", "path")
+                                  if k in row), None)
+                if not label_key or not video_key:
+                    raise RuntimeError(f"Cannot find label/video columns in {repo_id}; row keys "
+                                       f"are {list(row)[:12]}")
+                log.info("Parquet mirror: label column %r, video column %r", label_key, video_key)
+
+            label = normalize_label(str(row[label_key]))
+            if wanted.get(label, 0) <= counts.get(label, 0):
+                continue
+            payload = row[video_key]
+            data = payload.get("bytes") if isinstance(payload, dict) else payload
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            dest_dir = self.clips_dir / label.replace("/", "_")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{label.replace(' ', '_')}_{counts.get(label, 0):06d}.mp4"
+            dest.write_bytes(data)
+            counts[label] = counts.get(label, 0) + 1
+            written += 1
+            if written % 500 == 0:
+                self.ledger["counts"] = counts
+                self._save_ledger()
+                log.info("  parquet: %d clip(s) written, pool %d", written, sum(counts.values()))
+            if all(counts.get(k, 0) >= v for k, v in wanted.items()):
+                break
         self.ledger["counts"] = counts
         self._save_ledger()
         return counts
@@ -415,32 +618,50 @@ class SourcePool:
 
 
 def acquire(gen_cfg, cache_dir: Path, wanted: Dict[str, int]) -> Path:
-    """Fill the source pool to `wanted` clips per label using the configured sources."""
+    """Fill the source pool to `wanted` clips per label using the configured sources.
+
+    Order: an already-extracted local tree (free), then the Hugging Face mirror (the default -
+    it ships only the clips, needs no annotation CSVs and reuses the Hub client's auth and
+    retries), then the CVDF S3 mirror as a fallback.
+    """
     pool = SourcePool(cache_dir)
+    kin = gen_cfg.kinetics
     have = pool.refresh_counts(wanted)
     missing = {k: v for k, v in wanted.items() if have.get(k, 0) < v}
     log.info("Source pool: %d/%d clips present; %d label(s) still short",
              sum(have.values()), sum(wanted.values()), len(missing))
 
-    if missing and gen_cfg.kinetics.local_root:
-        have = pool.ingest_local(Path(gen_cfg.kinetics.local_root), wanted)
-        missing = {k: v for k, v in wanted.items() if have.get(k, 0) < v}
+    def shortfall(counts: Dict[str, int]) -> Dict[str, int]:
+        return {k: v for k, v in wanted.items() if counts.get(k, 0) < v}
 
-    if missing and gen_cfg.kinetics.hf_repo:
-        have = pool.ingest_hf(gen_cfg.kinetics.hf_repo, wanted, gen_cfg.kinetics.hf_revision)
-        missing = {k: v for k, v in wanted.items() if have.get(k, 0) < v}
+    if missing and kin.local_root:
+        have = pool.ingest_local(Path(kin.local_root), wanted)
+        missing = shortfall(have)
 
-    if missing and gen_cfg.kinetics.mirror_base:
-        annotations = load_annotations(pool.root, gen_cfg.kinetics.mirror_base,
-                                       tuple(gen_cfg.kinetics.splits))
-        have = pool.stream_mirror(gen_cfg.kinetics.mirror_base, wanted, annotations,
-                                  max_shards=gen_cfg.kinetics.max_shards,
-                                  splits=tuple(gen_cfg.kinetics.splits))
-        missing = {k: v for k, v in wanted.items() if have.get(k, 0) < v}
+    if missing and kin.hf_repo:
+        log.info("Fetching Kinetics-400 clips from the Hugging Face mirror %s", kin.hf_repo)
+        try:
+            have = pool.ingest_hf(kin.hf_repo, wanted, revision=kin.hf_revision)
+            missing = shortfall(have)
+        except Exception as exc:                              # noqa: BLE001 - fall back to S3
+            log.error("Hugging Face mirror %s failed: %s", kin.hf_repo, str(exc)[:400])
+            if not kin.mirror_base:
+                raise
+
+    if missing and kin.mirror_base:
+        log.info("Falling back to the CVDF S3 mirror for %d short label(s)", len(missing))
+        annotations = load_annotations(pool.root, kin.mirror_base, tuple(kin.splits))
+        have = pool.stream_mirror(kin.mirror_base, wanted, annotations,
+                                  max_shards=kin.max_shards, splits=tuple(kin.splits))
+        missing = shortfall(have)
 
     if missing:
         short = sorted(missing.items(), key=lambda kv: have.get(kv[0], 0) - kv[1])[:10]
         log.warning("%d label(s) below quota after all sources; worst: %s. The sampler will "
                     "redistribute within each source group.", len(missing),
                     [(k, have.get(k, 0), v) for k, v in short])
-    return pool.write_pool(wanted.keys(), probe=gen_cfg.kinetics.probe_clips)
+    if sum(have.values()) == 0:
+        raise RuntimeError(
+            "No Kinetics clips could be acquired from any configured source. Check "
+            "generation.kinetics.hf_repo / local_root / mirror_base and your Hub login.")
+    return pool.write_pool(wanted.keys(), probe=kin.probe_clips)

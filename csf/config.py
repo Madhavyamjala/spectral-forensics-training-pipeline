@@ -127,11 +127,16 @@ class HubConfig:
 
 @dataclass
 class KineticsConfig:
-    """Where Kinetics-400 source clips come from, and how many to keep."""
+    """Where Kinetics-400 source clips come from, and how many to keep.
+
+    The Hugging Face mirror is the default: it needs no annotation CSVs, reuses the Hub client's
+    auth/retry/caching, and the loader detects its layout at runtime. The CVDF S3 shards remain
+    as a fallback for labels the mirror cannot satisfy.
+    """
     local_root: Optional[str] = None            # an already-extracted tree on the cluster
-    mirror_base: str = "https://s3.amazonaws.com/kinetics/400"
-    hf_repo: Optional[str] = None               # optional Hugging Face mirror
+    hf_repo: Optional[str] = "liuhuanjim013/kinetics400"
     hf_revision: Optional[str] = None
+    mirror_base: Optional[str] = "https://s3.amazonaws.com/kinetics/400"   # fallback
     splits: List[str] = field(default_factory=lambda: ["train", "val"])
     max_shards: Optional[int] = None            # cap the shard downloads (smoke runs)
     probe_clips: bool = True

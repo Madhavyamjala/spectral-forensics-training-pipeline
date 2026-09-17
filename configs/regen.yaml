@@ -61,8 +61,11 @@ generation:
   accept_noncommercial: false
   kinetics:
     local_root: null           # set this if Kinetics-400 is already extracted on the cluster
-    mirror_base: https://s3.amazonaws.com/kinetics/400
-    hf_repo: null
+    # Primary source. The loader inspects the repo and picks the right reader (one file per
+    # clip / tar-zip shards / parquet), so it works whatever layout the mirror uses.
+    hf_repo: liuhuanjim013/kinetics400
+    hf_revision: null
+    mirror_base: https://s3.amazonaws.com/kinetics/400   # fallback for labels the mirror misses
     splits: [train, val]
     max_shards: null
     probe_clips: true
