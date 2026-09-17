@@ -82,6 +82,21 @@ def test_spec() -> None:
         check(f"{fam_key} row {row} matches the document", grid[row] == want,
               f"got {grid[row]}, want {want}")
 
+    # every source label must be a real Kinetics-400 class. A label the spec invents downloads
+    # nothing and silently starves the source groups that reference it, so it is a hard failure
+    # here rather than a "below quota" warning eight hours into a run.
+    classes = S.known_classes()
+    check("the checked-in Kinetics-400 class list holds 400 names", len(classes) == 400,
+          str(len(classes)))
+    unknown = [lbl for lbl in S.all_labels() if lbl not in classes]
+    check("every spec label is a real Kinetics-400 class", not unknown, str(unknown))
+    for invented, real in (("playing golf", "golf driving"), ("boxing", "punching person (boxing)"),
+                           ("sitting up", "situp"), ("riding a segway", "using segway"),
+                           ("painting", "brush painting"), ("hiking", "marching"),
+                           ("repairing puncture", "checking tires")):
+        check(f"'{invented}' is not used; upstream spells it '{real}'",
+              invented not in classes and real in classes)
+
     check("apportion sums exactly", sum(S.apportion(1000, [3, 3, 2, 2])) == 1000)
     grid = S.cross_split([7, 11, 5], [9, 8, 6])
     check("cross_split keeps row margins", [sum(r) for r in grid] == [7, 11, 5])
@@ -386,7 +401,7 @@ def test_kinetics_schema() -> None:
           resolve_row_label({"video_id": "q", "clips": [
               {"clip_path": "c.mp4", "frames": [{"annotation": "playing guitar"}]}]},
               wanted, None) == "playing guitar")
-    check("classes outside the spec's 147 are rejected",
+    check("classes outside the spec's 149 are rejected",
           resolve_row_label({"label": "abseiling", "video_path": "x.mp4"}, wanted, None) is None)
     check("a row with no clips falls back to the whole video",
           rank_clips({"video_id": "v", "video_path": "videos/v.mp4",

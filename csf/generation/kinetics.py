@@ -1,7 +1,7 @@
 """
 Kinetics-400 acquisition and source-clip pooling.
 
-The regeneration spec draws every source clip from Kinetics-400, but only references 147 of
+The regeneration spec draws every source clip from Kinetics-400, but only references 149 of
 its 400 classes. Downloading the full ~450 GB release to keep ~37% of it is wasteful and slow,
 so this module streams the CVDF mirror shard by shard:
 
