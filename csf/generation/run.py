@@ -17,6 +17,7 @@ already there.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -77,6 +78,42 @@ def stage_prefetch(cfg) -> Dict[str, object]:
 # --------------------------------------------------------------------------------------
 
 
+def kinetics_fingerprint(cfg) -> Dict[str, object]:
+    """What the acquired source pool depends on.
+
+    Recorded in `state.json` when the stage completes, so a later run can tell that the pool on
+    disk no longer matches the spec. The label set is the one that matters: correcting a class
+    name (or adding a source group) means clips that were never downloaded, and without this
+    the stage is skipped as "already completed" and generation quietly starves.
+    """
+    gen = cfg.generation
+    labels = S.all_labels()
+    digest = hashlib.sha256("\n".join(labels).encode("utf-8")).hexdigest()[:16]
+    return {"labels_sha": digest, "n_labels": len(labels),
+            "total_videos": int(gen.total_videos),
+            "demand_margin": float(gen.kinetics.demand_margin)}
+
+
+def stale_reason(stage_name: str, cfg, info: Optional[Dict[str, object]]) -> Optional[str]:
+    """Why a stage that state.json marks complete has to run again anyway, or None."""
+    if stage_name != "kinetics":
+        return None
+    if cfg.generation.kinetics.rescore:
+        return "generation.kinetics.rescore is set"
+    recorded = ((info or {}).get("result") or {})
+    if not isinstance(recorded, dict):
+        return None
+    recorded = recorded.get("fingerprint")
+    if not isinstance(recorded, dict):
+        return None            # completed before fingerprints existed - take it at its word
+    current = kinetics_fingerprint(cfg)
+    changed = [f"{k}: {recorded.get(k)!r} -> {v!r}" for k, v in current.items()
+               if recorded.get(k) != v]
+    if changed:
+        return "the source-pool inputs changed (" + "; ".join(changed) + ")"
+    return None
+
+
 def stage_kinetics(cfg) -> Dict[str, object]:
     """Acquire and filter Kinetics source clips for generation."""
     gen = cfg.generation
@@ -101,7 +138,8 @@ def stage_kinetics(cfg) -> Dict[str, object]:
               for name in ("any", "face", "mouth", "object")}
     report = {"clips": len(features), "qualifying": counts,
               "labels": len({r["label"] for r in features}),
-              "requested": sum(wanted.values())}
+              "requested": sum(wanted.values()),
+              "fingerprint": kinetics_fingerprint(cfg)}
     log.info("Source pool ready: %s", json.dumps(report))
     for name, need in (("face", "face_swap + reenactment + expression"), ("mouth", "lip_sync")):
         if counts[name] < 500:
@@ -159,12 +197,19 @@ def plan_jobs(cfg, rebuild: bool = False):
     """Load the job plan, building it from the scored source pool the first time."""
     gen = cfg.generation
     jobs_csv = Path(gen.jobs_csv)
+    features_csv = Path(cfg.paths.cache_dir) / "kinetics" / "clip_features.csv"
     if jobs_csv.exists() and not rebuild:
         jobs = read_jobs(jobs_csv)
         log.info("Loaded %d job(s) from %s", len(jobs), jobs_csv)
+        if features_csv.exists() and \
+                features_csv.stat().st_mtime > jobs_csv.stat().st_mtime:
+            log.warning("%s predates the scored source pool (%s), so it still points at the "
+                        "clips that existed when it was planned - any clip added since is "
+                        "unused. Re-plan with --set generation.rebuild_jobs=true (job ids are "
+                        "derived from the assignment, so re-planned jobs start fresh in the "
+                        "ledger).", jobs_csv, features_csv)
         return jobs
 
-    features_csv = Path(cfg.paths.cache_dir) / "kinetics" / "clip_features.csv"
     if not features_csv.exists():
         raise RuntimeError(f"{features_csv} is missing - run the 'kinetics' stage first.")
     features = load_features(features_csv)
@@ -188,7 +233,8 @@ def stage_generate(cfg) -> Dict[str, object]:
     from csf.generation.scheduler import GenerationScheduler, Ledger
 
     gen = cfg.generation
-    jobs = _filter_models(plan_jobs(cfg), gen.only_models, gen.skip_models)
+    jobs = _filter_models(plan_jobs(cfg, rebuild=gen.rebuild_jobs),
+                          gen.only_models, gen.skip_models)
     jobs = _apply_budget(cfg, jobs)
     if not jobs:
         raise RuntimeError("No jobs to run after applying only_models / skip_models / budget")
@@ -210,7 +256,8 @@ def stage_generate(cfg) -> Dict[str, object]:
         gpu_vram_gb=gen.gpu_vram_gb, max_workers_per_gpu=gen.max_workers_per_gpu)
     ledger = Ledger(Path(gen.ledger))
 
-    summary = scheduler.run(jobs, ledger, retry_failed=gen.retry_failed)
+    summary = scheduler.run(jobs, ledger, retry_failed=gen.retry_failed,
+                            max_attempts=gen.max_attempts)
     scheduler.write_failures(Path(cfg.paths.work_dir) / "metrics" / "generation_failures.csv")
 
     ok = sum(1 for v in ledger.done.values() if v)
@@ -221,9 +268,15 @@ def stage_generate(cfg) -> Dict[str, object]:
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     log.info("Generation summary -> %s: %s", out, json.dumps(summary))
     if ok == 0:
-        raise RuntimeError("Generation produced no videos at all. Check "
-                           "runs/<run>/logs/generation/ and metrics/generation_failures.csv - "
-                           "most likely no adapter environment could be built.")
+        reasons = ledger.failure_reasons()
+        detail = "; ".join(f"{count}x {reason}" for reason, count in reasons)
+        raise RuntimeError(
+            "Generation produced no videos at all. "
+            + (f"Recorded failures: {detail}. " if detail else "")
+            + f"Full logs in {log_dir}/ and "
+            f"{Path(cfg.paths.work_dir) / 'metrics' / 'generation_failures.csv'}. The usual "
+            "cause is an adapter environment that could not be built; re-running picks the "
+            "failed jobs back up (generation.retry_failed).")
     return summary
 
 

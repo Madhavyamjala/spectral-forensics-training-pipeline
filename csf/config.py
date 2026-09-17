@@ -178,7 +178,17 @@ class GenerationConfig:
     min_free_gb: float = 50.0
     offline: bool = False                       # fail instead of building envs on the fly
     deadline_hours: Optional[float] = None      # stop scheduling new groups after this long
-    retry_failed: bool = False
+    # Retry jobs that failed on an earlier run. On by default: nearly every failure seen in
+    # practice is environmental (an adapter env still building, a checkpoint not yet staged,
+    # a busy GPU), and treating the first failure as final leaves the run permanently stuck
+    # with nothing pending and nothing produced. `max_attempts` caps the retries per job.
+    retry_failed: bool = True
+    max_attempts: int = 3
+    # Re-plan jobs.csv from the current source pool instead of reusing the existing plan.
+    # Needed after the pool changes (new labels, more clips): the old plan still points at the
+    # clips that existed when it was written. Job ids are derived from the assignment, so
+    # re-planning starts the ledger fresh for anything that moved.
+    rebuild_jobs: bool = False
     keep_old_edited: bool = False
     only_models: List[str] = field(default_factory=list)      # restrict the run to these models
     skip_models: List[str] = field(default_factory=list)

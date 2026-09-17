@@ -367,6 +367,18 @@ prepare -> features -> train_qwen -> train_llama -> predict_scanner -> outcomes
   already cached. Training resumes from `checkpoints/<model>/last` with its optimiser and scheduler state.
 - Run specific stages with `--stage train_llama,outcomes`. Redo a finished stage with `--force train_llama`.
 - Override any config value with `--set section.key=value`, for example `--set data.max_rows=2000`.
+- **Generation resumes at job level.** `generate` keeps an append-only ledger (`generation.ledger`).
+  A job that succeeded is never re-run; a job that *failed* is retried on the next run, up to
+  `generation.max_attempts` (default 3), because most failures are environmental - an adapter
+  environment that had not finished building, a checkpoint not yet staged. Set
+  `generation.retry_failed=false` for one attempt per job ever.
+- **`kinetics` re-runs itself when its inputs change.** The stage records a fingerprint of the spec's
+  label set, the video target and the demand margin. If any of those move - say a source label is
+  corrected - the completed marker in `state.json` is ignored and the missing clips are fetched, rather
+  than the stage being skipped and generation silently starving. `--set generation.kinetics.rescore=true`
+  forces it too.
+- After the source pool grows, the existing `jobs.csv` still points at the clips it was planned against;
+  the run warns when it notices. Re-plan with `--set generation.rebuild_jobs=true`.
 
 ## 7. Logs and debugging
 
@@ -395,6 +407,10 @@ failures abort with a clear message instead of silently producing an empty datas
 | `no kernel image is available` / `sm_120 not supported` | RTX 50xx needs CUDA 12.8+ wheels: `setup_env.ps1 -Cuda cu128` |
 | `GatedRepoError` for Llama | Accept the licence on the model page, then `huggingface-cli login` |
 | Many `download failed` / 429 lines | Log in to the Hub (higher limits) or lower `data.download_workers`. Re-running resumes. |
+| `Generation produced no videos at all` | The message now lists the recorded failures; the full rows are in `runs/<run>/metrics/generation_failures.csv` and the worker logs in `runs/<run>/logs/generation/`. Re-running retries the failed jobs (`generation.max_attempts`). |
+| `Nothing to do: ... no retries left` | Every job has failed `generation.max_attempts` times. Fix the underlying error first, then raise the cap (`--set generation.max_attempts=5`) or delete the job's rows from the ledger file. |
+| `kinetics` skipped when you expected it to fetch | It is marked complete in `state.json` and its fingerprint still matches. `--force kinetics` re-runs it unconditionally. |
+| `Only N clip(s) pass the 'face' filter` | The face detectors are missing: `pip install insightface onnxruntime` (or `mediapipe`) in the driver environment. Without them the face families have no eligible source clips. |
 | Anything else | Open `runs/<run>/logs/crash_rank0.json`. It names the stage, step and video ids that failed. |
 
 ## 8. Outputs and publishing

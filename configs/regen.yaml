@@ -41,7 +41,8 @@ generation:
   min_free_gb: 100.0
   offline: false               # build the per-model venvs on demand (node has internet)
   deadline_hours: 120.0        # hard backstop only
-  retry_failed: false
+  retry_failed: true          # re-attempt jobs that failed on an earlier run
+  max_attempts: 3             # ... up to this many attempts each, then give up
   keep_old_edited: false       # the old 31,128 ai_edited rows are dropped
   only_models: []              # e.g. [inswapper, wav2lip] to run a subset
   skip_models: []

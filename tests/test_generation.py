@@ -889,13 +889,112 @@ def test_no_job_left_behind() -> None:
     check("workers are capped at the number of jobs", "min(len(jobs)," in src)
 
 
+def test_retry_policy() -> None:
+    """A failed job is picked back up on the next run, up to a cap."""
+    print("retry policy")
+    import tempfile
+
+    from csf.generation.scheduler import Ledger, Outcome, group_jobs
+
+    def job(n: int, model: str = "inswapper") -> Job:
+        return Job(job_id=f"j{n}", video_id=f"v{n}", family="face_swap", model=model,
+                   source_group="g", source_clip_id=f"c{n}", source_path=f"/tmp/c{n}.mp4",
+                   source_label="singing")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ledger.jsonl"
+        ledger = Ledger(path)
+        jobs = [job(0), job(1), job(2)]
+        ledger.record(Outcome(job_id="j0", ok=True, output_path="/tmp/v0.mp4", error="",
+                              seconds=1.0, metadata={}))
+        ledger.record(Outcome(job_id="j1", ok=False, output_path="", error="env build failed",
+                              seconds=1.0, metadata={}))
+
+        groups = group_jobs(jobs, ledger, retry_failed=True, max_attempts=3)
+        pending = {j.job_id for v in groups.values() for j in v}
+        check("a succeeded job is never re-run", "j0" not in pending)
+        check("a failed job is retried by default", "j1" in pending)
+        check("an unattempted job is still pending", "j2" in pending)
+
+        check("retry_failed=False keeps the old one-shot behaviour",
+              "j1" not in {j.job_id for v in group_jobs(jobs, ledger, retry_failed=False).values()
+                           for j in v})
+
+        # burn the remaining attempts
+        for _ in range(2):
+            ledger.record(Outcome(job_id="j1", ok=False, output_path="", error="env build failed",
+                                  seconds=1.0, metadata={}))
+        check("attempts accumulate across records", ledger.attempt_count("j1") == 3)
+        check("a job that used up its attempts stops being retried",
+              "j1" not in {j.job_id for v in group_jobs(jobs, ledger, max_attempts=3).values()
+                           for j in v})
+        check("raising max_attempts brings it back",
+              "j1" in {j.job_id for v in group_jobs(jobs, ledger, max_attempts=4).values()
+                       for j in v})
+
+        # a reopened ledger must see the same history, not a blank slate
+        reopened = Ledger(path)
+        check("attempt counts survive a restart", reopened.attempt_count("j1") == 3)
+        check("success survives a restart", reopened.succeeded("j0"))
+        reasons = reopened.failure_reasons()
+        check("failures are tallied by message",
+              reasons and reasons[0] == ("env build failed", 1), str(reasons))
+
+        # a job that failed and later succeeded must not be reported as a failure
+        reopened.record(Outcome(job_id="j1", ok=True, output_path="/tmp/v1.mp4", error="",
+                                seconds=1.0, metadata={}))
+        check("a later success clears the recorded error", not reopened.failure_reasons())
+
+
+def test_stage_staleness() -> None:
+    """A completed stage must re-run when the inputs it depended on have changed."""
+    print("stage staleness")
+    from csf.generation import run as R
+
+    class _K:
+        demand_margin = 1.2
+        rescore = False
+
+    class _G:
+        total_videos = 33333
+        kinetics = _K()
+
+    class _C:
+        generation = _G()
+
+    cfg = _C()
+    fp = R.kinetics_fingerprint(cfg)
+    check("the fingerprint pins the label set", fp["n_labels"] == len(S.all_labels()))
+    check("nothing is stale when the fingerprint matches",
+          R.stale_reason("kinetics", cfg, {"result": {"fingerprint": dict(fp)}}) is None)
+
+    stale = dict(fp, labels_sha="deadbeefdeadbeef")
+    reason = R.stale_reason("kinetics", cfg, {"result": {"fingerprint": stale}})
+    check("a changed label set forces the stage to re-run", bool(reason) and "labels_sha" in reason)
+
+    _K.rescore = True
+    check("rescore=true overrides the completed marker",
+          R.stale_reason("kinetics", cfg, {"result": {"fingerprint": dict(fp)}}) is not None)
+    _K.rescore = False
+
+    check("a state.json written before fingerprints existed is trusted",
+          R.stale_reason("kinetics", cfg, {"result": {"clips": 200}}) is None)
+    check("other stages are unaffected",
+          R.stale_reason("generate", cfg, {"result": {"fingerprint": stale}}) is None)
+
+    src = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    check("main.py consults the staleness check before skipping",
+          "_stale_reason(name, cfg, state.info(name))" in src)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
-               test_env_paths, test_no_job_left_behind):
+               test_env_paths, test_no_job_left_behind, test_retry_policy,
+               test_stage_staleness):
         fn()
     print()
     if FAILURES:

@@ -92,6 +92,8 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.done: Dict[str, bool] = {}
+        self.attempts: Dict[str, int] = {}
+        self.errors: Dict[str, str] = {}
         if self.path.exists():
             with open(self.path, encoding="utf-8") as fh:
                 for line in fh:
@@ -102,14 +104,27 @@ class Ledger:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self.done[rec["job_id"]] = bool(rec.get("ok"))
-            log.info("Ledger %s: %d job(s) already recorded (%d ok)", self.path, len(self.done),
-                     sum(1 for v in self.done.values() if v))
+                    job_id = rec["job_id"]
+                    ok = bool(rec.get("ok"))
+                    self.done[job_id] = ok
+                    self.attempts[job_id] = self.attempts.get(job_id, 0) + 1
+                    if ok:
+                        self.errors.pop(job_id, None)
+                    else:
+                        self.errors[job_id] = str(rec.get("error") or "")
+            log.info("Ledger %s: %d job(s) already recorded (%d ok, %d failed)", self.path,
+                     len(self.done), sum(1 for v in self.done.values() if v),
+                     sum(1 for v in self.done.values() if not v))
 
     def record(self, outcome: Outcome) -> None:
         """Append an outcome unless its job has already been recorded."""
         with self._lock:
             self.done[outcome.job_id] = outcome.ok
+            self.attempts[outcome.job_id] = self.attempts.get(outcome.job_id, 0) + 1
+            if outcome.ok:
+                self.errors.pop(outcome.job_id, None)
+            else:
+                self.errors[outcome.job_id] = outcome.error[:400]
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"job_id": outcome.job_id, "ok": outcome.ok,
                                      "output_path": outcome.output_path,
@@ -125,22 +140,57 @@ class Ledger:
         """Return whether a job has any recorded outcome."""
         return job_id in self.done
 
+    def attempt_count(self, job_id: str) -> int:
+        """How many outcomes - successful or not - this job has recorded."""
+        return self.attempts.get(job_id, 0)
+
+    def failure_reasons(self, limit: int = 5) -> List[Tuple[str, int]]:
+        """The most common failure messages, for diagnosing a run that produced nothing."""
+        tally: Dict[str, int] = {}
+        for job_id, ok in self.done.items():
+            if ok:
+                continue
+            reason = (self.errors.get(job_id) or "unknown error").strip().splitlines()
+            key = reason[-1][:160] if reason else "unknown error"
+            tally[key] = tally.get(key, 0) + 1
+        return sorted(tally.items(), key=lambda kv: -kv[1])[:limit]
+
 
 # --------------------------------------------------------------------------------------
 # planning
 # --------------------------------------------------------------------------------------
 
 
-def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = False
-               ) -> Dict[str, List[Job]]:
-    """Pending jobs, grouped by model. Already-succeeded jobs are dropped."""
+def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
+               max_attempts: int = 3) -> Dict[str, List[Job]]:
+    """Pending jobs, grouped by model.
+
+    A job is dropped once it has succeeded - that is the whole point of the ledger. A job that
+    *failed* is retried on the next run until it has used up `max_attempts`, because most
+    failures here are environmental rather than intrinsic to the job: an adapter environment
+    that had not finished building, a checkpoint that had not been staged, a GPU that was busy.
+    Treating the first failure as final turned those into a permanently dead run whose only
+    symptom was "nothing to do" followed by "produced no videos at all".
+
+    `retry_failed=False` restores the old behaviour (one attempt, ever); `max_attempts` caps how
+    many times a genuinely broken job is allowed to burn a worker slot.
+    """
     groups: Dict[str, List[Job]] = defaultdict(list)
+    exhausted = 0
     for job in jobs:
         if ledger.succeeded(job.job_id):
             continue
-        if ledger.seen(job.job_id) and not retry_failed:
-            continue
+        if ledger.seen(job.job_id):
+            if not retry_failed:
+                continue
+            if ledger.attempt_count(job.job_id) >= max(1, max_attempts):
+                exhausted += 1
+                continue
         groups[job.model].append(job)
+    if exhausted:
+        log.warning("%d job(s) have failed %d time(s) and will not be retried again. Fix the "
+                    "underlying error and re-run with generation.max_attempts raised, or delete "
+                    "their rows from the ledger.", exhausted, max_attempts)
     return dict(groups)
 
 
@@ -247,12 +297,21 @@ class GenerationScheduler:
             return False
         return True
 
-    def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = False) -> Dict[str, object]:
+    def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
+            max_attempts: int = 3) -> Dict[str, object]:
         """Schedule all pending jobs and return an execution summary."""
-        groups = group_jobs(jobs, ledger, retry_failed)
+        groups = group_jobs(jobs, ledger, retry_failed, max_attempts)
         if not groups:
-            log.info("Nothing to do: every job is already recorded in the ledger")
-            return {"generated": 0, "failed": 0, "skipped": len(jobs)}
+            ok = sum(1 for j in jobs if ledger.succeeded(j.job_id))
+            if ok == len(jobs):
+                log.info("Nothing to do: all %d job(s) already succeeded", len(jobs))
+            else:
+                log.error("Nothing to do: %d of %d job(s) failed previously and have no retries "
+                          "left. Most common failures:", len(jobs) - ok, len(jobs))
+                for reason, count in ledger.failure_reasons():
+                    log.error("  %4dx %s", count, reason)
+            return {"generated": 0, "failed": 0, "skipped": len(jobs),
+                    "exhausted": len(jobs) - ok}
 
         unknown = [m for m in groups if m not in ADAPTERS]
         if unknown:

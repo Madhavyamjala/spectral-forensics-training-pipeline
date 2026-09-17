@@ -210,6 +210,18 @@ def check_gated_access(model_id: str, log) -> None:
                                f"`huggingface-cli login` (or set HF_TOKEN) before launching.") from exc
 
 
+def _stale_reason(name: str, cfg, info):
+    """Why a completed stage has to run again, or None to honour state.json.
+
+    Only the regeneration stages record enough to answer this; everything else is skipped on
+    the strength of state.json alone, as before.
+    """
+    if name not in GENERATION_STAGES:
+        return None
+    from csf.generation import run as generation
+    return generation.stale_reason(name, cfg, info)
+
+
 def main() -> int:
     """Run the selected stages of the forensics pipeline."""
     args = parse_args()
@@ -261,6 +273,11 @@ def main() -> int:
         if name in forced:
             return True
         if state.done(name):
+            reason = _stale_reason(name, cfg, state.info(name))
+            if reason:
+                log.warning("Stage %s is marked complete in state.json, but %s -> re-running it.",
+                            name, reason)
+                return True
             log.info("Stage %s already completed (state.json) -> skipping. Use --force %s to redo.", name, name)
             return False
         return True

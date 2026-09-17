@@ -200,6 +200,10 @@ class RunState:
     def done(self, stage_name: str) -> bool:
         return stage_name in self.data.get("completed", {})
 
+    def info(self, stage_name: str) -> Dict[str, Any]:
+        """Whatever was recorded when the stage completed (empty if it never did)."""
+        return dict(self.data.get("completed", {}).get(stage_name, {}))
+
     def mark(self, stage_name: str, info: Optional[Dict[str, Any]] = None) -> None:
         self.data.setdefault("completed", {})[stage_name] = {
             "time": datetime.now().isoformat(timespec="seconds"), **(info or {})}
