@@ -150,7 +150,8 @@ def push(repo_id: str, manifest: Path, video_root: Path, token: Optional[str] = 
     stale = sorted(set(old) - wanted)
 
     plan = {"repo_id": repo_id, "upload_videos": len(present), "missing_locally": absent,
-            "delete_old": len(stale) if delete_old else 0, "dry_run": dry_run}
+            "delete_old": len(stale) if delete_old else 0, "dry_run": dry_run,
+            "metadata_csv": manifest.with_name("metadata.csv").exists()}
     log.info("Push plan: %s", plan)
     if dry_run:
         return plan
@@ -168,6 +169,19 @@ def push(repo_id: str, manifest: Path, video_root: Path, token: Optional[str] = 
     api.upload_file(path_or_fileobj=str(manifest), path_in_repo="manifest.csv",
                     repo_id=repo_id, repo_type="dataset",
                     commit_message="Update manifest for regenerated AI-Edited class")
+
+    # metadata.csv travels with the manifest - it is what the per-video attribution analysis
+    # reads, and a stale copy on the Hub would describe the deleted videos
+    for extra in (manifest.with_name("metadata.csv"),
+                  manifest.with_name("metadata_schema.json")):
+        if extra.exists():
+            api.upload_file(path_or_fileobj=str(extra), path_in_repo=extra.name,
+                            repo_id=repo_id, repo_type="dataset",
+                            commit_message=f"Update {extra.name} for the regenerated class")
+            log.info("Uploaded %s", extra.name)
+        elif extra.name == "metadata.csv":
+            log.warning("%s not found next to the manifest - the Hub copy (if any) will be "
+                        "stale. Run the regen_manifest stage to produce it.", extra)
 
     if card is not None:
         api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md",
