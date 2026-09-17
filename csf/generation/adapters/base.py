@@ -357,8 +357,12 @@ class WorkerPool:
             self._workers.pop(victim).stop()
             self._order.remove(victim)
 
-        worker = WorkerProcess(adapter, self._env(spec), gpu, self.log_dir,
-                               job_timeout=self.job_timeout)
+        env = self._env(spec)
+        if not Path(env.python).exists():
+            raise AdapterError(
+                f"The interpreter for env '{spec.name}' is missing at {env.python}. Rebuild it "
+                f"with: python -m csf.generation.envs --build {spec.name} --force")
+        worker = WorkerProcess(adapter, env, gpu, self.log_dir, job_timeout=self.job_timeout)
         worker.start()
         self._workers[key] = worker
         self._order.append(key)

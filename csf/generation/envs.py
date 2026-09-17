@@ -146,8 +146,9 @@ def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str,
 
 
 def _venv_python(root: Path) -> Path:
+    """Absolute path to a venv's interpreter."""
     """Return the Python executable path for a virtual environment."""
-    return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    return (Path(root) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")).resolve()
 
 
 def _fetch(url: str, dest: Path) -> None:
@@ -167,7 +168,10 @@ def _fetch(url: str, dest: Path) -> None:
 def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
               offline: bool = False) -> ReadyEnv:
     """Create (or reuse) the venv, repos and weights for one adapter."""
-    root = Path(envs_root) / spec.name
+    # Absolute, always. The worker is launched with cwd set to this directory, so a relative
+    # interpreter path would resolve against the env itself and disappear - the env builds
+    # perfectly, then every worker dies with FileNotFoundError on venv/bin/python.
+    root = (Path(envs_root) / spec.name).resolve()
     venv_dir = root / "venv"
     marker = root / ".csf_ready.json"
     repos_dir = root / "repos"
@@ -268,7 +272,13 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
                  what=announce("running the post-install hook (may download weights)"),
                  timeout=7200)
 
-    marker.write_text(json.dumps({"digest": want, "name": spec.name,
+    if not py.exists():
+        raise EnvBuildError(
+            f"Environment '{spec.name}' finished building but its interpreter is missing at "
+            f"{py}. The venv step probably failed silently - check that `python -m venv` works "
+            f"on this machine (some distributions need python3-venv / ensurepip installed).")
+    marker.write_text(json.dumps({"digest": want, "name": spec.name, "python": str(py),
+                                  "root": str(root),
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),
                       encoding="utf-8")
     log.info("Environment '%s' ready in %.0fs", spec.name, time.monotonic() - build_started)
