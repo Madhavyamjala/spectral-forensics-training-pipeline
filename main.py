@@ -6,6 +6,8 @@ Runs the proposal's pipeline on Chrono-TriClass-100k as a sequence of resumable 
 The first four rebuild the AI-Edited class from scratch and only run when `generation.enabled`
 is set (see configs/regen.yaml and docs/REGENERATION.md); the rest are the training pipeline:
 
+    prefetch         download every Hugging Face model/dataset the run needs, and fail fast on
+                     gated repos before hours of work go into it
     kinetics         acquire + qualify Kinetics-400 source clips for the manipulation families
     generate         render 33,333 AI-Edited videos across the configured GPUs (resumable)
     regen_manifest   rebuild manifest.csv around the videos that were actually produced
@@ -55,7 +57,7 @@ if platform.system() == "Windows":
 else:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-GENERATION_STAGES = ["kinetics", "generate", "regen_manifest", "push_dataset"]
+GENERATION_STAGES = ["prefetch", "kinetics", "generate", "regen_manifest", "push_dataset"]
 STAGES = GENERATION_STAGES + [
     "prepare", "features", "train_qwen", "train_llama", "predict_scanner", "outcomes",
     "train_dispatcher", "evaluate", "export", "latency", "push"]
@@ -203,6 +205,13 @@ def main() -> int:
 
     # ---- AI-Edited regeneration (opt-in, rank 0 only) --------------------------------
     gen_selected = [s for s in GENERATION_STAGES if s in selected]
+    if "prefetch" in gen_selected and not cfg.generation.enabled:
+        # a training-only run still wants its base models pulled up front
+        with stage("prefetch", work_dir, dist_info.rank):
+            if dist_info.is_main and should_run("prefetch"):
+                from csf.generation.prefetch import prefetch
+                mark("prefetch", **prefetch(cfg, stage="train"))
+        gen_selected = [s for s in gen_selected if s != "prefetch"]
     if gen_selected and not cfg.generation.enabled:
         log.info("Stage(s) %s requested but generation.enabled is false -> skipping. Use "
                  "configs/regen.yaml or --set generation.enabled=true.", gen_selected)
@@ -215,7 +224,8 @@ def main() -> int:
                 f"    python main.py --config {args.config} --stage {','.join(gen_selected)}\n"
                 "then launch the training stages with torchrun as usual.")
         from csf.generation import run as generation
-        handlers = {"kinetics": generation.stage_kinetics, "generate": generation.stage_generate,
+        handlers = {"prefetch": generation.stage_prefetch,
+                    "kinetics": generation.stage_kinetics, "generate": generation.stage_generate,
                     "regen_manifest": generation.stage_regen_manifest,
                     "push_dataset": generation.stage_push_dataset}
         for name in gen_selected:

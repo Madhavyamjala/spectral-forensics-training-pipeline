@@ -1,6 +1,7 @@
 """
 The four regeneration stages, as called by `main.py`.
 
+    prefetch        download every Hugging Face model/dataset the run needs
     kinetics        acquire Kinetics-400 source clips and score them for qualification
     generate        render the 33,333 AI-Edited videos across the configured GPUs
     regen_manifest  rebuild manifest.csv around what was actually produced
@@ -51,6 +52,23 @@ def _check_video_root(cfg) -> Path:
                     "the regenerated clips from the Hub instead of reading them locally. Set "
                     "them to the same path unless you intend to push first.", root, expected)
     return root
+
+
+# --------------------------------------------------------------------------------------
+# stage: prefetch
+# --------------------------------------------------------------------------------------
+
+
+def stage_prefetch(cfg) -> Dict[str, object]:
+    """Pull every Hub asset the run needs and fail fast on anything gated or missing.
+
+    Worth its own stage: a run touches ~20 repositories, and discovering a gated licence or a
+    dead repo id three days into generation costs far more than the few minutes this takes.
+    """
+    from csf.generation.prefetch import prefetch
+
+    scope = "all" if cfg.generation.enabled else "train"
+    return prefetch(cfg, stage=scope)
 
 
 # --------------------------------------------------------------------------------------
