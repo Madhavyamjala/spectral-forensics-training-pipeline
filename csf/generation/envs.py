@@ -27,10 +27,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from csf.generation.progress import Heartbeat
 from csf.logging_utils import get_logger
 
 log = get_logger("generation.envs")
@@ -119,17 +121,28 @@ class ReadyEnv:
 
 def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None,
          timeout: int = 3600, what: str = "") -> None:
-    """Run a subprocess and raise a contextual environment-build error on failure."""
+    """Run a build step, streaming its output so a long install is visibly alive.
+
+    Environment builds spend most of their time inside a single `pip install` that can run for
+    fifteen minutes. Buffering its output until it exits makes the terminal look frozen, which is
+    indistinguishable from a hang, so each line is logged as it arrives and a heartbeat reports
+    elapsed time plus whatever pip last printed.
+    """
+    from csf.generation.progress import run_streaming
+
+    label = what or " ".join(str(c) for c in cmd[:3])
     log.debug("$ %s", " ".join(str(c) for c in cmd))
+    started = time.monotonic()
     try:
-        proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
-                              capture_output=True, text=True, timeout=timeout)
+        proc = run_streaming(cmd, cwd=cwd, env=env, timeout=timeout, desc=label)
     except subprocess.TimeoutExpired as exc:
-        raise EnvBuildError(f"{what or cmd[0]} timed out after {timeout}s") from exc
+        raise EnvBuildError(f"{label} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise EnvBuildError(f"{label} could not be started: {exc}") from exc
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-2000:]
-        raise EnvBuildError(f"{what or ' '.join(map(str, cmd[:3]))} failed "
-                            f"(exit {proc.returncode}):\n{tail}")
+        raise EnvBuildError(f"{label} failed (exit {proc.returncode}):\n"
+                            f"{(proc.stdout or '')[-2000:]}")
+    log.info("  %s done in %.0fs", label, time.monotonic() - started)
 
 
 def _venv_python(root: Path) -> Path:
@@ -177,24 +190,37 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
         raise EnvBuildError(f"Env '{spec.name}' is not built and generation.offline is set. "
                             f"Pre-build it with: python -m csf.generation.envs --build {spec.name}")
 
-    log.info("Building environment '%s' at %s", spec.name, root)
+    steps = (2 + (1 if spec.torch else 0) + (1 if spec.requirements else 0)
+             + len(spec.repos) + len(spec.weights) + len(spec.post_install))
+    log.info("Building environment '%s' at %s | %d step(s). The torch install alone usually "
+             "takes 5-20 minutes; each step streams its output below.", spec.name, root, steps)
+    build_started = time.monotonic()
     root.mkdir(parents=True, exist_ok=True)
+    step = [0]
+
+    def announce(label: str) -> str:
+        step[0] += 1
+        log.info("[%s  step %d/%d] %s", spec.name, step[0], steps, label)
+        return label
 
     if not py.exists():
         base = spec.python or sys.executable
-        _run([base, "-m", "venv", str(venv_dir)], what=f"venv for {spec.name}", timeout=600)
+        _run([base, "-m", "venv", str(venv_dir)],
+             what=announce("creating the virtual environment"), timeout=600)
+    else:
+        announce("virtual environment already present")
     _run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
-         what="pip bootstrap", timeout=1800)
+         what=announce("upgrading pip"), timeout=1800)
 
     if spec.torch:
         cmd = [py, "-m", "pip", "install", *spec.torch.split()]
         if spec.torch_index:
             cmd += ["--index-url", spec.torch_index]
-        _run(cmd, what=f"torch for {spec.name}", timeout=7200)
+        _run(cmd, what=announce(f"installing {spec.torch.split()[0]} (several GB)"), timeout=7200)
 
     if spec.requirements:
         _run([py, "-m", "pip", "install", *spec.requirements],
-             what=f"requirements for {spec.name}", timeout=7200)
+             what=announce(f"installing {len(spec.requirements)} requirement(s)"), timeout=7200)
 
     repos: Dict[str, Path] = {}
     for repo in spec.repos:
@@ -202,7 +228,9 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
         if not (target / ".git").exists():
             target.parent.mkdir(parents=True, exist_ok=True)
             _run(["git", "clone", "--recursive", repo.url, str(target)],
-                 what=f"clone {repo.url}", timeout=3600)
+                 what=announce(f"cloning {repo.folder}"), timeout=3600)
+        else:
+            announce(f"{repo.folder} already cloned")
         if repo.commit:
             _run(["git", "checkout", repo.commit], cwd=target, what=f"checkout {repo.commit}")
         repos[repo.folder] = target
@@ -210,17 +238,19 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
     for weight in spec.weights:
         dest = root / weight.dest
         if dest.exists() and dest.stat().st_size > 0:
+            announce(f"{Path(weight.dest).name} already present")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         if weight.url:
-            log.info("  fetching %s", weight.dest)
-            _fetch(weight.url, dest)
+            announce(f"downloading {Path(weight.dest).name}")
+            with Heartbeat(f"downloading {Path(weight.dest).name}"):
+                _fetch(weight.url, dest)
         elif weight.hf_repo:
-            log.info("  fetching %s from %s", weight.hf_file, weight.hf_repo)
+            announce(f"downloading {weight.hf_file} from {weight.hf_repo}")
             code = ("from huggingface_hub import hf_hub_download; import shutil; "
                     f"p=hf_hub_download({weight.hf_repo!r}, {weight.hf_file!r}, "
                     f"repo_type={weight.hf_type!r}); shutil.copy2(p, {str(dest)!r})")
-            _run([py, "-c", code], what=f"hf download {weight.hf_file}", timeout=7200)
+            _run([py, "-c", code], what=f"fetching {weight.hf_file}", timeout=7200)
         else:
             raise EnvBuildError(f"Weight {weight.dest} for env {spec.name} has no url or hf_repo")
 
@@ -235,12 +265,13 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False,
             [str(py.parent), hook_env.get("PATH", "")]).rstrip(os.pathsep)
         for cmd in spec.post_install:
             _run([py, *cmd], cwd=root, env=hook_env,
-                 what=f"post-install for {spec.name}", timeout=7200)
+                 what=announce("running the post-install hook (may download weights)"),
+                 timeout=7200)
 
     marker.write_text(json.dumps({"digest": want, "name": spec.name,
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),
                       encoding="utf-8")
-    log.info("Environment '%s' ready", spec.name)
+    log.info("Environment '%s' ready in %.0fs", spec.name, time.monotonic() - build_started)
     return ReadyEnv(spec, root, py, repos)
 
 
