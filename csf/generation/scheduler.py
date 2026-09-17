@@ -302,7 +302,9 @@ class GenerationScheduler:
         """Run one model group across the allowed concurrent workers."""
         adapter = adapter_for(model)
         spec = specs[adapter.env_name]
-        slots = concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu)
+        # never start more workers than there is work; six videos do not need four processes
+        slots = min(len(jobs),
+                    concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu))
         log.info("GPU %d: starting model '%s' (%d videos, env %s, %d worker(s) x %.0f GB)",
                  gpu, model, len(jobs), adapter.env_name, slots, adapter.vram_gb)
 
@@ -325,10 +327,26 @@ class GenerationScheduler:
         streak_lock = threading.Lock()
 
         def slot_loop(slot: int) -> None:
-            """Consume jobs on one worker slot until completion or group abandonment."""
+            """Consume jobs on one worker slot, recording every job whatever goes wrong.
+
+            The wrapper matters: an unexpected exception used to kill the thread outright, and
+            the videos still queued were then neither generated nor written to the ledger. They
+            simply vanished, and the run reported a clean finish for a group that produced
+            nothing.
+            """
+            try:
+                _slot_loop(slot)
+            except Exception as exc:                          # noqa: BLE001 - never lose jobs
+                log.exception("GPU %d slot %d: '%s' failed unexpectedly", gpu, slot, model)
+                if not abandon.is_set():
+                    abandon.set()
+                    self._drain(queue, ledger, progress,
+                                f"worker slot crashed: {type(exc).__name__}: {exc}"[:500])
+
+        def _slot_loop(slot: int) -> None:
             try:
                 worker = pool.get(adapter, spec, gpu, slot)
-            except (AdapterError, EnvBuildError) as exc:
+            except (AdapterError, EnvBuildError, OSError) as exc:
                 reason = f"worker/env unavailable: {exc}"[:500]
                 log.error("GPU %d slot %d: cannot start '%s': %s", gpu, slot, model, reason)
                 if slot == 0:                      # slot 0 failing means the model cannot run
@@ -357,7 +375,7 @@ class GenerationScheduler:
                 started = time.monotonic()
                 try:
                     worker = pool.get(adapter, spec, gpu, slot)
-                except (AdapterError, EnvBuildError) as exc:
+                except (AdapterError, EnvBuildError, OSError) as exc:
                     outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500])
                 else:
                     outcome = self._run_one(worker, pool, adapter, spec, gpu, job, out, slot)
@@ -385,6 +403,24 @@ class GenerationScheduler:
             t.start()
         for t in threads:
             t.join()
+
+        # A group must account for every job it was given. If a thread still died in a way that
+        # escaped both handlers, the queue holds work nobody recorded; sweep it rather than let
+        # the run report success for videos that were never attempted.
+        stranded = 0
+        while True:
+            try:
+                job = queue.get_nowait()
+            except Empty:
+                break
+            stranded += 1
+            ledger.record(Outcome(job.job_id, False,
+                                  error="job was never attempted (worker group ended early)"))
+            self._note_failure(job, "never attempted")
+            progress.update(False)
+        if stranded:
+            log.error("GPU %d: '%s' ended with %d job(s) unattempted - recorded as failed",
+                      gpu, model, stranded)
         log.info("GPU %d: finished model '%s'", gpu, model)
 
     def _drain(self, queue: "Queue[Optional[Job]]", ledger: Ledger, progress: Progress,
