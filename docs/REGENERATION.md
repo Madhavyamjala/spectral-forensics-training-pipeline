@@ -10,6 +10,28 @@ parameters — which is what makes per-method forensic analysis possible at all.
 
 ---
 
+## 0. Before you start
+
+```bash
+python -m csf.generation.prefetch --list            # the ~21 Hub repos a run needs
+python -m csf.generation.prefetch --stage generate  # pull them (~90 GB), resumable
+```
+
+Source clips come from the Hugging Face mirror
+[`liuhuanjim013/kinetics400`](https://huggingface.co/datasets/liuhuanjim013/kinetics400).
+Community mirrors are not consistent in layout, so `SourcePool.probe_hf_layout` lists the repo
+once and picks the matching reader:
+
+| layout detected | reader |
+|---|---|
+| `<split>/<label>/<clip>.mp4` | one `hf_hub_download` per clip, per-label quotas |
+| `*.tar` / `*.tar.gz` / `*.zip` shards | stream a shard, keep the needed clips, delete it |
+| `*.parquet` with the video inline | `load_dataset(..., streaming=True)`, write out the bytes |
+
+If the mirror cannot satisfy some labels, the CVDF S3 shards
+(`generation.kinetics.mirror_base`) fill the gap. Set `generation.kinetics.local_root` instead if
+Kinetics is already extracted on the cluster, and nothing is downloaded at all.
+
 ## 1. What gets built
 
 33,333 videos over eight families and 32 models. The document specifies 28,333; the extra 5,000
