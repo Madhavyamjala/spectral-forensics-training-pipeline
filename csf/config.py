@@ -126,6 +126,81 @@ class HubConfig:
 
 
 @dataclass
+class KineticsConfig:
+    """Where Kinetics-400 source clips come from, and how many to keep.
+
+    The Hugging Face mirror is the default: it needs no annotation CSVs, reuses the Hub client's
+    auth/retry/caching, and the loader detects its layout at runtime. The CVDF S3 shards remain
+    as a fallback for labels the mirror cannot satisfy.
+    """
+    local_root: Optional[str] = None            # an already-extracted tree on the cluster
+    hf_repo: Optional[str] = "liuhuanjim013/kinetics400"
+    hf_revision: Optional[str] = None
+    mirror_base: Optional[str] = "https://s3.amazonaws.com/kinetics/400"   # fallback
+    splits: List[str] = field(default_factory=lambda: ["train", "val"])
+    max_shards: Optional[int] = None            # cap the shard downloads (smoke runs)
+    probe_clips: bool = True
+    demand_margin: float = 1.6                  # oversample: clips are lost to the filters
+    score_workers: int = 8
+    score_frames: int = 12
+    rescore: bool = False
+
+
+@dataclass
+class GenerationPushConfig:
+    """Publishing the regenerated class back to the dataset repo (destructive - opt in)."""
+    enabled: bool = False
+    repo_id: Optional[str] = None               # defaults to data.repo_id
+    delete_old: bool = True
+    private: bool = True
+    dry_run: bool = False
+
+
+@dataclass
+class GenerationConfig:
+    enabled: bool = False
+    total_videos: int = 33333
+    gpus: List[int] = field(default_factory=lambda: [2, 3, 4])
+    video_root: str = "./cache/regen/videos"
+    envs_root: str = "./cache/regen/envs"
+    jobs_csv: str = "./cache/regen/jobs.csv"
+    ledger: str = "./cache/regen/ledger.jsonl"
+    manifest_out: str = "manifest_regen.csv"
+    #: Per-video metadata for artifact-attribution analysis, written alongside the manifest.
+    #: Empty => metadata.csv next to manifest_out.
+    metadata_out: str = ""
+    job_timeout_s: int = 1800
+    fail_fast: int = 8
+    min_free_gb: float = 50.0
+    offline: bool = False                       # fail instead of building envs on the fly
+    deadline_hours: Optional[float] = None      # stop scheduling new groups after this long
+    retry_failed: bool = False
+    keep_old_edited: bool = False
+    only_models: List[str] = field(default_factory=list)      # restrict the run to these models
+    skip_models: List[str] = field(default_factory=list)
+    # Choose the model set up front to fit a wall-clock budget, instead of letting
+    # deadline_hours cut the run off mid-group (which biases the dataset toward whichever
+    # models sort earliest). null disables the planner and runs everything wired.
+    budget_wall_clock_hours: Optional[float] = None
+    budget_diversity_floor: int = 2                           # distinct renderers per family
+    budget_pin_models: List[str] = field(default_factory=list)
+    # Six of the document's models have no runnable release. With this set, each family's
+    # target is re-apportioned across the models that DO run, so every family still reaches the
+    # size the document specifies instead of coming up short.
+    reallocate_unfillable: bool = True
+    # Per-GPU concurrency. One worker per card leaves a 143 GB H200 almost idle on a 3 GB model,
+    # and the small nets are latency-bound (video decode, face detection) rather than
+    # compute-bound, so several in parallel scale nearly linearly.
+    gpu_vram_gb: float = 143.0
+    max_workers_per_gpu: int = 4
+    # REFace's checkpoint is trained on CelebAMask-HQ: non-commercial research only. Its
+    # adapter refuses to start unless this is set explicitly.
+    accept_noncommercial: bool = False
+    kinetics: KineticsConfig = field(default_factory=KineticsConfig)
+    push: GenerationPushConfig = field(default_factory=GenerationPushConfig)
+
+
+@dataclass
 class Config:
     run_name: str = "test"
     mode: str = "test"
@@ -137,6 +212,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     hub: HubConfig = field(default_factory=HubConfig)
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)

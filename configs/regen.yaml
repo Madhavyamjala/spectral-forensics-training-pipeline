@@ -1,0 +1,159 @@
+# AI-EDITED REGENERATION + FULL TRAINING RUN
+#
+# Rebuilds the AI-Edited class from Kinetics-400 per "AI Edited Data Source and Pipeline"
+# (33,333 videos, 8 families, 32 models), then trains the full CSF pipeline on the result.
+#
+# Target machine: tfgpu.cs.fiu.edu, 6x NVIDIA H200 NVL (143 GB). GPUs 0 and 1 are held by vLLM
+# workers, so everything here uses GPUs 2/3/4 only. Set CUDA_VISIBLE_DEVICES=2,3,4 for the
+# training stages; the generation scheduler pins its own workers via generation.gpus.
+#
+# Run it in two phases - generation is single-process (it schedules its own per-model workers),
+# training is torchrun:
+#   python main.py --config configs/regen.yaml --stage kinetics,generate,regen_manifest
+#   bash scripts/run_regen.sh --train
+#
+# See docs/REGENERATION.md for the full runbook.
+run_name: csf-regen
+mode: full
+seed: 42
+
+paths:
+  work_dir: ./runs/regen
+  cache_dir: ./cache/regen
+  video_dir: ./cache/regen/videos
+
+generation:
+  enabled: true
+  total_videos: 33333
+  gpus: [1, 2, 3, 4]            # 4 GPUs; GPU 0 left to the vLLM workers
+  # Must match paths.video_dir: the feature stage reads <video_dir>/<repo_path> and only falls
+  # back to the Hub when the file is absent, so writing here means no re-download.
+  video_root: ./cache/regen/videos
+  envs_root: ./cache/regen/envs
+  jobs_csv: ./cache/regen/jobs.csv
+  ledger: ./cache/regen/ledger.jsonl
+  manifest_out: manifest_regen.csv
+  job_timeout_s: 1800          # a TokenFlow job is the slow case at ~4 min; 30 min is generous
+  fail_fast: 8                 # abandon a model group after 8 consecutive failures
+  min_free_gb: 100.0
+  offline: false               # build the per-model venvs on demand (node has internet)
+  deadline_hours: 120.0        # hard backstop only
+  retry_failed: false
+  keep_old_edited: false       # the old 31,128 ai_edited rows are dropped
+  only_models: []              # e.g. [inswapper, wav2lip] to run a subset
+  skip_models: []
+  # Running every wired model costs ~523 GPU-hours (7.3 days on 3 GPUs), which does not leave
+  # room for training inside a week. The planner picks the model set up front instead: it keeps
+  # at least `budget_diversity_floor` distinct renderers per family, then spends the rest on
+  # volume. Set to null to run everything and take the extra days.
+  #   python -m csf.generation.budget --hours 84 --gpus 3      # preview the selection
+  budget_wall_clock_hours: null   # null = run every wired model (the full 33,333)
+  budget_diversity_floor: 2
+  budget_pin_models: []
+  # Re-apportion the six unfillable slots onto the runnable models in their family, so every
+  # family reaches the size the document specifies. Set false to leave those videos unmade.
+  reallocate_unfillable: true
+  # Per-GPU concurrency: 143 GB cards, so several workers fit alongside each other.
+  gpu_vram_gb: 143.0
+  max_workers_per_gpu: 4
+  # REFace (the FaceShifter substitute) is trained on CelebAMask-HQ: NON-COMMERCIAL RESEARCH
+  # ONLY, and generated videos inherit that. Leave false to skip it entirely.
+  accept_noncommercial: false
+  kinetics:
+    local_root: null           # set this if Kinetics-400 is already extracted on the cluster
+    # Primary source. The loader inspects the repo and picks the right reader (one file per
+    # clip / tar-zip shards / parquet), so it works whatever layout the mirror uses.
+    hf_repo: liuhuanjim013/kinetics400
+    hf_revision: null
+    mirror_base: https://s3.amazonaws.com/kinetics/400   # fallback for labels the mirror misses
+    splits: [train, val]
+    max_shards: null
+    probe_clips: true
+    demand_margin: 1.6         # oversample: clips are lost to the face/mouth/object filters
+    score_workers: 16
+    score_frames: 12
+    rescore: false
+  push:
+    enabled: false             # flip to true only when you have reviewed the videos
+    repo_id: null              # defaults to data.repo_id
+    delete_old: true
+    private: true
+    dry_run: false
+
+data:
+  repo_id: madhav-yrc/Chrono-TriClass-100k
+  manifest: manifest.csv       # replaced by manifest_regen.csv once regen_manifest has run
+  max_rows: null
+  num_frames: 16
+  frame_size: 224
+  mosaic_frames: 4
+  mosaic_size: 560
+  patch_size: 64
+  num_patches: 8
+  tool_max_side: 1024
+  jpeg_quality: 95
+  delete_videos_after_cache: false   # the regenerated videos are the dataset - do not delete
+  keep_videos_for_latency: 200
+  download_workers: 16
+  prefetch: 64
+
+models:
+  qwen_id: Qwen/Qwen2.5-VL-3B-Instruct
+  llama_id: meta-llama/Llama-3.2-11B-Vision-Instruct
+  vae_id: stabilityai/stable-video-diffusion-img2vid-xt
+  vae_subfolder: vae
+  vae_fallback_id: stabilityai/sd-vae-ft-mse
+  attn_implementation: sdpa          # --set models.attn_implementation=flash_attention_2 if built
+
+train:
+  num_workers: 12
+  qwen:
+    quantization: none
+    epochs: 2
+    batch_size: 16                   # 143 GB per card - far more headroom than full.yaml assumes
+    eval_batch_size: 32
+    grad_accum: 1
+    lr: 1.0e-4
+    head_lr: 5.0e-4
+    warmup_ratio: 0.03
+    lora_r: 32
+    lora_alpha: 64
+    optimizer: adamw
+    eval_every: 500
+    save_every: 500
+    max_eval_batches: 250
+    early_stop_patience: 4
+  llama:
+    quantization: none               # bf16 throughout; H200 has the memory for it
+    skip_quant_modules: [vision_model, multi_modal_projector, lm_head]
+    epochs: 1
+    batch_size: 6
+    eval_batch_size: 12
+    grad_accum: 2
+    lr: 1.0e-4
+    head_lr: 5.0e-4
+    warmup_ratio: 0.03
+    lora_r: 32
+    lora_alpha: 64
+    tool_dropout: 0.3
+    optimizer: adamw
+    eval_every: 500
+    save_every: 250
+    max_eval_batches: 250
+    early_stop_patience: 3
+  dispatcher:
+    train_videos: 6000
+    iterations: 1500
+    batch_videos: 256
+    group_size: 16
+    inner_epochs: 2
+    lr: 3.0e-4
+
+eval:
+  profiles: [ultra_fast, balanced, max_security]
+  latency_samples: 200
+  latency_warmup: 5
+
+hub:
+  private: true
+  prompt_for_push: true
