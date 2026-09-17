@@ -868,6 +868,18 @@ def test_env_paths() -> None:
         check("the interpreter resolves from inside the env root",
               (Path(ready.root) / ready.python).exists() or Path(ready.python).exists())
 
+    # the same trap as the interpreter: a worker's cwd is its env root, so a relative video
+    # root would put every mp4 under cache/.../envs/<env>/ and the driver would record "ok"
+    # for a file it cannot find
+    from csf.generation.scheduler import GenerationScheduler
+    sched = GenerationScheduler(video_root=Path("cache/rel/videos"), envs_root=Path("cache/envs"),
+                                log_dir=Path("logs"), gpus=[0])
+    check("the video root is absolute", sched.video_root.is_absolute(), str(sched.video_root))
+    check("output paths are absolute",
+          sched.output_path(Job(job_id="j", video_id="v", family="face_swap", model="inswapper",
+                                source_group="g", source_clip_id="c", source_path="c.mp4",
+                                source_label="singing")).is_absolute())
+
     check("the worker is launched with cwd set to the env root",
           "cwd=str(self.env.root)" in inspect.getsource(adapter_base.WorkerProcess.start))
     check("a missing interpreter is refused before spawning",
@@ -943,6 +955,44 @@ def test_retry_policy() -> None:
         reasons = reopened.failure_reasons()
         check("failures are tallied by message",
               reasons and reasons[0] == ("env build failed", 1), str(reasons))
+
+        # an env that will not build is not the job's fault: record it, but do not spend the
+        # job's attempts on it, or an offline node permanently strands work that would run
+        env_path = Path(tmp) / "envledger.jsonl"
+        env_ledger = Ledger(env_path)
+        for _ in range(4):
+            env_ledger.record(Outcome(job_id="j9", ok=False, env_error=True,
+                                      error="worker unavailable: EnvBuildError"))
+        check("an env failure costs no attempts", env_ledger.attempt_count("j9") == 0)
+        check("but the job is still on record", env_ledger.seen("j9"))
+        check("an env failure does not block a retry",
+              "j9" in {j.job_id for v in group_jobs([job(9)], env_ledger).values() for j in v})
+        env_ledger.record(Outcome(job_id="j9", ok=False, error="the model crashed"))
+        check("a real failure still counts", env_ledger.attempt_count("j9") == 1)
+
+        # ledgers written before env_error existed still carry the distinction in their text
+        legacy = Path(tmp) / "legacy.jsonl"
+        legacy.write_text("".join(
+            '{"job_id": "j8", "ok": false, "error": "worker unavailable: no pip"}\n'
+            for _ in range(3)), encoding="utf-8")
+        check("a legacy 'worker unavailable' row is read as an env failure",
+              Ledger(legacy).attempt_count("j8") == 0)
+        check("and the job is retried rather than left exhausted",
+              "j8" in {j.job_id for v in group_jobs([job(8)], Ledger(legacy)).values() for j in v})
+
+        # a success whose video has vanished must be regenerated, not skipped forever
+        gone = Path(tmp) / "gone.mp4"
+        present = Path(tmp) / "present.mp4"
+        present.write_bytes(b"x" * 16)
+        out_ledger = Ledger(Path(tmp) / "out.jsonl")
+        out_ledger.record(Outcome(job_id="j0", ok=True, output_path=str(gone)))
+        out_ledger.record(Outcome(job_id="j1", ok=True, output_path=str(present)))
+        paths = {"j0": gone, "j1": present}
+        pending = {j.job_id for v in group_jobs([job(0), job(1)], out_ledger,
+                                                output_for=lambda j: paths[j.job_id]).values()
+                   for j in v}
+        check("a recorded success with no file is re-generated", "j0" in pending)
+        check("a recorded success whose file is there is left alone", "j1" not in pending)
 
         # a job that failed and later succeeded must not be reported as a failure
         reopened.record(Outcome(job_id="j1", ok=True, output_path="/tmp/v1.mp4", error="",

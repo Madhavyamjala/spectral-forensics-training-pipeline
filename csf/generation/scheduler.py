@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import shutil
 import threading
 import time
@@ -81,6 +82,11 @@ class Outcome:
     error: str = ""
     seconds: float = 0.0
     metadata: dict = field(default_factory=dict)
+    #: The job never ran - its environment could not be built, or the group ended early. It is
+    #: recorded so the failure is visible, but it does not count against the job's attempts:
+    #: nothing about *this job* failed, and burning its retries on a broken env (or an offline
+    #: node) strands work that would succeed the moment the env is fixed.
+    env_error: bool = False
 
 
 class Ledger:
@@ -107,7 +113,14 @@ class Ledger:
                     job_id = rec["job_id"]
                     ok = bool(rec.get("ok"))
                     self.done[job_id] = ok
-                    self.attempts[job_id] = self.attempts.get(job_id, 0) + 1
+                    # ledgers written before env_error existed: a "worker unavailable"
+                    # error is an env failure by any other name, so do not charge it as an
+                    # attempt now that the distinction exists.
+                    env_error = bool(rec.get("env_error")) or \
+                        str(rec.get("error") or "").startswith("worker unavailable:")
+                    if not env_error:
+                        self.attempts[job_id] = self.attempts.get(job_id, 0) + 1
+                    self.attempts.setdefault(job_id, 0)
                     if ok:
                         self.errors.pop(job_id, None)
                     else:
@@ -120,7 +133,9 @@ class Ledger:
         """Append an outcome unless its job has already been recorded."""
         with self._lock:
             self.done[outcome.job_id] = outcome.ok
-            self.attempts[outcome.job_id] = self.attempts.get(outcome.job_id, 0) + 1
+            if not outcome.env_error:
+                self.attempts[outcome.job_id] = self.attempts.get(outcome.job_id, 0) + 1
+            self.attempts.setdefault(outcome.job_id, 0)
             if outcome.ok:
                 self.errors.pop(outcome.job_id, None)
             else:
@@ -130,6 +145,7 @@ class Ledger:
                                      "output_path": outcome.output_path,
                                      "error": outcome.error[:400],
                                      "seconds": round(outcome.seconds, 2),
+                                     "env_error": outcome.env_error,
                                      "metadata": outcome.metadata}) + "\n")
 
     def succeeded(self, job_id: str) -> bool:
@@ -162,7 +178,7 @@ class Ledger:
 
 
 def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
-               max_attempts: int = 3) -> Dict[str, List[Job]]:
+               max_attempts: int = 3, output_for=None) -> Dict[str, List[Job]]:
     """Pending jobs, grouped by model.
 
     A job is dropped once it has succeeded - that is the whole point of the ledger. A job that
@@ -177,8 +193,17 @@ def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
     """
     groups: Dict[str, List[Job]] = defaultdict(list)
     exhausted = 0
+    orphaned = 0
     for job in jobs:
         if ledger.succeeded(job.job_id):
+            # "succeeded" is only true while the video is still there. A recorded success whose
+            # file is gone (deleted, or written somewhere the driver could not see) would
+            # otherwise be skipped forever, leaving a hole nothing ever fills.
+            if output_for is not None:
+                out = Path(output_for(job))
+                if not (out.exists() and out.stat().st_size > 0):
+                    orphaned += 1
+                    groups[job.model].append(job)
             continue
         if ledger.seen(job.job_id):
             if not retry_failed:
@@ -187,6 +212,9 @@ def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
                 exhausted += 1
                 continue
         groups[job.model].append(job)
+    if orphaned:
+        log.warning("%d job(s) are recorded as successful but their video is missing from the "
+                    "video root -> re-generating them", orphaned)
     if exhausted:
         log.warning("%d job(s) have failed %d time(s) and will not be retried again. Fix the "
                     "underlying error and re-run with generation.max_attempts raised, or delete "
@@ -267,7 +295,10 @@ class GenerationScheduler:
                  offline: bool = False, deadline_hours: Optional[float] = None,
                  gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1):
         """Configure generation paths, limits, GPUs, and worker concurrency."""
-        self.video_root = Path(video_root)
+        # Absolute, always. Workers are launched with cwd set to their env root, so a relative
+        # output path would land under cache/.../envs/<env>/ instead of the video root - the
+        # driver then records "ok" for a file it cannot find. Same reasoning as the interpreter.
+        self.video_root = Path(os.path.abspath(video_root))
         self.envs_root = Path(envs_root)
         self.log_dir = Path(log_dir)
         self.gpus = list(gpus)
@@ -300,9 +331,10 @@ class GenerationScheduler:
     def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
             max_attempts: int = 3) -> Dict[str, object]:
         """Schedule all pending jobs and return an execution summary."""
-        groups = group_jobs(jobs, ledger, retry_failed, max_attempts)
+        groups = group_jobs(jobs, ledger, retry_failed, max_attempts, self.output_path)
         if not groups:
-            ok = sum(1 for j in jobs if ledger.succeeded(j.job_id))
+            ok = sum(1 for j in jobs if ledger.succeeded(j.job_id)
+                      and self.output_path(j).exists())
             if ok == len(jobs):
                 log.info("Nothing to do: all %d job(s) already succeeded", len(jobs))
             else:
@@ -435,7 +467,8 @@ class GenerationScheduler:
                 try:
                     worker = pool.get(adapter, spec, gpu, slot)
                 except (AdapterError, EnvBuildError, OSError) as exc:
-                    outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500])
+                    outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500],
+                                      env_error=True)
                 else:
                     outcome = self._run_one(worker, pool, adapter, spec, gpu, job, out, slot)
                 outcome.seconds = time.monotonic() - started
@@ -473,7 +506,7 @@ class GenerationScheduler:
             except Empty:
                 break
             stranded += 1
-            ledger.record(Outcome(job.job_id, False,
+            ledger.record(Outcome(job.job_id, False, env_error=True,
                                   error="job was never attempted (worker group ended early)"))
             self._note_failure(job, "never attempted")
             progress.update(False)

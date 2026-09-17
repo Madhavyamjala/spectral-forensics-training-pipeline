@@ -193,9 +193,27 @@ def _run(cmd: Sequence[str], cwd: Optional[Path] = None, env: Optional[Dict[str,
     except OSError as exc:
         raise EnvBuildError(f"{label} could not be started: {exc}") from exc
     if proc.returncode != 0:
-        raise EnvBuildError(f"{label} failed (exit {proc.returncode}):\n"
-                            f"{(proc.stdout or '')[-2000:]}")
+        tail = (proc.stdout or "")[-2000:]
+        raise EnvBuildError(f"{label} failed (exit {proc.returncode}):\n{tail}{_network_hint(tail)}")
     log.info("  %s done in %.0fs", label, time.monotonic() - started)
+
+
+NETWORK_MARKERS = ("NameResolutionError", "Temporary failure in name resolution",
+                   "Network is unreachable", "Could not find a version",
+                   "Failed to establish a new connection", "ProxyError", "Connection refused")
+
+
+def _network_hint(output: str) -> str:
+    """Extra guidance when a build step failed because the machine could not reach an index."""
+    if not any(marker in output for marker in NETWORK_MARKERS):
+        return ""
+    return ("\n\nThis looks like a network failure rather than a packaging one. Either this "
+            "node cannot reach the package index (build the envs where it can, with "
+            "`python -m csf.generation.envs --build all --envs-root <envs_root>`, then run "
+            "generation with generation.offline=true so it never tries), or pip is configured "
+            "with an index this node cannot resolve - check PIP_INDEX_URL / PIP_EXTRA_INDEX_URL "
+            "and pip.conf, since an unreachable extra index fails the install even when PyPI "
+            "itself is reachable.")
 
 
 def _venv_python(root: Path) -> Path:
