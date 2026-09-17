@@ -58,9 +58,10 @@ else:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 GENERATION_STAGES = ["prefetch", "kinetics", "generate", "regen_manifest", "push_dataset"]
-STAGES = GENERATION_STAGES + [
+TRAINING_STAGES = [
     "prepare", "features", "train_qwen", "train_llama", "predict_scanner", "outcomes",
     "train_dispatcher", "evaluate", "export", "latency", "push"]
+STAGES = GENERATION_STAGES + TRAINING_STAGES
 
 
 def parse_args():
@@ -81,51 +82,107 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def preflight(cfg, dist_info, log) -> None:
+def preflight(cfg, dist_info, log, selected=None) -> None:
+    """Check the environment for the stages actually being run.
+
+    Scoped deliberately. The generation stages schedule subprocesses that each bring their own
+    virtual environment, so they need ffmpeg and disk, not peft/torchvision/bitsandbytes. Demanding
+    the training stack for a `--stage kinetics,generate` run turns a missing optional dependency
+    into a hard failure before any work starts, which is what it used to do.
+    """
+    import shutil as _shutil
+
     import torch
-    import transformers
+    selected = set(selected or STAGES)
+    training = bool(selected & set(TRAINING_STAGES))
+
     info = {"python": sys.version.split()[0], "platform": platform.platform(), "torch": torch.__version__,
-            "cuda_available": torch.cuda.is_available(), "transformers": transformers.__version__,
-            "world_size": dist_info.world_size}
+            "cuda_available": torch.cuda.is_available(), "world_size": dist_info.world_size,
+            "stages": sorted(selected & set(STAGES))}
     try:
-        import peft
-        info["peft"] = peft.__version__
+        import transformers
+        info["transformers"] = transformers.__version__
     except ImportError:
-        raise RuntimeError("peft is not installed - run the setup script (setup_env.ps1 / setup_env.sh).")
-    try:
-        import torchvision
-        info["torchvision"] = torchvision.__version__
-    except ImportError as exc:
-        index = f"https://download.pytorch.org/whl/cu{torch.version.cuda.replace('.', '')}" \
-            if torch.version.cuda else "https://download.pytorch.org/whl/cpu"
-        raise RuntimeError(
-            f"torchvision is not installed ({exc}), but the Qwen2.5-VL video processor requires it. "
-            f"Install the build matching torch {torch.__version__}:\n"
-            f"    pip install torchvision --index-url {index}") from exc
+        info["transformers"] = "not installed"
+
+    if training:
+        try:
+            import peft
+            info["peft"] = peft.__version__
+        except ImportError:
+            raise RuntimeError("peft is not installed - run the setup script "
+                               "(setup_env.ps1 / setup_env.sh).")
+        try:
+            import torchvision
+            info["torchvision"] = torchvision.__version__
+        except ImportError as exc:
+            index = f"https://download.pytorch.org/whl/cu{torch.version.cuda.replace('.', '')}" \
+                if torch.version.cuda else "https://download.pytorch.org/whl/cpu"
+            raise RuntimeError(
+                f"torchvision is not installed ({exc}), but the Qwen2.5-VL video processor requires it. "
+                f"Install the build matching torch {torch.__version__}:\n"
+                f"    pip install torchvision --index-url {index}") from exc
+
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(dist_info.device)
-        info.update(gpu=props.name, vram_gib=round(props.total_memory / 2**30, 1),
-                    compute_capability=f"{props.major}.{props.minor}", bf16=torch.cuda.is_bf16_supported(),
-                    cuda_runtime=torch.version.cuda)
-        try:
-            import bitsandbytes
-            info["bitsandbytes"] = bitsandbytes.__version__
-        except Exception as exc:
-            info["bitsandbytes"] = f"UNAVAILABLE ({exc})"
-            if "4bit" in (cfg.train.qwen.quantization, cfg.train.llama.quantization):
-                raise RuntimeError("bitsandbytes is required for 4-bit training but failed to import: "
-                                   f"{exc}. Re-run the setup script.")
-        need = 11 if cfg.mode == "test" else 22
-        if info["vram_gib"] < need:
-            log.warning("GPU has %.1f GiB VRAM; the %s profile expects >= %d GiB. Expect OOM - lower "
-                        "data.num_frames / use 4bit quantization.", info["vram_gib"], cfg.mode, need)
-    else:
+        info.update(gpu=props.name, gpu_index=dist_info.device.index,
+                    vram_gib=round(props.total_memory / 2**30, 1),
+                    visible_devices=torch.cuda.device_count(),
+                    compute_capability=f"{props.major}.{props.minor}",
+                    bf16=torch.cuda.is_bf16_supported(), cuda_runtime=torch.version.cuda)
+        if training:
+            try:
+                import bitsandbytes
+                info["bitsandbytes"] = bitsandbytes.__version__
+            except Exception as exc:
+                info["bitsandbytes"] = f"UNAVAILABLE ({exc})"
+                if "4bit" in (cfg.train.qwen.quantization, cfg.train.llama.quantization):
+                    raise RuntimeError("bitsandbytes is required for 4-bit training but failed to import: "
+                                       f"{exc}. Re-run the setup script.")
+            need = 11 if cfg.mode == "test" else 22
+            if info["vram_gib"] < need:
+                log.warning("GPU has %.1f GiB VRAM; the %s profile expects >= %d GiB. Expect OOM - lower "
+                            "data.num_frames / use 4bit quantization.", info["vram_gib"], cfg.mode, need)
+    elif training:
         log.warning("CUDA is NOT available - training will run on CPU (only sensible for tiny smoke tests).")
-    free_gb = shutil.disk_usage(Path(cfg.paths.cache_dir).resolve().anchor).free / 2**30
+
+    if cfg.generation.enabled and selected & set(GENERATION_STAGES):
+        info["ffmpeg"] = bool(_shutil.which("ffmpeg")) and bool(_shutil.which("ffprobe"))
+        if not info["ffmpeg"]:
+            raise RuntimeError(
+                "ffmpeg and ffprobe must be on PATH for the generation stages - every worker "
+                "encodes with them, and the manifest stage probes each produced file.\n"
+                "    Linux:   sudo apt install ffmpeg\n"
+                "    Windows: winget install Gyan.FFmpeg")
+        _check_generation_gpus(cfg, log)
+
+    free_gb = _shutil.disk_usage(Path(cfg.paths.cache_dir).resolve().anchor).free / 2**30
     info["disk_free_gib"] = round(free_gb, 1)
     log.info("Environment: %s", json.dumps(info))
     if free_gb < (20 if cfg.mode == "test" else 120):
         log.warning("Only %.1f GiB free disk space; the feature cache + model downloads may not fit.", free_gb)
+
+
+def _check_generation_gpus(cfg, log) -> None:
+    """Fail early if `generation.gpus` names cards this process cannot see."""
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("The generation stages need CUDA, but torch reports no GPU.")
+    count = torch.cuda.device_count()
+    bad = [g for g in cfg.generation.gpus if g < 0 or g >= count]
+    if bad:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        raise RuntimeError(
+            f"generation.gpus={cfg.generation.gpus} names GPU(s) {bad}, but this process can see "
+            f"only {count} device(s) (0-{count - 1})."
+            + (f"\nCUDA_VISIBLE_DEVICES={visible!r} is set, so those ids are indices into that "
+               f"list rather than physical ids. Unset it to use physical ids." if visible else
+               "\nCheck nvidia-smi for the ids actually present."))
+    names = {g: torch.cuda.get_device_properties(g).name for g in cfg.generation.gpus}
+    log.info("Generation will use GPU(s) %s (%s); driver process is on %s",
+             cfg.generation.gpus, ", ".join(f"{k}:{v}" for k, v in names.items()),
+             torch.cuda.current_device())
 
 
 def check_gated_access(model_id: str, log) -> None:
@@ -156,13 +213,23 @@ def main() -> int:
     from csf.distributed import barrier, cleanup, init_distributed
     from csf.logging_utils import RunState, setup_logging, stage
 
-    dist_info = init_distributed()
+    # Bind the driver to a GPU the run is actually allowed to use. On a shared box GPU 0 often
+    # belongs to something else, and a single-process run has no LOCAL_RANK to take the hint from.
+    driver_gpu = cfg.generation.driver_gpu
+    if driver_gpu is None and cfg.generation.enabled and cfg.generation.gpus:
+        driver_gpu = cfg.generation.gpus[0]
+    dist_info = init_distributed(device_index=driver_gpu)
     work_dir = cfg.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     log = setup_logging(work_dir, dist_info.rank, cfg.debug)
     log.info("Run '%s' | mode=%s | config=%s | rank %d/%d | device %s", cfg.run_name, cfg.mode, args.config,
              dist_info.rank, dist_info.world_size, dist_info.device)
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        log.warning("CUDA_VISIBLE_DEVICES=%s is set, so GPU ids inside this process are indices "
+                    "into that list, not physical ids. generation.gpus=%s will be interpreted "
+                    "that way too. Unset it if you meant physical ids.",
+                    os.environ["CUDA_VISIBLE_DEVICES"], cfg.generation.gpus)
     if dist_info.is_main:
         cfg.save(work_dir / "resolved_config.json")
 
@@ -198,7 +265,7 @@ def main() -> int:
 
     with stage("preflight", work_dir, dist_info.rank):
         if dist_info.is_main:
-            preflight(cfg, dist_info, log)
+            preflight(cfg, dist_info, log, selected)
             if any(s in selected for s in ("train_llama", "outcomes", "latency")):
                 check_gated_access(cfg.models.llama_id, log)
         barrier()
