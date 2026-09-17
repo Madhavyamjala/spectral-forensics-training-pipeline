@@ -227,6 +227,66 @@ python -m csf.generation.budget --hours 84 --gpus 3      # 18 models, 18,941 vid
 This is preferred over `deadline_hours`, which stops whichever group is in flight when it fires
 and so shapes the dataset by scheduling order. `deadline_hours` remains as a hard backstop.
 
+## 2d. Progress, timing and resuming
+
+Every long stage reports progress. With a terminal attached you get a `tqdm` bar; redirected or
+under `nohup` you get the same information as periodic log lines, because a carriage-return bar
+in a log file is useless. `CSF_NO_PROGRESS=1` silences both.
+
+The environment build is the one that used to look frozen: it spends most of its time inside a
+single `pip install torch`, and the output was buffered until the command finished. It now
+streams, announces each step, and shows a heartbeat with elapsed time and the last line pip
+printed:
+
+```
+Building environment 'sam2_diffusers' | 7 step(s). The torch install alone usually takes
+5-20 minutes; each step streams its output below.
+[sam2_diffusers  step 3/7] installing torch==2.4.1 (several GB)
+  [  4m12s] installing torch==2.4.1 (several GB) - Downloading torch-2.4.1-cp312...whl (797 MB)
+```
+
+### How long each phase takes
+
+Per environment, on a reasonable connection:
+
+| Step | Time |
+|---|---|
+| venv + pip bootstrap | under a minute |
+| `pip install torch` (envs that need it) | 5–20 min, dominated by ~2.5 GB of wheels |
+| other requirements | 1–5 min |
+| git clones | seconds to a minute |
+| weight downloads | 1–15 min depending on the checkpoint |
+
+There are 18 environments, but only the ones your run touches are built, and they are built on
+first use. `bash scripts/run_regen.sh --envs` does them all up front (2–4 h); `--status` shows
+which are ready.
+
+Whole-run figures:
+
+| Phase | 200-video smoke | Full 33,333 on 4 GPUs |
+|---|---|---|
+| environments | 15–45 min (2 envs) | 2–4 h (all 18) |
+| prefetch | 5–15 min | 1–2 h (~115 GB) |
+| kinetics: download | minutes if cached | 8–20 h |
+| kinetics: scoring | 1–3 min | 1–3 h |
+| generate | 20–60 min | ~3.9 days |
+| regen_manifest | under a minute | 20–40 min (probe + hash every file) |
+
+### Stopping and restarting
+
+Every stage resumes. Stop with Ctrl-C and re-run the same command:
+
+| What | Resumes by |
+|---|---|
+| environment build | a readiness marker per env; an interrupted build re-runs its pip steps, but pip skips what is already installed, so it is fast the second time |
+| Kinetics download | counting clips already on disk, plus a ledger of consumed shards |
+| clip scoring | `clip_features.csv`, checkpointed every 500 clips |
+| generation | `ledger.jsonl`, appended per video, so a run that dies at 20,000 resumes at 20,001 |
+| manifest / metadata | rebuilt from the ledger, cheap to redo |
+
+Completed stages are also recorded in `runs/<run>/state.json` and skipped on the next run; use
+`--force <stage>` to redo one deliberately.
+
 ## 3. Hardware assumptions
 
 Written for `tfgpu.cs.fiu.edu`: 6 × H200 NVL (143 GB). The default config uses **GPUs 1–4**,

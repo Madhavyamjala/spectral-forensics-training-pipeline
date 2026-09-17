@@ -17,6 +17,7 @@ import os
 import random
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -770,12 +771,58 @@ def test_worker_inputs() -> None:
     print(f"       {len(by_renderer)} renderers, {len(jobs):,} jobs checked")
 
 
+def test_progress() -> None:
+    """Long stages must show they are alive, and keep working without a terminal."""
+    print("progress reporting")
+    import inspect
+
+    from csf.generation import progress as P
+
+    check("duration formatting is human", P._fmt_duration(75) == "1m15s"
+          and P._fmt_duration(3725) == "1h02m", P._fmt_duration(3725))
+
+    with P.bar(10, "unit test", "item", log_every=1000) as handle:
+        for _ in range(10):
+            handle.update(1)
+        handle.set_postfix_str("x")
+        check("the bar counts", getattr(handle, "n", 10) == 10)
+
+    proc = P.run_streaming(["bash", "-c", "echo first; echo second"], desc="stub")
+    check("run_streaming returns the exit status", proc.returncode == 0)
+    check("run_streaming keeps a tail for error reporting", "second" in proc.stdout)
+    proc = P.run_streaming(["bash", "-c", "echo boom >&2; exit 3"], desc="stub")
+    check("a failing command reports its status and output",
+          proc.returncode == 3 and "boom" in proc.stdout)
+
+    with P.Heartbeat("stub", interval=0.05) as beat:
+        beat.set_status("working")
+        time.sleep(0.15)
+    check("the heartbeat tracks elapsed time", beat.elapsed > 0)
+
+    # the stages a long run spends its time in must all report progress
+    from csf.generation import envs, filters, kinetics, manifest_build, prefetch, scheduler
+    for module, name in ((envs, "envs"), (filters, "filters"), (kinetics, "kinetics"),
+                         (manifest_build, "manifest_build"), (prefetch, "prefetch"),
+                         (scheduler, "scheduler")):
+        src = inspect.getsource(module)
+        check(f"{name} reports progress",
+              "progress.bar" in src or "progress_ui.bar" in src or "progress.track" in src
+              or "Heartbeat" in src or "run_streaming" in src)
+
+    check("the environment build streams rather than buffering",
+          "run_streaming" in inspect.getsource(envs._run))
+    check("clip scoring checkpoints so it can resume",
+          "checkpoint()" in inspect.getsource(filters.score_pool))
+    check("progress can be silenced for headless runs",
+          "CSF_NO_PROGRESS" in inspect.getsource(P))
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
                test_kinetics_schema, test_attribution, test_metadata,
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
-               test_ffmpeg_resolution, test_worker_inputs):
+               test_ffmpeg_resolution, test_worker_inputs, test_progress):
         fn()
     print()
     if FAILURES:

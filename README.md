@@ -274,6 +274,15 @@ Everything is resumable, so re-running the same command picks up where it stoppe
 **Expected wall clock** on 4 × H200: prefetch 1–2 h, environments 2–4 h, Kinetics 8–20 h,
 generation ~3.9 days, feature extraction 8–14 h, training + eval 1.5–2.5 days.
 
+Every long stage shows a progress bar (or periodic log lines when output is redirected), and the
+environment build streams pip's output with a heartbeat so a 15-minute torch install is visibly
+working rather than apparently hung. `CSF_NO_PROGRESS=1` turns it off.
+
+**Everything resumes.** Stop with Ctrl-C and re-run the same command: environments keep what pip
+already installed, Kinetics counts the clips on disk, clip scoring checkpoints every 500 clips,
+and generation resumes from its per-video ledger. See
+[docs/REGENERATION.md](docs/REGENERATION.md) for the details.
+
 ### Smoke tests at a glance
 
 | Command | Needs | Time | Checks |
