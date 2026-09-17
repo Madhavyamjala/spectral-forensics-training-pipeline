@@ -1135,6 +1135,65 @@ def test_env_interpreter() -> None:
           env_specs()["sam2_diffusers"].torch.startswith("torch==2.5.1"),
           env_specs()["sam2_diffusers"].torch)
 
+    # burning: only registered environments, nothing else living under the envs root
+    from csf.generation.envs import burn_envs
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name in ("insightface", "sam2_diffusers", "not_an_env"):
+            (root / name / "venv").mkdir(parents=True)
+            (root / name / "venv" / "blob").write_bytes(b"x" * 1024)
+        specs = list(env_specs().values())
+        freed = burn_envs(specs, root, keep=("sam2_diffusers",))
+        check("burn removes a registered env", "insightface" in freed
+              and not (root / "insightface").exists())
+        check("burn honours keep", (root / "sam2_diffusers").exists())
+        check("burn leaves unregistered directories alone", (root / "not_an_env").exists())
+        check("burn on an empty root is a no-op", burn_envs(specs, root / "nope") == {})
+
+    # a Git LFS pointer is not a checkpoint
+    from csf.generation.envs import WeightFile, _is_lfs_pointer, _staged_file
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp)
+        (staged / "real.pth").write_bytes(b"\x80\x02}q\x00." * 100)
+        (staged / "pointer.pth").write_text(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 164535938\n")
+        check("a real checkpoint is not mistaken for a pointer",
+              not _is_lfs_pointer(staged / "real.pth"))
+        check("an LFS pointer is recognised", _is_lfs_pointer(staged / "pointer.pth"))
+        found = _staged_file(WeightFile(dest="w/real.pth", staged_name="real.pth"), staged, "e")
+        check("a staged checkpoint is found by name", found == staged / "real.pth")
+        try:
+            _staged_file(WeightFile(dest="w/p.pth", staged_name="pointer.pth"), staged, "e")
+            check("an LFS pointer is refused", False, "no error raised")
+        except Exception as exc:
+            check("an LFS pointer is refused with the git lfs pull remedy",
+                  "git lfs pull" in str(exc), str(exc)[:100])
+        try:
+            _staged_file(WeightFile(dest="w/x.pth", staged_name="absent.pth",
+                                    where="https://example.invalid"), staged, "e")
+            check("a missing staged file is refused", False, "no error raised")
+        except Exception as exc:
+            check("a missing staged file names its source and what is present",
+                  "example.invalid" in str(exc) and "real.pth" in str(exc), str(exc)[:120])
+
+    # the insightface env must end up with the GPU runtime and headless OpenCV, not the CPU
+    # runtime and full OpenCV that insightface 2.0 depends on
+    ins = env_specs()["insightface"]
+    hook = " ".join(" ".join(c) for c in ins.post_install)
+    check("insightface installs without a compiler", "insightface==2.0" in ins.requirements)
+    check("the CPU runtime is replaced with onnxruntime-gpu",
+          "uninstall" in hook and "onnxruntime-gpu" in hook)
+    check("full OpenCV is replaced with the headless build",
+          "opencv-python'" in hook and "opencv-python-headless" in hook)
+    check("the swap is verified by the import check",
+          {"onnxruntime", "cv2"} <= set(ins.checks()))
+
+    sad = " ".join(" ".join(c) for c in env_specs()["sadtalker"].post_install)
+    check("basicsr's removed torchvision import is patched",
+          "functional_tensor" in sad and "basicsr.data.degradations" in sad)
+    check("the patch runs before SadTalker's own downloader",
+          sad.index("functional_tensor") < sad.index("download_models.sh"))
+
     body = inspect.getsource(_venv_python).split('"""')[-1]      # skip the docstring's prose
     check("the interpreter path is never resolved through its symlink",
           ".resolve()" not in body and "os.path.abspath" in body)

@@ -247,6 +247,13 @@ def stage_generate(cfg) -> Dict[str, object]:
                     "research-only weights (REFace) are enabled, and the videos they produce "
                     "inherit that restriction.")
 
+    if gen.burn_envs:
+        from csf.generation.adapters import env_specs
+        from csf.generation.envs import burn_envs
+        log.warning("generation.burn_envs is set: deleting every built environment under %s "
+                    "before generating. Each one will be rebuilt from scratch.", gen.envs_root)
+        burn_envs(list(env_specs().values()), Path(gen.envs_root))
+
     root = _check_video_root(cfg)
     log_dir = Path(cfg.paths.work_dir) / "logs" / "generation"
     scheduler = GenerationScheduler(

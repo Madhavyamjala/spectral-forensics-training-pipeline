@@ -324,6 +324,24 @@ dataset card carries the required credit, licence link and statement of changes 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.
 
+### Rebuilding the model environments from scratch
+
+The per-model environments repair themselves — a broken venv is detected and recreated, and a
+changed spec rebuilds — so this is only for when you want a guaranteed-clean install: an
+interrupted build, a hand-modified env, or proving the whole install path works.
+
+```bash
+# delete every built environment, then rebuild them all
+python -m csf.generation.envs --burn all --build all --envs-root cache/regen/envs
+
+# or as part of a run (one-off; do not leave it in a config file)
+python main.py --config configs/regen.yaml --stage generate --set generation.burn_envs=true
+```
+
+Only directories named after a registered environment are deleted, and the log names each one
+with the space it frees. Everything is re-downloaded afterwards — torch, requirements and
+checkpoints — so expect tens of GB.
+
 ### Checkpoints you have to stage by hand
 
 Six checkpoints are hosted on Google Drive / Tsinghua Cloud and cannot be fetched unattended.

@@ -193,6 +193,11 @@ class GenerationConfig:
     #: Cloud, OneDrive). Download them once by hand, drop them in this folder under the exact
     #: filename the adapter expects, and the env build copies them into place.
     staged_weights_dir: str = "./model_paths"
+    #: Delete every built per-model environment before generating, so they are recreated from
+    #: scratch. Destructive and expensive - it re-downloads torch, every requirement and every
+    #: checkpoint - so it is meant as `--set generation.burn_envs=true` for a one-off clean
+    #: rebuild, not as a standing setting in a config file.
+    burn_envs: bool = False
     keep_old_edited: bool = False
     only_models: List[str] = field(default_factory=list)      # restrict the run to these models
     skip_models: List[str] = field(default_factory=list)

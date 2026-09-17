@@ -30,11 +30,17 @@ source. `csf/generation/upload.py` writes this attribution into the dataset card
 
 ## Model weights
 
-The manipulation models carry their own licences, which are not all the same. Two need attention:
+The manipulation models carry their own licences, which are not all the same. Three need
+attention:
 
 - **REFace** — code is MIT, but its checkpoint is trained on CelebAMask-HQ and is restricted to
   **non-commercial research**. Videos it generates inherit that restriction. Disabled unless
   `generation.accept_noncommercial: true`.
+- **InsightFace** — the library is MIT, but upstream states that *the pretrained models provided
+  with this library are for non-commercial research only, whether downloaded automatically or
+  manually*. That covers `buffalo_l` and `inswapper_128`, so it reaches further than one model:
+  the face-swap videos produced with INSwapper **and** the face / mouth qualification scores the
+  `kinetics` stage computes with `buffalo_l` both rest on non-commercial weights.
 - **Llama-3.2-11B-Vision-Instruct** — gated; accept the licence on its model page before use.
 
 `python -m csf.generation.adapters` lists every model with its environment and notes.

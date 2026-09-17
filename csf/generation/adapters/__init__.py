@@ -42,11 +42,25 @@ ENVS: Dict[str, EnvSpec] = {
     "insightface": EnvSpec(
         name="insightface",
         torch="",                                   # onnxruntime does the work; no torch needed
-        requirements=("insightface==0.7.3", "onnxruntime-gpu==1.18.1", "opencv-python-headless",
-                      "numpy<2", "imageio[ffmpeg]", "tqdm"),
+        # 2.0 ships a pure-Python wheel (no compiler, unlike the 0.7.3 sdist) and keeps the
+        # FaceAnalysis / model_zoo API this worker uses. It depends on the CPU `onnxruntime`
+        # and on `opencv-python`, both of which install the same import name as the GPU runtime
+        # and the headless OpenCV we want - so the post-install step performs the replacement
+        # upstream documents, which must be repeated after any insightface install or upgrade.
+        requirements=("insightface==2.0", "numpy<2", "imageio[ffmpeg]", "tqdm"),
+        post_install=(("-c",
+                       "import subprocess,sys;"
+                       "subprocess.run([sys.executable,'-m','pip','uninstall','-y',"
+                       "'onnxruntime','opencv-python'],check=False);"
+                       "subprocess.run([sys.executable,'-m','pip','install',"
+                       "'onnxruntime-gpu==1.18.1','opencv-python-headless'],check=True)"),),
+        verify_imports=("insightface", "onnxruntime", "cv2", "numpy", "imageio"),
         weights=(WeightFile(dest="weights/inswapper_128.onnx",
                             hf_repo="ezioruan/inswapper_128.onnx", hf_file="inswapper_128.onnx"),),
-        note="INSwapper 128 + buffalo_l detection/recognition.",
+        note="INSwapper 128 + buffalo_l detection/recognition. LICENCE: the library is MIT, but "
+             "InsightFace's pretrained models - buffalo_l included, and inswapper_128 which "
+             "derives from them - are NON-COMMERCIAL RESEARCH ONLY. Videos produced here, and "
+             "the face/mouth scores the kinetics stage computes with buffalo_l, inherit that.",
     ),
 
     # --- background: SAM2 segmentation + diffusers generators ---------------------------
@@ -190,8 +204,25 @@ ENVS: Dict[str, EnvSpec] = {
                       "scipy", "yacs", "pydub", "kornia", "face-alignment", "safetensors",
                       "basicsr", "facexlib", "gfpgan", "tqdm"),
         repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),),
-        post_install=(("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
-                             "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),),
+        post_install=(
+            # basicsr 1.4.2 imports torchvision.transforms.functional_tensor, deprecated in
+            # torchvision 0.15 and removed in 0.17 - this env pins 0.19.1, so importing basicsr
+            # raises ModuleNotFoundError before SadTalker runs a single frame. The function it
+            # wants (rgb_to_grayscale) moved to torchvision.transforms.functional unchanged, so
+            # the fix is to rewrite the import in the installed copy. Upstream basicsr is
+            # unmaintained, so there is no release to upgrade to.
+            ("-c",
+             "import importlib.util,pathlib;"
+             "spec=importlib.util.find_spec('basicsr.data.degradations');"
+             "p=pathlib.Path(spec.origin) if spec and spec.origin else None;"
+             "t=p.read_text() if p else '';"
+             "p.write_text(t.replace('torchvision.transforms.functional_tensor',"
+             "'torchvision.transforms.functional')) if p and 'functional_tensor' in t else None;"
+             "print('basicsr import patched' if p and 'functional_tensor' in t "
+             "else 'basicsr needs no patch')"),
+            ("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
+                   "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),
+        ),
         hub_repos=(),   # its downloader pulls from GitHub Releases, not the Hub
         note="Apache-2.0 (non-commercial restriction was removed upstream). Its own "
              "download_models.sh pulls every checkpoint from GitHub Releases.",

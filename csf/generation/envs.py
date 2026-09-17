@@ -377,6 +377,20 @@ def _verify_imports(py: Path, modules: Sequence[str], label: str) -> None:
             f"effect; rebuild with --force.")
 
 
+def _is_lfs_pointer(path: Path) -> bool:
+    """Whether a file is a Git LFS pointer rather than the content it stands for.
+
+    Staging checkpoints through LFS is a sensible way to share them, but a clone without
+    `git lfs pull` leaves ~130 bytes of text where the weights should be. Copied into place it
+    fails much later, inside torch.load, with an error about a corrupt archive.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(64).startswith(b"version https://git-lfs.github.com/spec/v1")
+    except OSError:
+        return False
+
+
 def _staged_file(weight: WeightFile, staged_dir: Optional[Path], env_name: str) -> Path:
     """Locate a manually downloaded checkpoint, or explain precisely how to supply it."""
     name = weight.staged_name or Path(weight.dest).name
@@ -391,6 +405,11 @@ def _staged_file(weight: WeightFile, staged_dir: Optional[Path], env_name: str) 
     candidates = [staged_dir / name, *sorted(staged_dir.glob(f"*/{name}"))]
     for candidate in candidates:
         if candidate.is_file() and candidate.stat().st_size > 0:
+            if _is_lfs_pointer(candidate):
+                raise EnvBuildError(
+                    f"Env '{env_name}': {candidate} is a Git LFS pointer, not the checkpoint - "
+                    f"it is {candidate.stat().st_size} bytes of text. Fetch the real file with "
+                    f"`git lfs install && git lfs pull` in the repository, then build again.")
             return candidate
     present = sorted(p.name for p in staged_dir.glob("*") if p.is_file()) \
         if staged_dir.is_dir() else []
@@ -568,6 +587,41 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
     return ReadyEnv(spec, root, py, repos)
 
 
+def burn_envs(specs: Sequence[EnvSpec], envs_root: Path,
+              keep: Sequence[str] = ()) -> Dict[str, float]:
+    """Delete the environments under `envs_root` so the next build recreates them from scratch.
+
+    Rebuilding in place is usually enough - the readiness marker is keyed by the spec digest, and
+    a broken venv is detected and recreated. This is for the case where that is not enough:
+    half-installed packages from an interrupted build, an env whose torch was swapped underneath
+    it, or simply wanting to prove the whole install path works end to end on a fresh machine.
+
+    Only directories named after a registered environment are removed, so anything else living
+    under `envs_root` is left alone, and the returned sizes let the caller report what the
+    rebuild will have to download again.
+    """
+    envs_root = Path(envs_root)
+    known = {spec.name for spec in specs} - set(keep)
+    removed: Dict[str, float] = {}
+    if not envs_root.is_dir():
+        log.info("Nothing to burn: %s does not exist", envs_root)
+        return removed
+    for child in sorted(envs_root.iterdir()):
+        if not child.is_dir() or child.name not in known:
+            continue
+        gb = sum(f.stat().st_size for f in child.rglob("*") if f.is_file()) / 2 ** 30
+        log.warning("Burning environment '%s' (%.1f GiB) at %s", child.name, gb, child)
+        shutil.rmtree(child, ignore_errors=True)
+        removed[child.name] = round(gb, 2)
+    if removed:
+        log.warning("Burned %d environment(s), freeing %.1f GiB. They will be rebuilt on demand, "
+                    "which re-downloads torch, the requirements and every checkpoint.",
+                    len(removed), sum(removed.values()))
+    else:
+        log.info("Nothing to burn under %s", envs_root)
+    return removed
+
+
 def env_status(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, str]:
     """"ready" / "stale" / "missing" per env, without building anything."""
     out: Dict[str, str] = {}
@@ -648,6 +702,9 @@ def _main() -> int:
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--doctor", default="", help="env or adapter name, or 'all': check what is "
                                                  "actually installed in each built env")
+    ap.add_argument("--burn", default="", help="env or adapter name, or 'all': delete the built "
+                                               "environment(s) so they are recreated from "
+                                               "scratch. Combine with --build to rebuild now.")
     args = ap.parse_args()
 
     specs = env_specs()
@@ -659,6 +716,17 @@ def _main() -> int:
         if name in specs:
             return [specs[name]]
         return [specs[ADAPTERS[name].env_name]] if name in ADAPTERS else []
+
+    if args.burn:
+        wanted = _select(args.burn)
+        if not wanted:
+            print(f"Unknown env/adapter {args.burn!r}. Known envs: {sorted(specs)}")
+            return 2
+        freed = burn_envs(wanted, root)
+        for name, gb in sorted(freed.items()):
+            print(f"burned  {name}  ({gb} GiB)")
+        if not args.build:
+            return 0
 
     if args.doctor:
         wanted = _select(args.doctor)
