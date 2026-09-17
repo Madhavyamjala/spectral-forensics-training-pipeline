@@ -149,13 +149,16 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
         log.warning("CUDA is NOT available - training will run on CPU (only sensible for tiny smoke tests).")
 
     if cfg.generation.enabled and selected & set(GENERATION_STAGES):
-        info["ffmpeg"] = bool(_shutil.which("ffmpeg")) and bool(_shutil.which("ffprobe"))
-        if not info["ffmpeg"]:
+        from csf.generation.ffmpeg_tools import INSTALL_HINT, describe, ffprobe_exe, have_ffmpeg
+        info.update(describe())
+        if not have_ffmpeg():
             raise RuntimeError(
-                "ffmpeg and ffprobe must be on PATH for the generation stages - every worker "
-                "encodes with them, and the manifest stage probes each produced file.\n"
-                "    Linux:   sudo apt install ffmpeg\n"
-                "    Windows: winget install Gyan.FFmpeg")
+                "No ffmpeg binary could be found, and every generation worker encodes with it.\n"
+                + INSTALL_HINT)
+        if ffprobe_exe() is None:
+            log.warning("ffprobe was not found (imageio-ffmpeg ships ffmpeg without it). "
+                        "Container metadata will be parsed from ffmpeg instead, which is "
+                        "slightly less precise but sufficient.")
         _check_generation_gpus(cfg, log)
 
     free_gb = _shutil.disk_usage(Path(cfg.paths.cache_dir).resolve().anchor).free / 2**30

@@ -150,23 +150,24 @@ def probe_video(path: Path) -> Optional[Dict[str, object]]:
     """
     global _FFPROBE_WARNED
 
-    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
-           str(path)]
+    from csf.generation.ffmpeg_tools import INSTALL_HINT, ffprobe_exe, probe_with_ffmpeg
+
+    exe = ffprobe_exe()
     info = None
-    try:
-        out = subprocess.run(cmd, capture_output=True, timeout=60, check=True).stdout
-        info = json.loads(out)
-    except FileNotFoundError:
+    if exe is None:
         if not _FFPROBE_WARNED:
             _FFPROBE_WARNED = True
-            log.warning("ffprobe is not on PATH - falling back to OpenCV for container metadata. "
-                        "Codec, bitrate and audio presence will be recorded as unknown, and the "
-                        "generation workers need ffmpeg to encode, so install it before running "
-                        "the 'generate' stage:\n"
-                        "    Linux:  sudo apt install ffmpeg   (or: conda install -c conda-forge ffmpeg)\n"
-                        "    Windows: winget install Gyan.FFmpeg")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        info = None
+            log.warning("ffprobe was not found - container metadata will come from ffmpeg or "
+                        "OpenCV instead, so codec/bitrate/audio may be recorded as unknown. The "
+                        "generation workers still need ffmpeg to encode.\n%s", INSTALL_HINT)
+    else:
+        try:
+            out = subprocess.run([exe, "-v", "error", "-print_format", "json", "-show_format",
+                                  "-show_streams", str(path)],
+                                 capture_output=True, timeout=60, check=True).stdout
+            info = json.loads(out)
+        except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+            info = None
 
     if info is not None:
         video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
@@ -188,6 +189,10 @@ def probe_video(path: Path) -> Optional[Dict[str, object]]:
                     "bitrate": int(info.get("format", {}).get("bit_rate") or 0),
                     "has_audio": audio, "probe": "ffprobe"}
 
+    # ffmpeg carries the same stream details on stderr; imageio-ffmpeg ships it without ffprobe
+    via_ffmpeg = probe_with_ffmpeg(path)
+    if via_ffmpeg is not None:
+        return via_ffmpeg
     return _probe_with_opencv(path)
 
 

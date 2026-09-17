@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -141,7 +142,7 @@ def write_video(frames: Sequence[np.ndarray], path: str, fps: float = 25.0,
                 for f in frames]
 
     if _have_ffmpeg():
-        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+        cmd = [ffmpeg_exe(), "-y", "-loglevel", "error",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
                "-r", f"{fps:.4f}", "-i", "pipe:0"]
         if audio_from and Path(audio_from).exists():
@@ -171,26 +172,75 @@ def write_video(frames: Sequence[np.ndarray], path: str, fps: float = 25.0,
     return path
 
 
-_FFMPEG: Optional[bool] = None
+_FFMPEG_EXE: Optional[str] = None
+_FFPROBE_EXE: Optional[str] = None
+_RESOLVED = False
+
+
+def _resolve_ffmpeg() -> None:
+    """Find ffmpeg/ffprobe once per worker.
+
+    Mirrors `csf.generation.ffmpeg_tools`, which workers cannot import - they run inside the
+    model's own environment, where `csf` is not installed. The `imageio-ffmpeg` fallback matters:
+    every adapter env already installs `imageio[ffmpeg]`, so a static ffmpeg is present even when
+    the machine has none on PATH and conda is unusable.
+    """
+    global _FFMPEG_EXE, _FFPROBE_EXE, _RESOLVED
+    if _RESOLVED:
+        return
+    _RESOLVED = True
+
+    def usable(path):
+        if not path:
+            return None
+        p = Path(str(path))
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+        return shutil.which(str(path))
+
+    for cand in (os.environ.get("CSF_FFMPEG"), shutil.which("ffmpeg")):
+        _FFMPEG_EXE = usable(cand)
+        if _FFMPEG_EXE:
+            break
+    if not _FFMPEG_EXE:
+        try:
+            import imageio_ffmpeg
+            _FFMPEG_EXE = usable(imageio_ffmpeg.get_ffmpeg_exe())
+            if _FFMPEG_EXE:
+                note(f"using the ffmpeg bundled with imageio-ffmpeg: {_FFMPEG_EXE}")
+        except Exception:                      # noqa: BLE001 - optional dependency
+            _FFMPEG_EXE = None
+
+    for cand in (os.environ.get("CSF_FFPROBE"), shutil.which("ffprobe")):
+        _FFPROBE_EXE = usable(cand)
+        if _FFPROBE_EXE:
+            break
+    if not _FFPROBE_EXE and _FFMPEG_EXE:
+        _FFPROBE_EXE = usable(str(Path(_FFMPEG_EXE).with_name("ffprobe")))
+
+
+def ffmpeg_exe() -> Optional[str]:
+    """Path to an ffmpeg binary, or None."""
+    _resolve_ffmpeg()
+    return _FFMPEG_EXE
+
+
+def ffprobe_exe() -> Optional[str]:
+    """Path to an ffprobe binary, or None (imageio-ffmpeg does not ship one)."""
+    _resolve_ffmpeg()
+    return _FFPROBE_EXE
 
 
 def _have_ffmpeg() -> bool:
-    """Return whether the ffmpeg executable is available."""
-    global _FFMPEG
-    if _FFMPEG is None:
-        try:
-            subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=20, check=True)
-            _FFMPEG = True
-        except (OSError, subprocess.SubprocessError):
-            _FFMPEG = False
-    return _FFMPEG
+    """Return whether an ffmpeg executable could be located."""
+    return ffmpeg_exe() is not None
 
 
 def extract_audio(video_path: str, out_wav: str, sample_rate: int = 16000) -> Optional[str]:
     """Pull a mono wav out of a clip; returns None when the clip has no audio track."""
     if not _have_ffmpeg():
         return None
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vn",
+    cmd = [ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(video_path), "-vn",
            "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", "1", str(out_wav)]
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0 or not Path(out_wav).exists() or Path(out_wav).stat().st_size < 1024:
@@ -199,13 +249,23 @@ def extract_audio(video_path: str, out_wav: str, sample_rate: int = 16000) -> Op
 
 
 def has_audio(video_path: str) -> bool:
-    """Return whether the video contains an audio stream."""
-    if not _have_ffmpeg():
+    """Return whether the video contains an audio stream.
+
+    Uses ffprobe when present, otherwise ffmpeg's own stream listing - imageio-ffmpeg ships
+    ffmpeg but no ffprobe, and the lip-sync family depends on this check.
+    """
+    probe = ffprobe_exe()
+    if probe:
+        proc = subprocess.run([probe, "-v", "error", "-select_streams", "a", "-show_entries",
+                               "stream=index", "-of", "csv=p=0", str(video_path)],
+                              capture_output=True, text=True)
+        return bool(proc.stdout.strip())
+    exe = ffmpeg_exe()
+    if not exe:
         return False
-    proc = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
-                           "stream=index", "-of", "csv=p=0", str(video_path)],
+    proc = subprocess.run([exe, "-hide_banner", "-i", str(video_path)],
                           capture_output=True, text=True)
-    return bool(proc.stdout.strip())
+    return "Audio:" in ((proc.stderr or "") + (proc.stdout or ""))
 
 
 def run_cmd(cmd: Sequence[str], cwd: Optional[str] = None, timeout: int = 1800) -> str:
