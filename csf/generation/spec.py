@@ -602,16 +602,63 @@ def family_pipelines(family: Family, allowed: Optional[Set[str]] = None) -> List
     return kept
 
 
-def family_matrix(family: Family, target: int, allowed: Optional[Set[str]] = None
+def capability_weights(family: Family, pipelines: Sequence[Pipeline],
+                       capabilities: Optional[Dict[str, Sequence[str]]]
+                       ) -> Optional[List[float]]:
+    """Column weights derived from which pipeline can render which variant, or None.
+
+    The document assigns each family's videos to its models by a fixed weight, and separately
+    assigns manipulation types (variants) by another. That works only while every model can
+    perform every variant. In the expression family it cannot: StyleGANEX publishes one
+    checkpoint per editing direction and only age and hair colour exist for video, while
+    LivePortrait retargets an existing face and can do none of those. Splitting 50/50 by model
+    therefore forces roughly half the family's videos into two of its nine variants.
+
+    So when the runnable pipelines differ in what they support, the split follows variant demand
+    instead: each variant's weight is shared among the pipelines that can render it, and a
+    pipeline's column weight is the sum of its shares. The family total and its source-group mix
+    are untouched - only the per-model split moves - and the realised variant distribution then
+    matches the document's, renormalised over the variants some model can actually produce.
+
+    Returns None when the rule does not apply (no variants, no declarations, or every pipeline
+    supports the same set), leaving the document's own weights in force.
+    """
+    if not family.variants or not capabilities:
+        return None
+    every = tuple(name for name, _ in family.variants)
+    supported = {p.key: tuple(capabilities.get(p.key) or every) for p in pipelines}
+    if len({frozenset(v) for v in supported.values()}) <= 1:
+        return None                     # uniform capability: the document's weights still hold
+
+    weights = dict(family.variants)
+    out = []
+    for pipe in pipelines:
+        share = 0.0
+        for variant in every:
+            capable = [p for p in pipelines if variant in supported[p.key]]
+            if capable and variant in supported[pipe.key]:
+                share += weights[variant] / len(capable)
+        out.append(share)
+    return out if sum(out) > 0 else None
+
+
+def family_matrix(family: Family, target: int, allowed: Optional[Set[str]] = None,
+                  capabilities: Optional[Dict[str, Sequence[str]]] = None
                   ) -> Tuple[List[int], List[int], List[List[int]]]:
     """(row totals, column totals, cells) for one family scaled to `target` videos.
 
     With `allowed`, the target is redistributed across only those pipelines, so the family still
     produces `target` videos even though some of its models cannot be run.
+
+    With `capabilities` (pipeline key -> the variants it can render), the per-model split follows
+    variant demand wherever the pipelines differ in what they support; see `capability_weights`.
+    Without it the document's own pipeline weights are used, so every existing caller - and the
+    document plan itself - is unaffected.
     """
     pipelines = family_pipelines(family, allowed)
     rows = apportion(target, [g.weight for g in family.source_groups])
-    cols = apportion(target, [p.weight for p in pipelines])
+    derived = capability_weights(family, pipelines, capabilities)
+    cols = apportion(target, derived if derived else [p.weight for p in pipelines])
     return rows, cols, cross_split(rows, cols)
 
 

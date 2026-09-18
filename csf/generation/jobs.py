@@ -176,6 +176,17 @@ def object_operations(target: int, allowed: Optional[Set[str]] = None) -> Dict[s
     return out
 
 
+def model_capabilities() -> Dict[str, Sequence[str]]:
+    """Which family variants each registered model can genuinely render.
+
+    Read from the adapter registry rather than the spec, because it is a property of the code
+    and weights that exist, not of the document. Models that declare nothing support everything.
+    """
+    from csf.generation.adapters import ADAPTERS
+
+    return {key: adapter.variants for key, adapter in ADAPTERS.items() if adapter.variants}
+
+
 def variant_pools(family, capacity: Dict[str, int], seed: int) -> Dict[str, List[str]]:
     """Per-pipeline variant pools that respect what each renderer can actually produce.
 
@@ -195,25 +206,31 @@ def variant_pools(family, capacity: Dict[str, int], seed: int) -> Dict[str, List
     from csf.generation.adapters import ADAPTERS
 
     names = [n for n, _ in family.variants]
+    weights = dict(family.variants)
     total = sum(capacity.values())
-    target = dict(zip(names, S.apportion(total, [float(w) for _, w in family.variants])))
     supports = {m: [v for v in names
                     if not (ADAPTERS[m].variants if m in ADAPTERS else ())
                     or v in ADAPTERS[m].variants]
                 for m in capacity}
 
+    # A variant no renderer supports cannot be produced at all, so the family's weights are
+    # renormalised over the rest: the target each variant is measured against is its document
+    # share of what is actually producible, not of the full list.
     orphans = [v for v in names if not any(v in supports[m] for m in capacity)]
+    producible = [v for v in names if v not in orphans]
+    target = dict(zip(producible,
+                      S.apportion(total, [float(weights[v]) for v in producible])))
     remaining = dict(target)
     pools: Dict[str, List[str]] = {}
     for model in sorted(capacity, key=lambda m: (len(supports[m]), m)):
         room, options = capacity[model], supports[model] or names
         # follow what these variants still need; once a variant is satisfied everywhere, fall
         # back to the family's original weights so the split stays meaningful
-        weights = [float(remaining.get(v, 0)) for v in options]
-        if sum(weights) <= 0:
-            weights = [float(dict(family.variants).get(v, 1)) for v in options]
+        share = [float(remaining.get(v, 0)) for v in options]
+        if sum(share) <= 0:
+            share = [float(weights.get(v, 1)) for v in options]
         pool: List[str] = []
-        for variant, n in zip(options, S.apportion(room, weights)):
+        for variant, n in zip(options, S.apportion(room, share)):
             pool.extend([variant] * n)
             remaining[variant] = max(0, remaining.get(variant, 0) - n)
         _rng(seed, family.key, "variants", model).shuffle(pool)
@@ -224,16 +241,15 @@ def variant_pools(family, capacity: Dict[str, int], seed: int) -> Dict[str, List
         for variant in pool:
             realised[variant] += 1
     if orphans:
-        log.warning("%s: no wired renderer can produce %s - the spec's %d video(s) for those "
-                    "went to variants that can be produced honestly. Wiring a model that "
-                    "supports them is the only way to get them back.", family.key,
-                    ", ".join(f"{v} ({target[v]})" for v in orphans),
-                    sum(target[v] for v in orphans))
-    drift = {v: (realised.get(v, 0), target[v]) for v in names
-             if abs(realised.get(v, 0) - target[v]) > max(5, 0.1 * target[v])}
+        log.warning("%s: no wired renderer can produce %s - its share is spread over the "
+                    "variants that can be produced, in the document's proportions. Wiring a "
+                    "model that supports it is the only way to get those videos back.",
+                    family.key, ", ".join(orphans))
+    drift = {v: (realised.get(v, 0), target[v]) for v in producible
+             if abs(realised.get(v, 0) - target[v]) > max(5, 0.02 * target[v])}
     if drift:
-        log.warning("%s: variant mix shifted because renderers differ in what they support "
-                    "(%s). Family totals are unchanged.", family.key,
+        log.warning("%s: the variant mix does not match the document's shares (%s). Family "
+                    "totals are unchanged.", family.key,
                     "; ".join(f"{v}: {got} vs {want} planned" for v, (got, want) in
                               sorted(drift.items())))
     return pools
@@ -400,7 +416,8 @@ def build_jobs(features: Sequence[Dict[str, object]], targets: Optional[Dict[str
     for family in S.FAMILY_LIST:
         target = targets[family.key]
         pipelines = S.family_pipelines(family, allowed_models)
-        rows, cols, grid = S.family_matrix(family, target, allowed_models)
+        rows, cols, grid = S.family_matrix(family, target, allowed_models,
+                                           capabilities=model_capabilities())
 
         # secondary breakdowns, drawn per family then consumed per cell
         pipeline_variants: Dict[str, List[str]] = {}
