@@ -1307,6 +1307,49 @@ def test_variant_capability() -> None:
     check("StyleGANEX calls the repo's real video-editing entry point",
           "video_editing.py" in sg and "--task" not in sg)
 
+    # the per-model split must follow variant demand where renderers differ, so the realised
+    # manipulation_type mix matches the document instead of being dictated by the model split
+    fam_expr = S.FAMILIES["expression_attribute_editing"]
+    caps = {k: a.variants for k, a in ADAPTERS.items() if a.variants}
+    doc_cols = S.family_matrix(fam_expr, 4750, allowed)[1]
+    cap_cols = S.family_matrix(fam_expr, 4750, allowed, capabilities=caps)[1]
+    check("capability weighting moves the model split", doc_cols != cap_cols,
+          f"{doc_cols} vs {cap_cols}")
+    check("the family still totals the same", sum(cap_cols) == sum(doc_cols) == 4750)
+    check("the model that supports fewer variants gets the smaller share",
+          cap_cols[[p.key for p in S.family_pipelines(fam_expr, allowed)].index("styleganex")]
+          < cap_cols[[p.key for p in S.family_pipelines(fam_expr, allowed)].index("ganimation")])
+
+    weights = dict(fam_expr.variants)
+    producible = [v for v in weights if v != "facial_attributes"]
+    want = dict(zip(producible, S.apportion(len(expr), [float(weights[v]) for v in producible])))
+    got = Counter(j.variant for j in expr)
+    worst = max(abs(got.get(v, 0) - want[v]) for v in want)
+    check("every producible variant lands on its document share (within rounding)", worst <= 2,
+          f"worst deviation {worst}: " + str({v: (got.get(v, 0), want[v]) for v in want}))
+    check("the variant with no renderer stays at zero", got.get("facial_attributes", 0) == 0)
+
+    # only families whose renderers differ may be re-weighted; everything else is untouched
+    for key in ("face_swap", "lip_sync", "video_inpainting", "object_insertion_removal",
+                "background_manipulation", "video_to_video", "facial_reenactment"):
+        fam = S.FAMILIES[key]
+        target = S.FAMILY_TARGETS[key]
+        check(f"{key}'s split is unchanged by capability weighting",
+              S.family_matrix(fam, target, allowed)[1]
+              == S.family_matrix(fam, target, allowed, capabilities=caps)[1])
+    check("a family with uniform capability keeps the document's weights",
+          S.capability_weights(S.FAMILIES["lip_sync"],
+                               S.family_pipelines(S.FAMILIES["lip_sync"], allowed), caps) is None)
+    # build_plan() is the document's own view and must stay that way: it passes no
+    # capabilities, so the printed plan still reproduces the proposal's per-model split
+    plan_cols = Counter()
+    for cell in S.build_plan(allowed=allowed):
+        if cell.family == "expression_attribute_editing":
+            plan_cols[cell.model] += cell.videos
+    check("build_plan keeps the document's per-model split",
+          [plan_cols[p.key] for p in S.family_pipelines(fam_expr, allowed)] == doc_cols,
+          f"{dict(plan_cols)} vs {doc_cols}")
+
     # family totals must survive the re-routing exactly
     fam = S.FAMILIES["expression_attribute_editing"]
     capacity = {"styleganex": 2250, "ganimation": 2500}

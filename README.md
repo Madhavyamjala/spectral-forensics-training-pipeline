@@ -324,6 +324,25 @@ dataset card carries the required credit, licence link and statement of changes 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.
 
+### How manipulation types are assigned
+
+Each family's videos carry a `manipulation_type` (the *variant*: a smile edit, an age edit, an
+object removal). Models are not interchangeable here — StyleGANEX publishes one checkpoint per
+editing direction and only age and hair colour exist for video, while LivePortrait retargets an
+existing face and can do neither. A video labelled `age` that LivePortrait produced would be
+mislabelled data, so adapters declare which variants they can genuinely render and the planner
+respects it.
+
+Where a family's models differ in what they support, the per-model split follows variant demand
+rather than the document's fixed model weights — otherwise a 50/50 model split would force half
+the expression family into two of its nine variants. Family totals and the source-group mix are
+untouched; only the split between models moves, and the realised variant mix then matches the
+document's shares. `python -m csf.generation.spec` still prints the document's own plan.
+
+One variant, `facial_attributes` (glasses), has no released renderer at all. Its share is spread
+over the variants that can be produced, and the run logs it — no video is ever labelled with a
+manipulation that was not performed.
+
 ### Rebuilding the model environments from scratch
 
 The per-model environments repair themselves — a broken venv is detected and recreated, and a
