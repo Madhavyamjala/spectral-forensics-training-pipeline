@@ -1211,7 +1211,34 @@ def test_env_interpreter() -> None:
                   ).digest()
           != EnvSpec(name="x", torch="").digest())
 
+    # nothing may require a C toolchain or Python.h: the cluster has neither
+    all_reqs = {n: sp.pip_requirements() for n, sp in env_specs().items()}
+    check("no env pins the insightface source distribution",
+          not any("insightface==0.7" in r for reqs in all_reqs.values() for r in reqs),
+          str([n for n, reqs in all_reqs.items() if any("0.7" in r for r in reqs)]))
+    check("dlib comes from the prebuilt wheel",
+          "dlib-bin" in all_reqs["stylegan"] and "dlib" not in all_reqs["stylegan"])
+    check("the wheel still provides the dlib import name",
+          "dlib" in env_specs()["stylegan"].checks())
+    for name in ("insightface", "dreamid", "reface"):
+        spec = env_specs()[name]
+        hook = " ".join(" ".join(c) for c in spec.post_install)
+        check(f"{name} replaces the CPU runtime insightface pulls in",
+              "onnxruntime-gpu" in hook and "uninstall" in hook)
+        check(f"{name} verifies the swap took effect",
+              {"onnxruntime", "cv2"} <= set(spec.checks()), str(spec.checks()))
+
+    # a weight source that does not exist is worse than one that has to be staged
+    fomm_weights = env_specs()["fomm"].weights
+    check("the FOMM checkpoint is staged, not fetched from a guessed repo",
+          all(w.staged_name and not w.hf_repo for w in fomm_weights))
+    check("it says where to get it", all(w.where for w in fomm_weights))
+
     sad = " ".join(" ".join(c) for c in env_specs()["sadtalker"].post_install)
+    check("the basicsr patch does not import basicsr to find it",
+          "find_spec" not in sad and "sysconfig" in sad)
+    check("the basicsr patch verifies the import afterwards",
+          "import_module('basicsr.data.degradations')" in sad)
     check("basicsr's removed torchvision import is patched",
           "functional_tensor" in sad and "basicsr.data.degradations" in sad)
     check("the patch runs before SadTalker's own downloader",

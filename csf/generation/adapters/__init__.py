@@ -37,6 +37,53 @@ TORCH_SAM2 = "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
 TORCH_LEGACY = "torch==1.13.1 torchvision==0.14.1"
 LEGACY_INDEX = "https://download.pytorch.org/whl/cu117"
 
+#: basicsr 1.4.2 imports `torchvision.transforms.functional_tensor`, deprecated in torchvision
+#: 0.15 and removed in 0.17 while these envs pin 0.19.1. The function it wants moved to
+#: `torchvision.transforms.functional` unchanged, so the import is rewritten in the installed
+#: copy - upstream basicsr is unmaintained, so there is no release to upgrade to.
+#:
+#: The files are located by walking site-packages, NOT with importlib: `find_spec` on a
+#: submodule imports its parent package, and importing `basicsr` is exactly what raises the
+#: ModuleNotFoundError this patch exists to prevent.
+BASICSR_PATCH = """
+import glob, sysconfig
+roots = {sysconfig.get_paths()[k] for k in ('purelib', 'platlib')}
+files = sorted({p for r in roots for p in glob.glob(r + '/basicsr/**/*.py', recursive=True)})
+if not files:
+    raise SystemExit('basicsr is not installed in this environment')
+patched = 0
+for path in files:
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    if 'torchvision.transforms.functional_tensor' in text:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(text.replace('torchvision.transforms.functional_tensor',
+                                  'torchvision.transforms.functional'))
+        patched += 1
+print('basicsr: rewrote the removed torchvision import in %d of %d file(s)'
+      % (patched, len(files)))
+import importlib
+importlib.import_module('basicsr.data.degradations')
+print('basicsr imports cleanly')
+"""
+
+
+def onnxruntime_gpu_swap() -> tuple:
+    """Replace the CPU runtime and full OpenCV that InsightFace 2.0 pulls in.
+
+    2.0 depends on `onnxruntime` and `opencv-python`, which install the same import names as
+    `onnxruntime-gpu` and `opencv-python-headless`; whichever lands last wins, so upstream
+    documents uninstalling the CPU distribution and installing the GPU one afterwards, and says
+    to repeat it after any insightface install or upgrade. This is that step.
+    """
+    return ("-c",
+            "import subprocess,sys;"
+            "subprocess.run([sys.executable,'-m','pip','uninstall','-y',"
+            "'onnxruntime','opencv-python'],check=False);"
+            "subprocess.run([sys.executable,'-m','pip','install',"
+            "'onnxruntime-gpu==1.18.1','opencv-python-headless'],check=True)")
+
+
 def hub_snapshot(repo_id: str, *dest: str) -> tuple:
     """A post-install step that downloads a Hub repo into `<env root>/<dest...>`.
 
@@ -67,12 +114,7 @@ ENVS: Dict[str, EnvSpec] = {
         # and the headless OpenCV we want - so the post-install step performs the replacement
         # upstream documents, which must be repeated after any insightface install or upgrade.
         requirements=("insightface==2.0", "numpy<2", "imageio[ffmpeg]", "tqdm"),
-        post_install=(("-c",
-                       "import subprocess,sys;"
-                       "subprocess.run([sys.executable,'-m','pip','uninstall','-y',"
-                       "'onnxruntime','opencv-python'],check=False);"
-                       "subprocess.run([sys.executable,'-m','pip','install',"
-                       "'onnxruntime-gpu==1.18.1','opencv-python-headless'],check=True)"),),
+        post_install=(onnxruntime_gpu_swap(),),
         verify_imports=("insightface", "onnxruntime", "cv2", "numpy", "imageio",
                         "huggingface_hub"),
         weights=(WeightFile(dest="weights/inswapper_128.onnx",
@@ -159,8 +201,11 @@ ENVS: Dict[str, EnvSpec] = {
                       "pyyaml", "tqdm", "scipy", "cffi", "matplotlib"),
         repos=(GitRepo("https://github.com/AliaksandrSiarohin/first-order-model.git", name="fomm"),),
         weights=(WeightFile(dest="weights/vox-adv-cpk.pth.tar",
-                            hf_repo="Ubaidbhat/first_order_motion_model",
-                            hf_file="vox-adv-cpk.pth.tar"),),
+                            staged_name="vox-adv-cpk.pth.tar",
+                            where="https://github.com/AliaksandrSiarohin/first-order-model "
+                                  "(the README's 'vox-adv-cpk.pth.tar' Google Drive / Yandex "
+                                  "link). Any Hub mirror works too - drop the file in "
+                                  "generation.staged_weights_dir under this name."),),
     ),
 
     # --- TokenFlow / InsV2V: diffusion video editing -------------------------------------
@@ -231,15 +276,7 @@ ENVS: Dict[str, EnvSpec] = {
             # wants (rgb_to_grayscale) moved to torchvision.transforms.functional unchanged, so
             # the fix is to rewrite the import in the installed copy. Upstream basicsr is
             # unmaintained, so there is no release to upgrade to.
-            ("-c",
-             "import importlib.util,pathlib;"
-             "spec=importlib.util.find_spec('basicsr.data.degradations');"
-             "p=pathlib.Path(spec.origin) if spec and spec.origin else None;"
-             "t=p.read_text() if p else '';"
-             "p.write_text(t.replace('torchvision.transforms.functional_tensor',"
-             "'torchvision.transforms.functional')) if p and 'functional_tensor' in t else None;"
-             "print('basicsr import patched' if p and 'functional_tensor' in t "
-             "else 'basicsr needs no patch')"),
+            ("-c", BASICSR_PATCH),
             ("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
                    "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),
         ),
@@ -296,9 +333,14 @@ ENVS: Dict[str, EnvSpec] = {
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31", "transformers>=4.49", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
-                      "insightface==0.7.3", "onnxruntime-gpu==1.18.1", "easydict", "ftfy", "tqdm"),
+                      "insightface==2.0", "easydict", "ftfy", "tqdm"),
+        # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
+        # explicitly - a swap that silently failed would otherwise pass the import check
+        verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
+                        "cv2", "numpy", "huggingface_hub"),
         repos=(GitRepo("https://github.com/bytedance/DreamID-V.git", name="DreamID-V"),),
-        post_install=(hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V"),),
+        post_install=(onnxruntime_gpu_swap(),
+                      hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V")),
         hub_repos=("XuGuo699/DreamID-V",),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
@@ -310,9 +352,12 @@ ENVS: Dict[str, EnvSpec] = {
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
-                      "omegaconf", "pytorch-lightning", "kornia", "insightface==0.7.3",
-                      "onnxruntime-gpu==1.18.1", "tqdm"),
+                      "omegaconf", "pytorch-lightning", "kornia", "insightface==2.0",
+                      "tqdm"),
+        verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
+                        "cv2", "numpy", "omegaconf", "huggingface_hub"),
         repos=(GitRepo("https://github.com/Sanoojan/REFace.git", name="REFace"),),
+        post_install=(onnxruntime_gpu_swap(),),
         weights=(WeightFile(dest="repos/REFace/checkpoints/last.ckpt",
                             hf_repo="Sanoojan/REFace", hf_file="last.ckpt"),),
         note="LICENCE WARNING: MIT code, but trained on CelebAMask-HQ, which restricts use to "
@@ -344,8 +389,12 @@ ENVS: Dict[str, EnvSpec] = {
         note="Weights (arcface + 512 checkpoint) are hosted on Google Drive / OneDrive upstream."),
     "stylegan": EnvSpec(
         name="stylegan", torch=TORCH_CU121,
+        # `dlib` builds through cmake against Python.h. dlib-bin is the same library shipped
+        # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
+        # it installs `dlib` under the same import name.
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
-                      "dlib", "tqdm"),
+                      "dlib-bin", "tqdm"),
+        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
         weights=(
             # Upstream releases one checkpoint PER EDITING DIRECTION, not one "editing" model:
@@ -381,8 +430,9 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/albertpumarola/GANimation.git", name="GANimation"),)),
     "faceshifter": EnvSpec(
         name="faceshifter", torch=TORCH_CU121,
-        requirements=("opencv-python-headless", "numpy<2", "insightface==0.7.3", "onnxruntime-gpu",
-                      "imageio[ffmpeg]"),
+        requirements=("numpy<2", "insightface==2.0", "imageio[ffmpeg]"),
+        verify_imports=("torch", "insightface", "onnxruntime", "cv2", "numpy"),
+        post_install=(onnxruntime_gpu_swap(),),
         repos=(GitRepo("https://github.com/mindslab-ai/faceshifter.git", name="faceshifter"),),
         note="Upstream ships training code only; no released inference checkpoint."),
     "pirenderer": EnvSpec(

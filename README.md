@@ -353,6 +353,7 @@ names, and the env build copies them where each repo expects them:
 | `e2fgvi_hq.pth` | video inpainting (E2FGVI-HQ) | [MCG-NKU/E2FGVI](https://github.com/MCG-NKU/E2FGVI) |
 | `sttn.pth` | video inpainting (STTN) | [researchmm/STTN](https://github.com/researchmm/STTN) |
 | `fuseformer.pth` | video inpainting (FuseFormer) | [ruiliu-ai/FuseFormer](https://github.com/ruiliu-ai/FuseFormer) |
+| `vox-adv-cpk.pth.tar` | reenactment (FOMM) | [AliaksandrSiarohin/first-order-model](https://github.com/AliaksandrSiarohin/first-order-model) |
 | `vox.pth.tar` | reenactment (TPSMM) | [yoyo-nb/Thin-Plate-Spline-Motion-Model](https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model) |
 | `styleganex_edit_age.pt` | expression editing (age) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
 | `styleganex_edit_hair.pt` | expression editing (hair colour) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
