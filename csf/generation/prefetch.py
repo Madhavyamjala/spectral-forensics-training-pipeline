@@ -171,7 +171,7 @@ def check_access(asset: HubAsset, token: Optional[str] = None) -> Optional[str]:
         return None
     except GatedRepoError:
         return (f"GATED: accept the licence at https://huggingface.co/{asset.repo_id} "
-                f"then `huggingface-cli login` (or set HF_TOKEN)")
+                f"then `hf auth login` (or set HF_TOKEN)")
     except RepositoryNotFoundError:
         return (f"NOT FOUND (or private): https://huggingface.co/{asset.repo_id} - check the id, "
                 f"or log in if it is private")
@@ -247,7 +247,7 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
         raise RuntimeError(
             "Cannot reach gated repo(s): " + ", ".join(gated_blocked) + ".\n"
             + "\n".join(f"  {r}: {blocked[r]}" for r in gated_blocked) +
-            "\nAccept the licence on each model page, then `huggingface-cli login`.")
+            "\nAccept the licence on each model page, then `hf auth login`.")
 
     if dry_run:
         return {"assets": len(assets), "blocked": blocked, "dry_run": True}

@@ -48,7 +48,7 @@ def load() -> State:
     if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
         raise RuntimeError(
             f"VACE weights missing at {ckpt_dir}. Fetch them with:\n"
-            f"    huggingface-cli download Wan-AI/Wan2.1-VACE-1.3B --local-dir {ckpt_dir}")
+            f"    hf download Wan-AI/Wan2.1-VACE-1.3B --local-dir {ckpt_dir}")
     note(f"vace: repo {repo}, ckpt {ckpt_dir}")
     return State(repo, ckpt_dir)
 

@@ -118,7 +118,7 @@ bash setup_env.sh --cuda cu128          # use cu121 for older drivers
 source .venv/bin/activate
 
 # 3. log in to Hugging Face (needed for the gated Llama model and higher rate limits)
-huggingface-cli login                   # paste a READ token
+hf auth login                           # paste a READ token
 
 # 4. verify the machine
 python -m csf.env_check
@@ -138,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File setup_env.ps1 -Cuda cu128
 .\.venv\Scripts\Activate.ps1
 
 # 3. log in to Hugging Face
-huggingface-cli login
+hf auth login
 
 # 4. verify the machine
 python -m csf.env_check
@@ -441,7 +441,7 @@ failures abort with a clear message instead of silently producing an empty datas
 | `CUDA out of memory` elsewhere on a 12 GB card | Close other GPU apps. Then `--set data.num_frames=6 --set train.llama.lora_r=8` and re-run the same command; it resumes. |
 | `Qwen2VLVideoProcessor requires the Torchvision library` | torchvision is missing (the setup scripts install it with torch; a hand-built venv may not have it). Install the build matching your torch: `pip install torchvision --index-url https://download.pytorch.org/whl/cu130` (swap `cu130` for your `torch.version.cuda`). |
 | `no kernel image is available` / `sm_120 not supported` | RTX 50xx needs CUDA 12.8+ wheels: `setup_env.ps1 -Cuda cu128` |
-| `GatedRepoError` for Llama | Accept the licence on the model page, then `huggingface-cli login` |
+| `GatedRepoError` for Llama | Accept the licence on the model page, then `hf auth login` |
 | Many `download failed` / 429 lines | Log in to the Hub (higher limits) or lower `data.download_workers`. Re-running resumes. |
 | `Generation produced no videos at all` | The message now lists the recorded failures; the full rows are in `runs/<run>/metrics/generation_failures.csv` and the worker logs in `runs/<run>/logs/generation/`. Re-running retries the failed jobs (`generation.max_attempts`). |
 | `Nothing to do: ... no retries left` | Every job has failed `generation.max_attempts` times. Fix the underlying error first, then raise the cap (`--set generation.max_attempts=5`) or delete the job's rows from the ledger file. |

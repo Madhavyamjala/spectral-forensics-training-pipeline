@@ -393,7 +393,7 @@ mechanism. Without it, reallocation sends all 4,750 of that family's videos thro
 alone, and the per-method breakdown for the family becomes meaningless.
 
 Everything else fetches itself. Two adapters call an upstream downloader during the env build
-(SadTalker's `download_models.sh`, LivePortrait's `huggingface-cli download`); if those fail, the
+(SadTalker's `download_models.sh`, LivePortrait's Hub snapshot download); if those fail, the
 env build reports it and the worker names the exact missing path at load time rather than failing
 per job.
 

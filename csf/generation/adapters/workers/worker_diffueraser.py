@@ -46,7 +46,7 @@ def load() -> State:
     if not weights.exists() or not any(weights.iterdir()):
         raise RuntimeError(
             f"DiffuEraser weights missing at {weights}. Fetch them with:\n"
-            f"    huggingface-cli download lixiaowen/diffuEraser --local-dir {weights}")
+            f"    hf download lixiaowen/diffuEraser --local-dir {weights}")
     note(f"diffueraser: repo {repo}")
     return State(repo, weights)
 

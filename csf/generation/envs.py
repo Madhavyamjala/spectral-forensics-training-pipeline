@@ -50,7 +50,7 @@ _IMPORT_NAMES: Dict[str, str] = {
     "imageio": "imageio", "diffusers": "diffusers", "transformers": "transformers",
     "accelerate": "accelerate", "safetensors": "safetensors", "insightface": "insightface",
     "onnxruntime": "onnxruntime", "onnxruntime-gpu": "onnxruntime", "librosa": "librosa",
-    "huggingface-hub": "huggingface_hub", "einops": "einops", "omegaconf": "omegaconf",
+    "huggingface-hub": "huggingface_hub", "huggingface_hub": "huggingface_hub", "einops": "einops", "omegaconf": "omegaconf",
 }
 
 
@@ -106,6 +106,24 @@ class EnvSpec:
     verify_imports: Sequence[str] = ()
     note: str = ""
 
+    def needs_hub(self) -> bool:
+        """Whether building this env talks to the Hugging Face Hub."""
+        return bool(self.hub_repos) or any(w.hf_repo for w in self.weights)
+
+    def pip_requirements(self) -> Tuple[str, ...]:
+        """Requirements as installed, with `huggingface_hub` added when the build needs it.
+
+        The weight step and the post-install hooks import `huggingface_hub` inside the env, so
+        it has to be installed there. Most envs get it transitively through diffusers or
+        transformers - but insightface, fomm, liveportrait and wav2lip pull neither, and would
+        only discover that at the weight step, after a full torch install. Deriving it from what
+        the spec declares means a new env cannot forget it.
+        """
+        reqs = tuple(self.requirements)
+        if self.needs_hub() and not any("huggingface" in r.lower() for r in reqs):
+            reqs += ("huggingface_hub",)
+        return reqs
+
     def checks(self) -> Tuple[str, ...]:
         """Modules this env must be able to import.
 
@@ -117,7 +135,7 @@ class EnvSpec:
         if self.verify_imports:
             return tuple(self.verify_imports)
         mods: List[str] = ["torch"] if self.torch else []
-        for req in self.requirements:
+        for req in self.pip_requirements():
             name = re.split(r"[=<>!\[ ]", req.strip(), 1)[0].lower()
             mod = _IMPORT_NAMES.get(name)
             if mod and mod not in mods:
@@ -128,7 +146,7 @@ class EnvSpec:
         """Return a stable digest of inputs that define this environment."""
         payload = json.dumps({
             "python": self.python, "torch": self.torch, "torch_index": self.torch_index,
-            "requirements": list(self.requirements),
+            "requirements": list(self.pip_requirements()),
             "repos": [[r.url, r.commit] for r in self.repos],
             "hub_repos": list(self.hub_repos),
             "weights": [[w.dest, w.url, w.hf_repo, w.hf_file, w.staged_name]
@@ -475,7 +493,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
         raise EnvBuildError(f"Env '{spec.name}' is not built and generation.offline is set. "
                             f"Pre-build it with: python -m csf.generation.envs --build {spec.name}")
 
-    steps = (2 + (1 if spec.torch else 0) + (1 if spec.requirements else 0)
+    steps = (2 + (1 if spec.torch else 0) + (1 if spec.pip_requirements() else 0)
              + len(spec.repos) + len(spec.weights) + len(spec.post_install))
     log.info("Building environment '%s' at %s | %d step(s). The torch install alone usually "
              "takes 5-20 minutes; each step streams its output below.", spec.name, root, steps)
@@ -520,9 +538,10 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
         # pip reads this for every install below, post-install hooks included
         build_env_vars["PIP_CONSTRAINT"] = str(constraints)
 
-    if spec.requirements:
-        _run([py, "-m", "pip", "install", *spec.requirements],
-             what=announce(f"installing {len(spec.requirements)} requirement(s)"), timeout=7200,
+    requirements = spec.pip_requirements()
+    if requirements:
+        _run([py, "-m", "pip", "install", *requirements],
+             what=announce(f"installing {len(requirements)} requirement(s)"), timeout=7200,
              env=build_env_vars)
 
     repos: Dict[str, Path] = {}
@@ -562,9 +581,9 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
         else:
             raise EnvBuildError(f"Weight {weight.dest} for env {spec.name} has no url or hf_repo")
 
-    # post-install hooks (upstream downloaders, huggingface-cli pulls) locate the env through
+    # post-install hooks (upstream downloaders, Hub snapshot pulls) locate the env through
     # CSF_ENV_ROOT, which is otherwise only injected at worker launch - set it here too, and put
-    # the venv's bin dir first so `huggingface-cli` resolves to this env's copy.
+    # the venv's bin dir first so any console script resolves to this env's copy.
     if spec.post_install:
         hook_env = ReadyEnv(spec, root, py, repos).environ()
         for cmd in spec.post_install:

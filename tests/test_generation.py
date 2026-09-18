@@ -1188,6 +1188,29 @@ def test_env_interpreter() -> None:
     check("the swap is verified by the import check",
           {"onnxruntime", "cv2"} <= set(ins.checks()))
 
+    # Hub downloads must not go through a CLI: `huggingface-cli` was removed in favour of `hf`
+    specs_all = env_specs()
+    hooks = {n: " ".join(" ".join(c) for c in sp.post_install) for n, sp in specs_all.items()}
+    check("no post-install hook shells out to huggingface-cli",
+          not any("huggingface-cli" in h for h in hooks.values()),
+          str([n for n, h in hooks.items() if "huggingface-cli" in h]))
+    hub_hooks = [n for n, h in hooks.items() if "snapshot_download" in h]
+    check("the Hub pulls use snapshot_download", len(hub_hooks) == 4, str(sorted(hub_hooks)))
+    check("each snapshot lands under the env root",
+          all("CSF_ENV_ROOT" in hooks[n] for n in hub_hooks))
+
+    # every env that touches the Hub must have the library installed in it
+    missing = [n for n, sp in specs_all.items() if sp.needs_hub()
+               and not any("huggingface" in r.lower() for r in sp.pip_requirements())]
+    check("every Hub-using env installs huggingface_hub", not missing, str(missing))
+    check("an env that never touches the Hub does not gain the dependency",
+          not any("huggingface" in r.lower()
+                  for r in specs_all["propainter"].pip_requirements()))
+    check("the derived requirement is part of the digest",
+          EnvSpec(name="x", torch="", weights=(WeightFile(dest="w", hf_repo="r", hf_file="f"),)
+                  ).digest()
+          != EnvSpec(name="x", torch="").digest())
+
     sad = " ".join(" ".join(c) for c in env_specs()["sadtalker"].post_install)
     check("basicsr's removed torchvision import is patched",
           "functional_tensor" in sad and "basicsr.data.degradations" in sad)

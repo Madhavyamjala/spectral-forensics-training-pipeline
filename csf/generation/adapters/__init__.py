@@ -37,6 +37,25 @@ TORCH_SAM2 = "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
 TORCH_LEGACY = "torch==1.13.1 torchvision==0.14.1"
 LEGACY_INDEX = "https://download.pytorch.org/whl/cu117"
 
+def hub_snapshot(repo_id: str, *dest: str) -> tuple:
+    """A post-install step that downloads a Hub repo into `<env root>/<dest...>`.
+
+    Through `huggingface_hub.snapshot_download`, not a CLI: `huggingface-cli` was removed in
+    favour of `hf`, so a hook that shells out to it fails outright ("`huggingface-cli` is
+    deprecated and no longer works"), and hard-coding the new name would only move the problem to
+    the next rename. The Python API is the stable interface, it is already a dependency of every
+    env that needs it, it picks up the same stored credentials as `hf auth login`, and it resumes
+    from the shared Hub cache instead of re-downloading.
+    """
+    joined = ", ".join(repr(part) for part in dest)
+    return ("-c",
+            "import os;from huggingface_hub import snapshot_download;"
+            f"p=os.path.join(os.environ['CSF_ENV_ROOT'], {joined});"
+            f"print('downloading {repo_id} ->', p);"
+            f"snapshot_download({repo_id!r}, local_dir=p, max_workers=8);"
+            "print('done')")
+
+
 ENVS: Dict[str, EnvSpec] = {
     # --- face swap: InsightFace / ONNX Runtime -----------------------------------------
     "insightface": EnvSpec(
@@ -54,7 +73,8 @@ ENVS: Dict[str, EnvSpec] = {
                        "'onnxruntime','opencv-python'],check=False);"
                        "subprocess.run([sys.executable,'-m','pip','install',"
                        "'onnxruntime-gpu==1.18.1','opencv-python-headless'],check=True)"),),
-        verify_imports=("insightface", "onnxruntime", "cv2", "numpy", "imageio"),
+        verify_imports=("insightface", "onnxruntime", "cv2", "numpy", "imageio",
+                        "huggingface_hub"),
         weights=(WeightFile(dest="weights/inswapper_128.onnx",
                             hf_repo="ezioruan/inswapper_128.onnx", hf_file="inswapper_128.onnx"),),
         note="INSwapper 128 + buffalo_l detection/recognition. LICENCE: the library is MIT, but "
@@ -235,9 +255,8 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
                       "onnxruntime-gpu==1.18.1", "rich", "pyyaml", "albumentations", "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
-        post_install=(("-c", "import subprocess,os;r=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','LivePortrait');"
-                             "subprocess.run(['huggingface-cli','download','KlingTeam/LivePortrait',"
-                             "'--local-dir','pretrained_weights'],cwd=r,check=True)"),),
+        post_install=(hub_snapshot("KlingTeam/LivePortrait",
+                                   "repos", "LivePortrait", "pretrained_weights"),),
         hub_repos=("KlingTeam/LivePortrait",),
         note="Drives both reenactment (v2v) and expression editing (retargeting ratios).",
     ),
@@ -250,9 +269,7 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
-        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
-                             "'Wan-AI/Wan2.1-VACE-1.3B','--local-dir',"
-                             "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','Wan2.1-VACE-1.3B')],check=True)"),),
+        post_install=(hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),),
         hub_repos=("Wan-AI/Wan2.1-VACE-1.3B",),
         note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
              "prompt-driven V2V, so it fills several slots the document's models cannot.",
@@ -266,9 +283,8 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
                       "scipy", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
-        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
-                             "'lixiaowen/diffuEraser','--local-dir',"
-                             "os.path.join(os.environ['CSF_ENV_ROOT'],'repos','DiffuEraser','weights','diffuEraser')],check=True)"),),
+        post_install=(hub_snapshot("lixiaowen/diffuEraser",
+                                   "repos", "DiffuEraser", "weights", "diffuEraser"),),
         hub_repos=("lixiaowen/diffuEraser",),
         note="Apache-2.0. Diffusion removal - a different artifact class from ProPainter's "
              "flow propagation, which is why it is worth a slot of its own.",
@@ -282,9 +298,7 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "insightface==0.7.3", "onnxruntime-gpu==1.18.1", "easydict", "ftfy", "tqdm"),
         repos=(GitRepo("https://github.com/bytedance/DreamID-V.git", name="DreamID-V"),),
-        post_install=(("-c", "import subprocess,os;subprocess.run(['huggingface-cli','download',"
-                             "'XuGuo699/DreamID-V','--local-dir',"
-                             "os.path.join(os.environ['CSF_ENV_ROOT'],'weights','DreamID-V')],check=True)"),),
+        post_install=(hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V"),),
         hub_repos=("XuGuo699/DreamID-V",),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",

@@ -59,7 +59,7 @@ def load() -> State:
     if not weights.exists() or not any(weights.iterdir()):
         raise RuntimeError(
             f"LivePortrait weights missing at {weights}. Fetch them with:\n"
-            f"    cd {repo} && huggingface-cli download KlingTeam/LivePortrait "
+            f"    cd {repo} && hf download KlingTeam/LivePortrait "
             f"--local-dir pretrained_weights")
     note(f"liveportrait: repo {repo}")
     return State(repo, "")

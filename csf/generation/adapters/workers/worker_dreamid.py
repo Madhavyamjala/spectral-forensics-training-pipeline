@@ -43,7 +43,7 @@ def load() -> State:
     if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
         raise RuntimeError(
             f"DreamID-V weights missing at {ckpt_dir}. Fetch them with:\n"
-            f"    huggingface-cli download XuGuo699/DreamID-V --local-dir {ckpt_dir}")
+            f"    hf download XuGuo699/DreamID-V --local-dir {ckpt_dir}")
     candidates = [repo / "inference.py", repo / "infer.py", repo / "scripts" / "inference.py"]
     script = next((c for c in candidates if c.exists()), None)
     if script is None:

@@ -94,7 +94,7 @@ latency percentiles, routing statistics, shortcut baselines) is in `metrics/abla
 ```bash
 git clone https://huggingface.co/{repo_id} csf-model && cd csf-model/code
 pip install -r requirements.txt        # plus a CUDA build of torch, see README of the training repo
-huggingface-cli login                  # Llama 3.2 Vision is gated: accept its license first
+hf auth login                         # Llama 3.2 Vision is gated: accept its license first
 python -m csf.inference /path/to/video.mp4 --model_dir .. --mode agentic --profile balanced
 ```
 

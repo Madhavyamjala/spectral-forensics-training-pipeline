@@ -207,7 +207,7 @@ def check_gated_access(model_id: str, log) -> None:
             log.info("Access OK with provided token: %s", model_id)
         else:
             raise RuntimeError(f"No access to gated model {model_id}: {exc}. Accept the licence on the Hub and run "
-                               f"`huggingface-cli login` (or set HF_TOKEN) before launching.") from exc
+                               f"`hf auth login` (or set HF_TOKEN) before launching.") from exc
 
 
 def _stale_reason(name: str, cfg, info):

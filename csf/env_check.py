@@ -81,7 +81,7 @@ def main() -> int:
         who = HfApi().whoami()
         report("huggingface login", "ok", who.get("name", "?"))
     except Exception:
-        report("huggingface login", "warn", "not logged in - run `huggingface-cli login` (Llama 3.2 Vision is gated)")
+        report("huggingface login", "warn", "not logged in - run `hf auth login` (Llama 3.2 Vision is gated)")
 
     print("\nEnvironment", "READY" if ok else "has FAILURES (see above)")
     return 0 if ok else 1
