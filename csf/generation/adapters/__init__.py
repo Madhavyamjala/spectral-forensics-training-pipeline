@@ -208,8 +208,11 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/Rudrabha/Wav2Lip.git", name="Wav2Lip"),),
         weights=(WeightFile(dest="repos/Wav2Lip/checkpoints/wav2lip_gan.pth",
                             hf_repo="camenduru/Wav2Lip", hf_file="checkpoints/wav2lip_gan.pth"),
+                 # upstream stores the S3FD detector under its hash-suffixed name; Wav2Lip's
+                 # face_detection module loads it by the plain name, hence the rename on copy
                  WeightFile(dest="repos/Wav2Lip/face_detection/detection/sfd/s3fd.pth",
-                            hf_repo="camenduru/Wav2Lip", hf_file="checkpoints/s3fd.pth")),
+                            hf_repo="camenduru/Wav2Lip",
+                            hf_file="checkpoints/s3fd-619a316812.pth")),
     ),
 
     # --- First Order Motion Model (reenactment) ------------------------------------------

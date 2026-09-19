@@ -1258,6 +1258,40 @@ def test_env_interpreter() -> None:
               for sp in specs_all.values() for r in sp.pip_requirements()
               if r.startswith("transformers")))
     from csf.generation.envs import FRAMEWORK_PROBE, _verify_framework
+
+    # a stub interpreter whose framework probe reports PyTorch disabled: both the build and
+    # the doctor must refuse it, because every other signal in such an env looks healthy
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        venv = root / "probe" / "venv"
+        (venv / "bin").mkdir(parents=True)
+        stub = venv / "bin" / "python"
+        stub.write_text(f"""#!/bin/sh
+case "$2" in
+  *is_torch_available*) echo "transformers 5.17.0 | torch 2.4.1 | torch enabled: False"; exit 3 ;;
+  *sys.prefix*)         echo "{venv.resolve()}" ;;
+  *torch.__version__*)  echo "2.4.1+cu121" ;;
+  *)                    exit 0 ;;
+esac
+""")
+        stub.chmod(0o755)
+        broken = EnvSpec(name="probe", torch="torch==2.4.1",
+                         requirements=("transformers>=4.44,<5",),
+                         verify_imports=("torch", "transformers"))
+        try:
+            _verify_framework(stub, broken)
+            check("the build refuses an env with PyTorch disabled", False, "no error raised")
+        except E_.EnvBuildError as exc:
+            check("the build refuses an env with PyTorch disabled",
+                  "PyTorch disabled" in str(exc), str(exc)[:80])
+        report = E_.diagnose([broken], root)["probe"]
+        check("the doctor calls it broken, not ok", report["verdict"] == "broken",
+              str(report.get("verdict")))
+        check("the doctor reports torch_enabled", report.get("torch_enabled") is False)
+        check("an env with no transformers is not framework-checked",
+              "torch_enabled" not in E_.diagnose(
+                  [EnvSpec(name="probe", torch="torch==2.4.1", verify_imports=("torch",))],
+                  root)["probe"])
     check("the build asserts transformers can use torch",
           "is_torch_available" in FRAMEWORK_PROBE)
     build_all = inspect.getsource(E_.build_env)

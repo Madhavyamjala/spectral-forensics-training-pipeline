@@ -740,8 +740,19 @@ def diagnose(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, Dict[str, o
             info["torch_pinned"] = want
             if str(info["torch"]).split("+")[0] != want:
                 info["torch_drifted"] = True
+        # importable is not usable: transformers past its torch floor disables PyTorch and
+        # loads tokenizers only, which every other check in here would call healthy
+        if "transformers" in spec.checks() and spec.torch and "transformers" not in missing:
+            try:
+                proc = _probe(py, FRAMEWORK_PROBE, timeout=300)
+                info["torch_enabled"] = proc.returncode == 0
+                line = (proc.stdout or "").strip().splitlines()
+                info["frameworks"] = line[-1] if line else ""
+            except (OSError, subprocess.SubprocessError):
+                info["torch_enabled"] = False
         info["verdict"] = ("ok" if info["own_venv"] and info["pip"] != "MISSING" and not missing
-                           and not info.get("torch_drifted") else "broken")
+                           and not info.get("torch_drifted")
+                           and info.get("torch_enabled", True) else "broken")
         out[spec.name] = info
     return out
 
@@ -827,6 +838,10 @@ def _main() -> int:
                     drift = "  <- NOT the pinned build" if info.get("torch_drifted") else ""
                     print(f"         torch: {info.get('torch')} "
                           f"(pinned {info['torch_pinned']}){drift}")
+                if "torch_enabled" in info:
+                    note = "" if info["torch_enabled"] else \
+                        "  <- transformers has PyTorch DISABLED; it can load no models"
+                    print(f"         {info.get('frameworks') or 'frameworks'}{note}")
             if info["verdict"] != "ok":
                 bad += 1
                 print(f"         fix: python -m csf.generation.envs --build {name} --force "
@@ -834,11 +849,12 @@ def _main() -> int:
         return 1 if bad else 0
 
     if args.status or not args.build:
-        status = env_status(list(specs.values()), root)
+        status = env_status(_select("all"), root)
         for name in sorted(status):
             print(f"{status[name]:>8}  {name}")
         implemented = sum(1 for a in ADAPTERS.values() if a.implemented)
-        print(f"\n{implemented}/{len(ADAPTERS)} adapters implemented; {len(specs)} environments")
+        print(f"\n{implemented}/{len(ADAPTERS)} adapters implemented; "
+              f"{len(status)} environment(s) a runnable model needs")
         return 0
 
     wanted = _select(args.build)
