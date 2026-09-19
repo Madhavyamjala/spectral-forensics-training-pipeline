@@ -1014,8 +1014,20 @@ def test_stage_staleness() -> None:
         total_videos = 33333
         kinetics = _K()
 
+    # a cache with the stage's outputs present, so these checks isolate the fingerprint rule
+    import tempfile as _tf
+    _cache = _tf.mkdtemp()
+    _kin = Path(_cache) / "kinetics"
+    _kin.mkdir()
+    for _name in ("source_pool.csv", "clip_features.csv"):
+        (_kin / _name).write_text("clip_id\nabc\n")
+
+    class _P:
+        cache_dir = _cache
+
     class _C:
         generation = _G()
+        paths = _P()
 
     cfg = _C()
     fp = R.kinetics_fingerprint(cfg)
@@ -1034,6 +1046,32 @@ def test_stage_staleness() -> None:
 
     check("a state.json written before fingerprints existed is trusted",
           R.stale_reason("kinetics", cfg, {"result": {"clips": 200}}) is None)
+
+    # a completed marker whose output is gone must not be honoured: state.json outlives the
+    # cache it describes, and skipping on the marker alone defers the failure to a later stage
+    with _tf.TemporaryDirectory() as tmp:
+        class _P2:
+            cache_dir = tmp
+        cfg_real = type("C", (), {"generation": _G(), "paths": _P2()})()
+        fp = R.kinetics_fingerprint(cfg_real)
+        done = {"result": {"fingerprint": dict(fp)}}
+        reason = R.stale_reason("kinetics", cfg_real, done)
+        check("a marker with no output on disk is refused", bool(reason) and "missing" in reason,
+              str(reason))
+        check("the reason names the files it looked for",
+              "clip_features.csv" in (reason or ""))
+
+        kin = Path(tmp) / "kinetics"
+        kin.mkdir()
+        (kin / "source_pool.csv").write_text("clip_id\n")
+        (kin / "clip_features.csv").write_text("")          # present but empty
+        check("an empty artifact counts as missing",
+              "clip_features.csv" in (R.stale_reason("kinetics", cfg_real, done) or ""))
+        (kin / "clip_features.csv").write_text("clip_id\nabc\n")
+        check("a complete cache with a matching fingerprint is honoured",
+              R.stale_reason("kinetics", cfg_real, done) is None)
+        check("missing_artifacts reports nothing when both files are there",
+              R.missing_artifacts("kinetics", cfg_real) == [])
     check("other stages are unaffected",
           R.stale_reason("generate", cfg, {"result": {"fingerprint": stale}}) is None)
 

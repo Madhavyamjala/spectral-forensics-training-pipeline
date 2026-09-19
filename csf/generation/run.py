@@ -94,12 +94,39 @@ def kinetics_fingerprint(cfg) -> Dict[str, object]:
             "demand_margin": float(gen.kinetics.demand_margin)}
 
 
+#: What a completed stage must have left behind, relative to `paths.cache_dir`. A marker in
+#: state.json is a claim about the past; these files are the evidence for it.
+STAGE_ARTIFACTS: Dict[str, Sequence[str]] = {
+    "kinetics": ("kinetics/source_pool.csv", "kinetics/clip_features.csv"),
+}
+
+
+def missing_artifacts(stage_name: str, cfg) -> List[str]:
+    """Outputs a completed stage should have produced that are absent or empty."""
+    cache = Path(cfg.paths.cache_dir)
+    out = []
+    for rel in STAGE_ARTIFACTS.get(stage_name, ()):
+        path = cache / rel
+        if not path.exists() or path.stat().st_size == 0:
+            out.append(str(path))
+    return out
+
+
 def stale_reason(stage_name: str, cfg, info: Optional[Dict[str, object]]) -> Optional[str]:
     """Why a stage that state.json marks complete has to run again anyway, or None."""
     if stage_name != "kinetics":
         return None
     if cfg.generation.kinetics.rescore:
         return "generation.kinetics.rescore is set"
+
+    # A completed marker is a claim, not proof. state.json can outlive the cache it describes -
+    # a cache directory cleaned up, a run copied between machines, or a stage marked done before
+    # it wrote anything. Skipping on the strength of the marker alone then defers the failure to
+    # whichever later stage reads the missing file, far from the cause.
+    gone = missing_artifacts(stage_name, cfg)
+    if gone:
+        return f"its output is missing ({', '.join(gone)})"
+
     recorded = ((info or {}).get("result") or {})
     if not isinstance(recorded, dict):
         return None
