@@ -344,6 +344,20 @@ One variant, `facial_attributes` (glasses), has no released renderer at all. Its
 over the variants that can be produced, and the run logs it — no video is ever labelled with a
 manipulation that was not performed.
 
+### Version ceilings on the shared frameworks
+
+`transformers` and `diffusers` carry an upper bound (`<5`, `<1`) in every env that installs them.
+Without one, pip takes the newest release: transformers 5 requires torch ≥ 2.5, and in an env
+pinned to torch 2.4.1 it prints *"Disabling PyTorch"* and continues with tokenizers only. The env
+imports cleanly and cannot load a single model. The build now asserts
+`transformers.utils.is_torch_available()` before marking an env ready, so that state cannot reach
+a run.
+
+The same care applies to `onnxruntime` / `onnxruntime-gpu` and `opencv-python` /
+`opencv-python-headless`: each pair installs the same import name, so uninstalling one deletes the
+other's files while pip still records it as installed. The envs that need the GPU runtime remove
+every variant first and then reinstall, and import the result to prove it worked.
+
 ### Rebuilding the model environments from scratch
 
 The per-model environments repair themselves — a broken venv is detected and recreated, and a
@@ -353,6 +367,9 @@ interrupted build, a hand-modified env, or proving the whole install path works.
 ```bash
 # delete every built environment, then rebuild them all
 python -m csf.generation.envs --burn all --build all --envs-root cache/regen/envs
+
+# or name several - comma-separated, env or adapter names both work
+python -m csf.generation.envs --build dreamid,reface,vace --envs-root cache/regen/envs
 
 # or as part of a run (one-off; do not leave it in a config file)
 python main.py --config configs/regen.yaml --stage generate --set generation.burn_envs=true

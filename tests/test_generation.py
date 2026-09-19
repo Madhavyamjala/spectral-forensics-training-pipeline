@@ -1150,6 +1150,17 @@ def test_env_interpreter() -> None:
         check("burn leaves unregistered directories alone", (root / "not_an_env").exists())
         check("burn on an empty root is a no-op", burn_envs(specs, root / "nope") == {})
 
+    # 'all' must mean "every env a runnable model needs", and a list must be accepted
+    import csf.generation.envs as _E
+    src_cli = inspect.getsource(_E._main)
+    check("'all' skips envs no implemented adapter uses",
+          "a.implemented" in src_cli and "no implemented adapter uses" in src_cli)
+    check("names can be given as a comma-separated list", 'name.split(",")' in src_cli)
+    live = {a.env_name for a in ADAPTERS.values() if a.implemented}
+    check("vid2vid is excluded from 'all'", "vid2vid" not in live and "vid2vid" in env_specs())
+    check("every other env survives the filter", len(live) == len(env_specs()) - 1,
+          f"{len(live)} vs {len(env_specs())}")
+
     # a Git LFS pointer is not a checkpoint
     from csf.generation.envs import WeightFile, _is_lfs_pointer, _staged_file
     with tempfile.TemporaryDirectory() as tmp:
@@ -1233,6 +1244,50 @@ def test_env_interpreter() -> None:
     check("the FOMM checkpoint is staged, not fetched from a guessed repo",
           all(w.staged_name and not w.hf_repo for w in fomm_weights))
     check("it says where to get it", all(w.where for w in fomm_weights))
+
+    # a framework pin with no ceiling is not a pin: transformers 5 requires torch>=2.5 and,
+    # below that, disables PyTorch and loads tokenizers only - an env that imports fine and
+    # cannot load a single model
+    unbounded = [(n, r) for n, sp in specs_all.items() for r in sp.pip_requirements()
+                 if r.split(">")[0].split("=")[0].split("<")[0] in ("transformers", "diffusers")
+                 and "<" not in r]
+    check("every transformers/diffusers pin has a major-version ceiling", not unbounded,
+          str(unbounded))
+    check("the ceiling keeps transformers on the 4.x line",
+          all("transformers>=4" in r and ",<5" in r
+              for sp in specs_all.values() for r in sp.pip_requirements()
+              if r.startswith("transformers")))
+    from csf.generation.envs import FRAMEWORK_PROBE, _verify_framework
+    check("the build asserts transformers can use torch",
+          "is_torch_available" in FRAMEWORK_PROBE)
+    build_all = inspect.getsource(E_.build_env)
+    check("the framework check runs before an env is marked ready",
+          "_verify_framework(py, spec)" in build_all)
+
+    # the swap must survive the state that broke it: opencv-python uninstalled out from under
+    # opencv-python-headless, whose metadata then suppresses the reinstall
+    from csf.generation.adapters import RUNTIME_SWAP
+    import ast as _ast
+    _ast.parse(RUNTIME_SWAP)
+    for pkg in ("onnxruntime", "onnxruntime-gpu", "opencv-python", "opencv-python-headless",
+                "opencv-contrib-python"):
+        check(f"the swap removes {pkg} before installing", f"'{pkg}'" in RUNTIME_SWAP)
+    check("the swap imports what it installed, so a silent no-op cannot pass",
+          "importlib.import_module(name)" in RUNTIME_SWAP)
+    from csf.generation.adapters import ENVS as ALL_ENVS
+    check("no env pins opencv alongside insightface, which pulls its own",
+          not any("opencv" in r
+                  for n in ("dreamid", "reface", "insightface", "faceshifter")
+                  for r in ALL_ENVS[n].pip_requirements()))
+
+    # numpy must be constrained for every later install in the env, not just torch
+    with tempfile.TemporaryDirectory() as tmp:
+        written = E_._write_constraints(specs_all["dreamid"], Path(tmp))
+        check("the constraints file pins numpy as well as torch",
+              "numpy<2" in written.read_text())
+        plain = E_._write_constraints(specs_all["propainter"], Path(tmp))
+        check("an env without a numpy pin still gets its torch pins",
+              "torch==" in plain.read_text())
 
     sad = " ".join(" ".join(c) for c in env_specs()["sadtalker"].post_install)
     check("the basicsr patch does not import basicsr to find it",

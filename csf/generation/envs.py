@@ -274,7 +274,12 @@ def _write_constraints(spec: "EnvSpec", root: Path) -> Optional[Path]:
     the one the adapter was pinned against. As a constraint the same conflict becomes a
     resolution error at build time, naming the package that wants to move torch.
     """
-    pins = torch_pins(spec)
+    pins = list(torch_pins(spec))
+    # numpy rides along: these envs pin numpy<2 for InsightFace and ONNX Runtime, and a later
+    # install (opencv-python-headless 5.x wants numpy>=2) would otherwise pull it forward.
+    pins += [r for r in spec.pip_requirements()
+             if r.split("<")[0].split(">")[0].split("=")[0].strip() == "numpy" and
+             any(op in r for op in ("<", ">", "="))]
     if not pins:
         return None
     path = Path(root) / "constraints.txt"
@@ -378,6 +383,39 @@ def _verify_torch(py: Path, spec: "EnvSpec") -> None:
             f"torch; the pin is in the env's constraints.txt.")
 
 
+FRAMEWORK_PROBE = """
+import transformers, torch
+ok = transformers.utils.is_torch_available()
+print('transformers %s | torch %s | torch enabled: %s'
+      % (transformers.__version__, torch.__version__, ok))
+raise SystemExit(0 if ok else 3)
+"""
+
+
+def _verify_framework(py: Path, spec: "EnvSpec") -> None:
+    """Confirm transformers can actually use the torch in this env.
+
+    `import transformers` succeeding proves nothing: transformers 5 requires torch>=2.5 and,
+    below that, prints "Disabling PyTorch" and carries on with tokenizers only. Every model
+    class is then unavailable, so an env passes an import check and cannot load a single model -
+    the failure only surfaces when a worker tries to render, hours into a run.
+    """
+    if "transformers" not in spec.checks() or not spec.torch:
+        return
+    try:
+        proc = _probe(py, FRAMEWORK_PROBE, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EnvBuildError(f"env '{spec.name}': framework check could not run: {exc}") from exc
+    detail = (proc.stdout or proc.stderr or "").strip().splitlines()
+    if proc.returncode != 0:
+        raise EnvBuildError(
+            f"env '{spec.name}': transformers is installed but has PyTorch disabled "
+            f"({detail[-1] if detail else 'no detail'}). It will load tokenizers and no models. "
+            f"This happens when transformers outruns the env's torch pin - cap it below the "
+            f"major version that requires a newer torch.")
+    log.info("  env '%s': %s", spec.name, detail[-1] if detail else "framework ok")
+
+
 def _verify_imports(py: Path, modules: Sequence[str], label: str) -> None:
     """Fail the build if the env cannot import what its worker needs."""
     if not modules:
@@ -479,6 +517,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
                 try:
                     _verify_imports(py, spec.checks(), f"env '{spec.name}'")
                     _verify_torch(py, spec)
+                    _verify_framework(py, spec)
                     return ReadyEnv(spec, root, py,
                                     {r.folder: repos_dir / r.folder for r in spec.repos})
                 except EnvBuildError as exc:
@@ -598,6 +637,7 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
             f"on this machine (some distributions need python3-venv / ensurepip installed).")
     _verify_imports(py, spec.checks(), f"env '{spec.name}'")
     _verify_torch(py, spec)
+    _verify_framework(py, spec)
     marker.write_text(json.dumps({"digest": want, "name": spec.name, "python": str(py),
                                   "root": str(root),
                                   "repos": {k: str(v) for k, v in repos.items()}}, indent=2),
@@ -730,11 +770,28 @@ def _main() -> int:
     root = Path(args.envs_root)
 
     def _select(name: str) -> List[EnvSpec]:
+        """Resolve a name to env specs. Accepts a comma-separated list, an adapter name, 'all'."""
         if name == "all":
-            return list(specs.values())
-        if name in specs:
-            return [specs[name]]
-        return [specs[ADAPTERS[name].env_name]] if name in ADAPTERS else []
+            # 'all' means every env a runnable model needs - not every env in the registry.
+            # An env whose only adapter is unwired (vid2vid, whose torch 1.13.1 has no wheel for
+            # Python 3.12 anyway) can never be used by a run, so building it only manufactures a
+            # failure that means nothing.
+            live = {a.env_name for a in ADAPTERS.values() if a.implemented}
+            skipped = sorted(set(specs) - live)
+            if skipped:
+                log.info("Skipping %s: no implemented adapter uses %s",
+                         ", ".join(skipped), "them" if len(skipped) > 1 else "it")
+            return [spec for key, spec in specs.items() if key in live]
+        picked: List[EnvSpec] = []
+        for part in (p.strip() for p in name.split(",") if p.strip()):
+            if part in specs:
+                picked.append(specs[part])
+            elif part in ADAPTERS:
+                picked.append(specs[ADAPTERS[part].env_name])
+            else:
+                return []
+        # de-duplicate while preserving order: several adapters can share one env
+        return list({spec.name: spec for spec in picked}.values())
 
     if args.burn:
         wanted = _select(args.burn)

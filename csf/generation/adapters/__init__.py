@@ -68,6 +68,30 @@ print('basicsr imports cleanly')
 """
 
 
+#: `onnxruntime` / `onnxruntime-gpu` and `opencv-python` / `opencv-python-headless` are pairs of
+#: distributions that install the SAME import name. Uninstalling one deletes the shared files
+#: even when the other is still recorded as installed - and pip then answers the reinstall with
+#: "Requirement already satisfied" and does nothing, leaving the env with metadata for a package
+#: whose files are gone. That is how an env built cleanly and then failed on `import cv2`.
+#:
+#: So every variant is removed first, and the two we want are installed into the vacuum. The
+#: numpy pin rides along because opencv-python-headless 5.x requires numpy>=2, which these envs
+#: cannot use: pip backtracks to a 4.x OpenCV that accepts numpy<2.
+RUNTIME_SWAP = """
+import subprocess, sys
+run = lambda *a: subprocess.run([sys.executable, '-m', 'pip', *a], check=False)
+run('uninstall', '-y', 'onnxruntime', 'onnxruntime-gpu',
+    'opencv-python', 'opencv-python-headless', 'opencv-contrib-python')
+out = subprocess.run([sys.executable, '-m', 'pip', 'install',
+                      'onnxruntime-gpu==1.18.1', 'opencv-python-headless', 'numpy<2'],
+                     check=True)
+import importlib
+for name in ('cv2', 'onnxruntime', 'numpy'):
+    importlib.import_module(name)
+print('runtime swap ok: onnxruntime-gpu + headless OpenCV are importable')
+"""
+
+
 def onnxruntime_gpu_swap() -> tuple:
     """Replace the CPU runtime and full OpenCV that InsightFace 2.0 pulls in.
 
@@ -76,12 +100,7 @@ def onnxruntime_gpu_swap() -> tuple:
     documents uninstalling the CPU distribution and installing the GPU one afterwards, and says
     to repeat it after any insightface install or upgrade. This is that step.
     """
-    return ("-c",
-            "import subprocess,sys;"
-            "subprocess.run([sys.executable,'-m','pip','uninstall','-y',"
-            "'onnxruntime','opencv-python'],check=False);"
-            "subprocess.run([sys.executable,'-m','pip','install',"
-            "'onnxruntime-gpu==1.18.1','opencv-python-headless'],check=True)")
+    return ("-c", RUNTIME_SWAP)
 
 
 def hub_snapshot(repo_id: str, *dest: str) -> tuple:
@@ -129,7 +148,7 @@ ENVS: Dict[str, EnvSpec] = {
     "sam2_diffusers": EnvSpec(
         name="sam2_diffusers",
         torch=TORCH_SAM2,
-        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
                       "sentencepiece", "protobuf", "opencv-python-headless", "numpy<2",
                       "imageio[ffmpeg]", "pillow", "tqdm",
                       "git+https://github.com/facebookresearch/sam2.git"),
@@ -212,7 +231,7 @@ ENVS: Dict[str, EnvSpec] = {
     "tokenflow": EnvSpec(
         name="tokenflow",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "tqdm",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
@@ -222,7 +241,7 @@ ENVS: Dict[str, EnvSpec] = {
     "latentsync": EnvSpec(
         name="latentsync",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.32", "transformers>=4.44", "accelerate", "safetensors",
+        requirements=("diffusers>=0.32,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
                       "decord", "mediapipe", "tqdm"),
@@ -238,7 +257,7 @@ ENVS: Dict[str, EnvSpec] = {
     "musetalk": EnvSpec(
         name="musetalk",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.30", "transformers>=4.44", "accelerate",
+        requirements=("diffusers>=0.30,<1", "transformers>=4.44,<5", "accelerate",
                       "opencv-python-headless", "numpy<2", "librosa==0.10.2",
                       "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
         repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
@@ -302,7 +321,7 @@ ENVS: Dict[str, EnvSpec] = {
     "vace": EnvSpec(
         name="vace",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.49", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
@@ -316,7 +335,7 @@ ENVS: Dict[str, EnvSpec] = {
     "diffueraser": EnvSpec(
         name="diffueraser",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
                       "scipy", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
@@ -331,8 +350,8 @@ ENVS: Dict[str, EnvSpec] = {
     "dreamid": EnvSpec(
         name="dreamid",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.49", "accelerate", "safetensors",
-                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
+                      "numpy<2", "imageio[ffmpeg]", "einops",
                       "insightface==2.0", "easydict", "ftfy", "tqdm"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
@@ -350,8 +369,8 @@ ENVS: Dict[str, EnvSpec] = {
     "reface": EnvSpec(
         name="reface",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "safetensors",
-                      "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+                      "numpy<2", "imageio[ffmpeg]", "einops",
                       "omegaconf", "pytorch-lightning", "kornia", "insightface==2.0",
                       "tqdm"),
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
@@ -442,7 +461,7 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/RenYurui/PIRender.git", name="PIRender"),)),
     "anyv2v": EnvSpec(
         name="anyv2v", torch=TORCH_CU121,
-        requirements=("diffusers>=0.31", "transformers>=4.44", "accelerate", "opencv-python-headless",
+        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "opencv-python-headless",
                       "numpy<2", "imageio[ffmpeg]", "einops"),
         repos=(GitRepo("https://github.com/TIGER-AI-Lab/AnyV2V.git", name="AnyV2V"),)),
     "videocomposer": EnvSpec(
