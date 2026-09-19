@@ -290,6 +290,7 @@ and generation resumes from its per-video ledger. See
 | `python -m csf.env_check` | — | seconds | GPU, bf16, CUDA matmul, ffmpeg, Hub login |
 | `python -m csf.generation.prefetch --dry-run` | — | ~1 min | every Hub repo is reachable |
 | `python tests/test_generation.py` | — | ~1 min | allocation, splits, budget, substitutions |
+| `python tests/test_download_retry.py` | — | <1 s | Hub download retry classification, resume messaging |
 | `python main.py --config configs/smoke_cpu.yaml` | CPU | ~10 min | the whole training pipeline wires up |
 | `python main.py --config configs/regen_smoke.yaml --stage kinetics,generate,regen_manifest` | 1 GPU | ~30 min | generation workers, ledger, manifest rebuild |
 | `bash scripts/run_test.sh` | 1 GPU ≥12 GB | ~4 h | every training stage on 5,000 videos |
@@ -463,6 +464,7 @@ failures abort with a clear message instead of silently producing an empty datas
 | `no kernel image is available` / `sm_120 not supported` | RTX 50xx needs CUDA 12.8+ wheels: `setup_env.ps1 -Cuda cu128` |
 | `GatedRepoError` for Llama | Accept the licence on the model page, then `hf auth login` |
 | Many `download failed` / 429 lines | Log in to the Hub (higher limits) or lower `data.download_workers`. Re-running resumes. |
+| `N consecutive download failures (limit 10)` | A burst of CDN errors, usually 5xx. Those are retried with backoff now; if it still trips, the Hub is having a bad day — re-run once it recovers (everything cached is skipped) or raise `--set data.download_fail_fast=25`. |
 | `Generation produced no videos at all` | The message now lists the recorded failures; the full rows are in `runs/<run>/metrics/generation_failures.csv` and the worker logs in `runs/<run>/logs/generation/`. Re-running retries the failed jobs (`generation.max_attempts`). |
 | `Nothing to do: ... no retries left` | Every job has failed `generation.max_attempts` times. Fix the underlying error first, then raise the cap (`--set generation.max_attempts=5`) or delete the job's rows from the ledger file. |
 | `No module named pip` naming a system Python, or `ModuleNotFoundError` for a package the env installs | The env's interpreter is not running as its own venv. `python -m csf.generation.envs --doctor all --envs-root cache/regen/envs` reports each env's interpreter, pip and missing imports; a broken env is rebuilt automatically on the next run, or force it with `--build <env> --force`. |

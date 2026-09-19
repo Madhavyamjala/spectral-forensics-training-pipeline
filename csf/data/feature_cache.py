@@ -148,9 +148,21 @@ def build_feature_cache(df: pd.DataFrame, cfg: Config, dist_info: DistInfo) -> p
                                                   "stage": res["stage"], "error": res["error"][:500]})
                     limit = d.download_fail_fast if kind == "download" else d.extract_fail_fast
                     if consecutive[kind] >= limit:
-                        raise RuntimeError(f"{consecutive[kind]} consecutive {kind} failures (limit {limit}); "
-                                           f"last: {res['error']}. Likely systemic (network / auth / codec). "
-                                           f"See {failed_path}. Re-run to resume.")
+                        # Say plainly what survives. Aborting at 98% of 97,774 videos and
+                        # reporting only "re-run to resume" reads like three hours are gone;
+                        # every cached item is on disk and the re-run skips it.
+                        cached = len(mine) - len(todo) + n_done
+                        knob = ("data.download_fail_fast" if kind == "download"
+                                else "data.extract_fail_fast")
+                        raise RuntimeError(
+                            f"{consecutive[kind]} consecutive {kind} failures (limit {limit}); "
+                            f"last: {res['error']}. Likely systemic (network / auth / codec). "
+                            f"See {failed_path}.\n"
+                            f"Nothing cached is lost: {cached:,} of {len(mine):,} item(s) for this "
+                            f"rank are on disk and a re-run skips them, so it resumes at the "
+                            f"remaining {len(mine) - cached:,} - it does not start over. Re-run "
+                            f"the same command once the cause is cleared, or raise the tolerance "
+                            f"with --set {knob}=<n> if the failures are a transient burst.")
                 else:
                     consecutive = {"download": 0, "other": 0}
                     try:
