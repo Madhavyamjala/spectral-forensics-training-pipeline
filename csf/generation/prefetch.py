@@ -101,7 +101,7 @@ def generation_assets() -> List[HubAsset]:
     # base diffusion models the workers load by id at runtime
     for repo, used in (("black-forest-labs/FLUX.1-schnell", "bg_flux_image, bg_svd_video"),
                        ("stabilityai/stable-video-diffusion-img2vid-xt", "bg_svd_video"),
-                       ("stabilityai/stable-diffusion-2-1-base", "tokenflow")):
+                       ("Manojb/stable-diffusion-2-1-base", "tokenflow")):
         seen.setdefault(repo, HubAsset(repo, stage="generate", used_by=used))
     return sorted(seen.values(), key=lambda a: a.repo_id)
 

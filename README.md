@@ -489,6 +489,7 @@ failures abort with a clear message instead of silently producing an empty datas
 | `NameResolutionError` / `Could not find a version` during an env build | The node cannot reach the package index. Build the envs where it can — `python -m csf.generation.envs --build all --envs-root cache/regen/envs` — then run generation with `--set generation.offline=true`. Also check `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` and `pip.conf`: an unreachable *extra* index fails the install even when PyPI is reachable. Jobs skipped this way cost no retry attempts. |
 | `kinetics` skipped when you expected it to fetch | It is marked complete in `state.json` and its fingerprint still matches. `--force kinetics` re-runs it unconditionally. |
 | `Only N clip(s) pass the 'face' filter` | The face detectors are missing: `pip install insightface onnxruntime` (or `mediapipe`) in the driver environment. Without them the face families have no eligible source clips. |
+| `Only N GiB free disk space` | The figure names the directory it measured (`disk_probe` in the environment line). If that is not the filesystem holding your cache, check `paths.cache_dir`. |
 | Anything else | Open `runs/<run>/logs/crash_rank0.json`. It names the stage, step and video ids that failed. |
 
 ## 8. Outputs and publishing

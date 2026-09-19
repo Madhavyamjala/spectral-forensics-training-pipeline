@@ -40,7 +40,7 @@ def load() -> State:
     repo = repo_path("TokenFlow")
     require(repo / "run_tokenflow_pnp.py", "TokenFlow driver script")
     require(repo / "preprocess.py", "TokenFlow preprocess script")
-    sd_id = os.environ.get("CSF_SD_ID", "stabilityai/stable-diffusion-2-1-base")
+    sd_id = os.environ.get("CSF_SD_ID", "Manojb/stable-diffusion-2-1-base")
     note(f"tokenflow: repo {repo}, sd {sd_id}")
     return State(repo, sd_id)
 

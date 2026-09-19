@@ -161,11 +161,36 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
                         "slightly less precise but sufficient.")
         _check_generation_gpus(cfg, log)
 
-    free_gb = _shutil.disk_usage(Path(cfg.paths.cache_dir).resolve().anchor).free / 2**30
+    free_gb, probed = free_space_gib(cfg.paths.cache_dir)
     info["disk_free_gib"] = round(free_gb, 1)
+    info["disk_probe"] = str(probed)
+    video_free, video_probed = free_space_gib(cfg.paths.video_dir)
+    if video_probed != probed:                      # a second filesystem holds the videos
+        info["video_disk_free_gib"] = round(video_free, 1)
+        info["video_disk_probe"] = str(video_probed)
     log.info("Environment: %s", json.dumps(info))
-    if free_gb < (20 if cfg.mode == "test" else 120):
-        log.warning("Only %.1f GiB free disk space; the feature cache + model downloads may not fit.", free_gb)
+    for label, gib, where in (("cache", free_gb, probed), ("videos", video_free, video_probed)):
+        if gib < (20 if cfg.mode == "test" else 120):
+            log.warning("Only %.1f GiB free for the %s directory (measured on %s); the feature "
+                        "cache + model downloads may not fit.", gib, label, where)
+        if where == probed and label == "videos":
+            break                                   # same filesystem, one warning is enough
+
+
+def free_space_gib(path) -> "tuple[float, Path]":
+    """Free GiB on the filesystem that will hold `path`, and the directory actually measured.
+
+    The directory usually does not exist yet on a first run, which is why this used to measure
+    `Path(...).anchor` - and on POSIX that is always "/". It therefore reported the root
+    filesystem forever: on a cluster where the cache lives on a 30 TB mount, preflight warned
+    about the 71 GiB left on the OS disk, a number with no bearing on the run. Walking up to the
+    nearest existing parent measures the filesystem the data will really land on, and the caller
+    logs which directory that was so the figure can be checked.
+    """
+    probe = Path(path).resolve()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / 2 ** 30, probe
 
 
 def _check_generation_gpus(cfg, log) -> None:

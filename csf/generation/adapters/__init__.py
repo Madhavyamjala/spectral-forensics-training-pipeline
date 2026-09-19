@@ -598,7 +598,10 @@ ADAPTERS: Dict[str, Adapter] = {a.key: a for a in [
 
     # ---- video-to-video (2,333) ----
     _a("tokenflow", "video_to_video", "tokenflow", "worker_tokenflow.py", cost_s=240.0,
-       sd_id="stabilityai/stable-diffusion-2-1-base", steps=50, vram_gb=16.0),
+       # stabilityai/stable-diffusion-2-1-base no longer resolves; this is a community
+       # mirror of the same checkpoint. Override with CSF_SD_ID if you have a better source -
+       # the manifest records what actually rendered, so a mirror swap stays visible.
+       sd_id="Manojb/stable-diffusion-2-1-base", steps=50, vram_gb=16.0),
     _a("insv2v", "video_to_video", "vace", "worker_vace.py", actual_model="vace", cost_s=180.0,
        task="depth",
        note="InsV2V's weights are Drive-hosted. VACE stands in for prompt-driven whole-frame "

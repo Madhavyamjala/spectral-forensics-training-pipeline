@@ -22,7 +22,8 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from csf.generation import spec as S
 from csf.generation.adapters import (ADAPTERS, coverage, cost_estimate, env_specs,
@@ -1450,6 +1451,48 @@ def test_variant_capability() -> None:
           len(set(variant_pools(fam, {"inswapper": 100}, seed=1)["inswapper"])) > 1)
 
 
+def test_disk_probe() -> None:
+    """Free space must be measured where the data lands, not on the root filesystem."""
+    print("disk probe")
+    import importlib.util
+    import shutil as _sh
+    import tempfile
+
+    spec = importlib.util.spec_from_file_location("csf_main", ROOT / "main.py")
+    main_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(main_mod)
+
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    import ast as _a
+    calls = [n for n in _a.walk(_a.parse(src))
+             if isinstance(n, _a.Attribute) and n.attr == "anchor"]
+    check("no code path measures Path(...).anchor any more", not calls,
+          f"{len(calls)} anchor access(es) remain")
+    check("preflight logs which directory it measured", '"disk_probe"' in src)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        deep = Path(tmp) / "cache" / "regen" / "kinetics" / "clips"
+        gib, probed = main_mod.free_space_gib(deep)
+        check("a path that does not exist yet resolves to an existing parent", probed.exists())
+        check("it walks up no further than it must", str(probed) == str(Path(tmp).resolve()),
+              f"{probed} vs {Path(tmp).resolve()}")
+        check("it reports that filesystem's free space",
+              abs(gib - _sh.disk_usage(tmp).free / 2 ** 30) < 1.0)
+
+        existing = Path(tmp) / "here"
+        existing.mkdir()
+        _, probed_existing = main_mod.free_space_gib(existing)
+        check("an existing directory is measured directly",
+              probed_existing == existing.resolve())
+
+    # the bug: on POSIX the anchor of any absolute path is "/", so the old call measured the
+    # root filesystem no matter where the cache actually lived
+    check("the anchor of a project path is the root filesystem",
+          Path("./cache/regen").resolve().anchor == "/")
+    _, probed = main_mod.free_space_gib("./cache/regen")
+    check("the new probe does not collapse to the root", str(probed) != "/")
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
@@ -1457,7 +1500,8 @@ def main() -> int:
                test_metadata_merge, test_stage_scoping, test_probe_fallback,
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
-               test_stage_staleness, test_env_interpreter, test_variant_capability):
+               test_stage_staleness, test_env_interpreter, test_variant_capability,
+               test_disk_probe):
         fn()
     print()
     if FAILURES:
