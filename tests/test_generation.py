@@ -1531,6 +1531,12 @@ def test_disk_probe() -> None:
     check("the new probe does not collapse to the root", str(probed) != "/")
 
 
+# These exercise POSIX-only mechanics: venv layouts (bin/python), symlinks, and "/" as the
+# anchor of an absolute path. The generator itself is Linux-only - its per-model environments
+# clone Linux-only upstream repos - so skipping them on Windows loses no coverage that matters.
+POSIX_ONLY = {"test_env_paths", "test_env_interpreter", "test_disk_probe"}
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
@@ -1540,6 +1546,9 @@ def main() -> int:
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe):
+        if os.name == "nt" and fn.__name__ in POSIX_ONLY:
+            print(f"{fn.__name__} (skipped on Windows: POSIX-only generator internals)")
+            continue
         fn()
     print()
     if FAILURES:
