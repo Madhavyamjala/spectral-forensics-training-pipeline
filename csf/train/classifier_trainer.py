@@ -21,7 +21,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+from csf import LABELS
 from csf.config import Config
 from csf.data.datasets import CachedVideoDataset, LlamaCollator, QwenCollator
 from csf.distributed import DistInfo, all_gather_objects, all_reduce_mean, barrier
@@ -85,8 +86,13 @@ def _scheduler(opt, total_steps: int, warmup_ratio: float):
 
 @torch.no_grad()
 def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.dtype, dist_info: DistInfo,
-                  max_batches=None, return_pooled: bool = False, desc: str = "infer") -> Dict[str, Dict[str, Any]]:
-    """Returns {key: {"probs": np.ndarray[3], "label": int, "latency": sec/sample, ("pooled")}} gathered from all ranks."""
+                  max_batches=None, return_pooled: bool = False, desc: str = "infer",
+                  active_ids: Optional[List[int]] = None) -> Dict[str, Dict[str, Any]]:
+    """Returns {key: {"probs": np.ndarray[3], "label": int, "latency": sec/sample, ("pooled")}} gathered from all ranks.
+
+    `probs` always has one column per label in LABELS so everything downstream keeps its shape. When
+    `active_ids` excludes a class, the softmax is taken over the active columns only and the excluded
+    ones are reported as exactly 0 - renormalising over an untrained logit would invent a probability."""
     from tqdm import tqdm
     was_training = model.training
     model.eval()
@@ -103,7 +109,12 @@ def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.
         t0 = time.perf_counter()
         with torch.autocast(device.type, dtype=dtype, enabled=device.type == "cuda"):
             logits, pooled = model(**{k: v for k, v in batch.items() if k not in NON_MODEL_KEYS})
-        probs = torch.softmax(logits.float(), dim=-1)
+        if active_ids is not None and len(active_ids) < logits.shape[-1]:
+            idx = torch.as_tensor(active_ids, device=logits.device)
+            probs = torch.zeros_like(logits, dtype=torch.float32)
+            probs[:, idx] = torch.softmax(logits.float()[:, idx], dim=-1)
+        else:
+            probs = torch.softmax(logits.float(), dim=-1)
         if device.type == "cuda":
             torch.cuda.synchronize()
         per_sample = (time.perf_counter() - t0) / len(batch["keys"])
@@ -140,6 +151,17 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
     ckpt_root = cfg.work_dir / "checkpoints" / kind
     best_dir, last_dir = ckpt_root / "best", ckpt_root / "last"
     jsonl = cfg.work_dir / "logs" / f"train_{kind}.jsonl"
+
+    active_ids = cfg.data.active_label_ids()
+    # Slice the logits to the active classes rather than masking the others to -inf: with
+    # label_smoothing > 0 an excluded class still carries a non-zero target, and -log(0) is inf.
+    active_idx = torch.tensor(active_ids, device=device)
+    label_remap = torch.full((len(LABELS),), -1, dtype=torch.long, device=device)
+    label_remap[active_idx] = torch.arange(len(active_ids), device=device)
+    if len(active_ids) < len(LABELS):
+        log.warning("[%s] training on %d of %d classes (%s); the excluded head row(s) stay at "
+                    "initialisation instead of being trained to never fire.", kind, len(active_ids),
+                    len(LABELS), [LABELS[i] for i in active_ids])
 
     model, processor = build_classifier(kind, model_id, tcfg, device, cfg.models.attn_implementation)
     if device.type == "cuda":
@@ -204,7 +226,8 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
     def evaluate_and_checkpoint(force_save: bool = False) -> bool:
         nonlocal best_f1, bad_evals
         res = run_inference(ddp_model.module if dist_info.distributed else ddp_model, val_loader, device, dtype,
-                            dist_info, max_batches=tcfg.max_eval_batches, desc=f"val {kind}")
+                            dist_info, max_batches=tcfg.max_eval_batches, desc=f"val {kind}",
+                            active_ids=active_ids)
         m = _val_metrics(res)
         m.update(step=step, time=time.time())
         history.append(m)
@@ -260,7 +283,8 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
             with ctx:
                 with torch.autocast(device.type, dtype=dtype, enabled=device.type == "cuda"):
                     logits, _ = ddp_model(**{k: v for k, v in batch.items() if k not in NON_MODEL_KEYS})
-                loss = F.cross_entropy(logits.float(), batch["labels"], label_smoothing=tcfg.label_smoothing)
+                loss = F.cross_entropy(logits.float()[:, active_idx], label_remap[batch["labels"]],
+                                       label_smoothing=tcfg.label_smoothing)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"[{kind}] non-finite loss {loss.item()} at step {step} micro {micro}; "
                                              f"batch keys={batch['keys']}")

@@ -32,6 +32,7 @@ class DataConfig:
     repo_id: str = "madhav-yrc/Chrono-TriClass-100k"
     revision: Optional[str] = None
     manifest: str = "manifest.csv"
+    classes: Optional[List[str]] = None   # train on a subset of LABELS; None = all three
     max_rows: Optional[int] = 5000
     num_frames: int = 8
     frame_size: int = 224
@@ -47,6 +48,17 @@ class DataConfig:
     prefetch: int = 16
     download_fail_fast: int = 10
     extract_fail_fast: int = 50
+
+    def active_label_ids(self) -> List[int]:
+        """Label ids this run actually trains on. `classes` narrows the manifest to a subset - used
+        while a class is unusable (being regenerated, or mislabelled) so the run is not blocked by it."""
+        from csf import LABEL2ID
+        if not self.classes:
+            return list(range(len(LABEL2ID)))
+        unknown = [c for c in self.classes if c not in LABEL2ID]
+        if unknown:
+            raise ValueError(f"data.classes contains unknown label(s) {unknown}; valid: {list(LABEL2ID)}")
+        return sorted(LABEL2ID[c] for c in self.classes)
 
 
 @dataclass
