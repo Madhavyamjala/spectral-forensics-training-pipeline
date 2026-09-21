@@ -34,6 +34,15 @@ TORCH_CU121 = "torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1"
 #: pull the newest torch from PyPI on top of the pinned build - the env then flip-flops between
 #: the two on every rebuild. Meet upstream's floor instead of fighting it.
 TORCH_SAM2 = "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
+#: Why every torch-2.4.1 env caps diffusers and transformers rather than taking the newest:
+#: diffusers 0.36 added `models/attention_dispatch.py`, which registers a flash-attention-3
+#: custom op at import time under `from __future__ import annotations`, so its `float | None`
+#: defaults reach torch as strings. torch 2.4.1's infer_schema cannot parse those, and the
+#: import raises before any model loads - with no flash-attention package installed anywhere,
+#: which is what made it so hard to place. Its own guard only checks that custom_op exists
+#: (torch 2.4), not that the annotation syntax is supported (torch 2.5+). 0.35.2 is the last
+#: release without it; the repos here were written against 0.30-0.32 anyway. sam2_diffusers is
+#: on torch 2.5.1 and takes the newest of both.
 TORCH_LEGACY = "torch==1.13.1 torchvision==0.14.1"
 LEGACY_INDEX = "https://download.pytorch.org/whl/cu117"
 
@@ -120,6 +129,77 @@ print('sadtalker: replaced removed numpy scalar aliases in %d file(s)' % patched
 WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
 
 
+#: STTN's test.py opens `torch.device("cuda:1")` - hard-coded, not from a flag. Workers run with
+#: CUDA_VISIBLE_DEVICES pinned to one card, so the only ordinal that exists is 0 and every job
+#: dies with "invalid device ordinal" whichever GPU it was scheduled on.
+STTN_DEVICE_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'STTN' / 'test.py'
+text = path.read_text(encoding='utf-8')
+if 'cuda:1' in text:
+    path.write_text(text.replace('cuda:1', 'cuda:0'), encoding='utf-8')
+    print('sttn: repointed the hard-coded cuda:1 at the only visible device')
+else:
+    print('sttn: test.py already targets cuda:0')
+"""
+
+#: TPSMM's demo.py asks for `face_alignment.LandmarksType._2D`. face-alignment 1.4 renamed that
+#: enum member to TWO_D. Pinning back to 1.3.5 instead would pull `opencv-python` into this env,
+#: which installs the same import name as the headless build already there - the exact swap that
+#: has emptied `cv2` before - so the call site moves instead.
+TPSMM_FACE_ALIGNMENT_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'TPSMM' / 'demo.py'
+text = path.read_text(encoding='utf-8')
+if 'LandmarksType._2D' in text:
+    path.write_text(text.replace('LandmarksType._2D', 'LandmarksType.TWO_D'), encoding='utf-8')
+    print('tpsmm: renamed the face-alignment enum member demo.py asks for')
+else:
+    print('tpsmm: demo.py already uses the current enum name')
+"""
+
+#: Wav2Lip writes three intermediates - temp/temp.wav, temp/result.avi, and the ffmpeg mux that
+#: reads them - under whatever directory it is run from, with fixed names. Every Wav2Lip worker
+#: runs from the same cloned repo, so two jobs in flight at once overwrite each other's audio
+#: and frames, and a video can be muxed from another job's material. The names become per-job.
+WAV2LIP_TEMP_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'Wav2Lip' / 'inference.py'
+text = path.read_text(encoding='utf-8')
+job_tmp = "os.path.join(os.environ.get('CSF_JOB_TMP', 'temp'), %s)"
+swaps = [("'temp/temp.wav'", job_tmp % "'temp.wav'"),
+         ("'temp/result.avi'", job_tmp % "'result.avi'")]
+done = 0
+for old, new in swaps:
+    if old in text:
+        done += text.count(old)
+        text = text.replace(old, new)
+if done:
+    if 'import os' not in text:
+        text = 'import os\\n' + text
+    path.write_text(text, encoding='utf-8')
+print('wav2lip: gave %d shared intermediate(s) a per-job home' % done)
+"""
+
+#: SadTalker's own downloader is not safe to run twice: it opens with `mkdir ./checkpoints`
+#: (no -p), so on an env that already has its weights it prints "File exists", skips every
+#: download and exits non-zero - failing a build that had nothing wrong with it. Run it only
+#: when the checkpoints are actually absent, and judge it by what is on disk afterwards.
+SADTALKER_DOWNLOAD = """
+import os, pathlib, subprocess
+repo = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'SadTalker'
+wanted = repo / 'checkpoints' / 'SadTalker_V0.0.2_512.safetensors'
+if wanted.exists():
+    print('sadtalker: checkpoints already present, skipping the downloader')
+else:
+    (repo / 'checkpoints').mkdir(parents=True, exist_ok=True)
+    subprocess.run(['bash', 'scripts/download_models.sh'], cwd=repo, check=False)
+    if not wanted.exists():
+        raise SystemExit('sadtalker: download_models.sh did not produce %s' % wanted)
+    print('sadtalker: checkpoints downloaded')
+"""
+
+
 #: `onnxruntime` / `onnxruntime-gpu` and `opencv-python` / `opencv-python-headless` are pairs of
 #: distributions that install the SAME import name. Uninstalling one deletes the shared files
 #: even when the other is still recorded as installed - and pip then answers the reinstall with
@@ -142,6 +222,28 @@ for name in ('cv2', 'onnxruntime', 'numpy'):
     importlib.import_module(name)
 print('runtime swap ok: onnxruntime-gpu + headless OpenCV are importable')
 """
+
+
+OPENCV_HEADLESS_SWAP = """
+import subprocess, sys, importlib
+run = lambda *a: subprocess.run([sys.executable, '-m', 'pip', *a], check=False)
+run('uninstall', '-y', 'opencv-python', 'opencv-python-headless', 'opencv-contrib-python')
+subprocess.run([sys.executable, '-m', 'pip', 'install',
+                'opencv-python-headless', 'numpy<2'], check=True)
+importlib.import_module('cv2')
+print('opencv swap ok: the headless build is the one installed')
+"""
+
+
+def opencv_headless_swap() -> tuple:
+    """Put the headless OpenCV back after a dependency drags the full build in.
+
+    `opencv-python` and `opencv-python-headless` install the same import name, so whichever
+    lands last wins and uninstalling either deletes the shared files - pip then answers the
+    reinstall with "Requirement already satisfied" and does nothing. Every variant is removed
+    first and the headless build installed into the vacuum, same as the insightface envs do.
+    """
+    return ("-c", OPENCV_HEADLESS_SWAP)
 
 
 def onnxruntime_gpu_swap() -> tuple:
@@ -242,7 +344,11 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
                       "av", "einops", "tqdm", "scikit-image",
                       # all three test.py entry points import matplotlib for their colour maps
-                      "matplotlib"),
+                      "matplotlib",
+                      # E2FGVI's flow_comp.py imports mmcv.cnn.ConvModule. mmcv-lite is the
+                      # pure-Python half of mmcv - the wheel carries ConvModule and needs no
+                      # nvcc, unlike mmcv-full, which would have to compile CUDA ops here.
+                      "mmcv-lite"),
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
@@ -257,6 +363,9 @@ ENVS: Dict[str, EnvSpec] = {
                        staged_name="fuseformer.pth",
                        where="https://github.com/ruiliu-ai/FuseFormer (Drive link in README)"),
         ),
+        # mmcv-lite depends on opencv-python (and so does mmengine underneath it), which
+        # would replace the headless build this env installs - so put it back afterwards.
+        post_install=(opencv_headless_swap(), ("-c", STTN_DEVICE_PATCH)),
         note="All three checkpoints are Drive-hosted upstream, so they are staged by hand into "
              "generation.staged_weights_dir and copied into place by the build.",
     ),
@@ -275,7 +384,7 @@ ENVS: Dict[str, EnvSpec] = {
                  WeightFile(dest="repos/Wav2Lip/face_detection/detection/sfd/s3fd.pth",
                             hf_repo="camenduru/Wav2Lip",
                             hf_file="checkpoints/s3fd-619a316812.pth")),
-        post_install=(("-c", WAV2LIP_LIBROSA_PATCH),),
+        post_install=(("-c", WAV2LIP_LIBROSA_PATCH), ("-c", WAV2LIP_TEMP_PATCH)),
     ),
 
     # --- First Order Motion Model (reenactment) ------------------------------------------
@@ -297,7 +406,8 @@ ENVS: Dict[str, EnvSpec] = {
     "tokenflow": EnvSpec(
         name="tokenflow",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "tqdm",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
@@ -307,7 +417,8 @@ ENVS: Dict[str, EnvSpec] = {
     "latentsync": EnvSpec(
         name="latentsync",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.32,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.32,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
                       "decord", "mediapipe", "tqdm"),
@@ -323,7 +434,7 @@ ENVS: Dict[str, EnvSpec] = {
     "musetalk": EnvSpec(
         name="musetalk",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.30,<1", "transformers>=4.44,<5", "accelerate",
+        requirements=("diffusers>=0.30,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "opencv-python-headless", "numpy<2", "librosa==0.10.2",
                       "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
         repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
@@ -362,8 +473,7 @@ ENVS: Dict[str, EnvSpec] = {
             # the fix is to rewrite the import in the installed copy. Upstream basicsr is
             # unmaintained, so there is no release to upgrade to.
             ("-c", BASICSR_PATCH),
-            ("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
-                   "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),
+            ("-c", SADTALKER_DOWNLOAD),
             ("-c", SADTALKER_NUMPY_PATCH),
         ),
         hub_repos=(),   # its downloader pulls from GitHub Releases, not the Hub
@@ -379,8 +489,8 @@ ENVS: Dict[str, EnvSpec] = {
         # and that copy's arcface_onnx.py imports `onnx` itself - onnxruntime is a different
         # distribution and does not provide it
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
-                      "onnxruntime-gpu==1.18.1", "onnx", "rich", "pyyaml", "albumentations",
-                      "tqdm"),
+                      "onnxruntime-gpu==1.18.1", "onnx", "requests", "rich", "pyyaml",
+                      "albumentations", "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
         post_install=(hub_snapshot("KlingTeam/LivePortrait",
                                    "repos", "LivePortrait", "pretrained_weights"),),
@@ -392,7 +502,8 @@ ENVS: Dict[str, EnvSpec] = {
     "vace": EnvSpec(
         name="vace",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
         # `wan` is not derivable from the requirements, and neither is the fact that VACE
@@ -412,7 +523,8 @@ ENVS: Dict[str, EnvSpec] = {
     "diffueraser": EnvSpec(
         name="diffueraser",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
                       "scipy", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
@@ -431,7 +543,8 @@ ENVS: Dict[str, EnvSpec] = {
         # DWPose ONNX models placed by hand), and it reaches mediapipe through the repo's own
         # express_adaption package. dashscope is imported by the vendored prompt-extend module
         # that the entry point loads at import time, whether or not prompt extension is used.
-        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
+                      "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
                       "insightface==2.0", "easydict", "ftfy", "tqdm",
                       "mediapipe", "dashscope"),
@@ -454,7 +567,8 @@ ENVS: Dict[str, EnvSpec] = {
     "reface": EnvSpec(
         name="reface",
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
                       "omegaconf", "pytorch-lightning", "kornia", "insightface==2.0",
                       "tqdm"),
@@ -481,6 +595,7 @@ ENVS: Dict[str, EnvSpec] = {
                       "face-alignment"),
         repos=(GitRepo("https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model.git",
                        name="TPSMM"),),
+        post_install=(("-c", TPSMM_FACE_ALIGNMENT_PATCH),),
         weights=(WeightFile(dest="repos/TPSMM/checkpoints/vox.pth.tar",
                             staged_name="vox.pth.tar",
                             where="https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model "
@@ -501,9 +616,10 @@ ENVS: Dict[str, EnvSpec] = {
         # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
         # it installs `dlib` under the same import name.
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
-                      # StyleGANEX/models/psp.py imports matplotlib at module scope
-                      "dlib-bin", "matplotlib", "tqdm"),
-        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib"),
+                      # psp.py imports matplotlib, and the vendored lpips imports skimage
+                      "dlib-bin", "matplotlib", "scikit-image", "tqdm"),
+        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib",
+                        "skimage"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
         weights=(
             # Upstream releases one checkpoint PER EDITING DIRECTION, not one "editing" model:
@@ -551,7 +667,8 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/RenYurui/PIRender.git", name="PIRender"),)),
     "anyv2v": EnvSpec(
         name="anyv2v", torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "opencv-python-headless",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "opencv-python-headless",
                       "numpy<2", "imageio[ffmpeg]", "einops"),
         repos=(GitRepo("https://github.com/TIGER-AI-Lab/AnyV2V.git", name="AnyV2V"),)),
     "videocomposer": EnvSpec(

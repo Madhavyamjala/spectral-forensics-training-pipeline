@@ -180,6 +180,7 @@ class ReadyEnv:
         """
         env = _clean_environ()
         venv_bin = Path(self.python).parent
+        _ffmpeg_shim(venv_bin)
         env["VIRTUAL_ENV"] = str(venv_bin.parent)
         env["PATH"] = os.pathsep.join([str(venv_bin), env.get("PATH", "")]).rstrip(os.pathsep)
         # make the cloned repos importable without each worker hard-coding paths. This
@@ -285,6 +286,34 @@ def _write_constraints(spec: "EnvSpec", root: Path) -> Optional[Path]:
     path = Path(root) / "constraints.txt"
     path.write_text("\n".join(pins) + "\n", encoding="utf-8")
     return path
+
+
+def _ffmpeg_shim(venv_bin: Path) -> None:
+    """Expose imageio-ffmpeg's bundled binary as a plain `ffmpeg` on the env's PATH.
+
+    Several upstream repos shell out to bare `ffmpeg` - Wav2Lip muxes its result that way, and
+    ignores the return code, so on a machine without a system ffmpeg it exits 0 having written
+    nothing at all. Every env already installs imageio-ffmpeg, which ships a binary under a
+    version-stamped name; linking it under the name those repos call makes them work, and
+    `environ()` already puts this directory first on PATH.
+
+    Done here rather than at build time so envs built before this existed pick it up too,
+    without a rebuild. Best-effort: an env with no imageio-ffmpeg, or a filesystem that refuses
+    the link, is left exactly as it was.
+    """
+    target = venv_bin / "ffmpeg"
+    if target.exists():
+        return
+    binaries = sorted((venv_bin.parent).glob(
+        "lib*/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg-*"))
+    usable = [b for b in binaries if b.is_file() and os.access(b, os.X_OK)]
+    if not usable:
+        return
+    try:
+        target.symlink_to(usable[-1])
+        log.debug("Linked %s -> %s", target, usable[-1])
+    except OSError as exc:                                   # noqa: BLE001 - never fatal
+        log.debug("Could not link ffmpeg into %s: %s", venv_bin, exc)
 
 
 def _clean_environ() -> Dict[str, str]:

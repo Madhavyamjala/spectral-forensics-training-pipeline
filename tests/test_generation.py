@@ -1292,8 +1292,10 @@ def test_env_interpreter() -> None:
                  and "<" not in r]
     check("every transformers/diffusers pin has a major-version ceiling", not unbounded,
           str(unbounded))
+    # ",<5" or tighter: the torch-2.4.1 envs cap at 4.50 as well, for a different reason
+    # (see test_torch_library_ceilings), and both ceilings keep it on the 4.x line
     check("the ceiling keeps transformers on the 4.x line",
-          all("transformers>=4" in r and ",<5" in r
+          all("transformers>=4" in r and (",<5" in r or ",<4." in r)
               for sp in specs_all.values() for r in sp.pip_requirements()
               if r.startswith("transformers")))
     from csf.generation.envs import FRAMEWORK_PROBE, _verify_framework
@@ -1600,6 +1602,112 @@ def test_worker_dependencies() -> None:
           (int(re.search(r"N_FRAMES = (\d+)", dreamid).group(1)) - 1) % 4 == 0)
 
 
+def test_second_round_dependencies() -> None:
+    """The failures a smoke run found underneath the first round of missing imports."""
+    print("second-round dependencies")
+    envs = env_specs()
+
+    reqs = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                         for r in envs[name].pip_requirements()]
+    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv-lite" in reqs("videoinpaint"))
+    check("it is the lite build, which needs no nvcc", "mmcv-full" not in reqs("videoinpaint"))
+    check("stylegan installs scikit-image for the vendored lpips",
+          "scikit-image" in reqs("stylegan"))
+    check("liveportrait installs requests for the vendored insightface downloader",
+          "requests" in reqs("liveportrait"))
+
+    # mmcv-lite and mmengine both depend on opencv-python, which installs the same import name
+    # as the headless build - whichever lands last wins, so the headless one must land last
+    vi_hooks = "".join("".join(c) for c in envs["videoinpaint"].post_install)
+    check("videoinpaint puts the headless OpenCV back after mmcv drags the full one in",
+          "opencv-python-headless" in vi_hooks and "uninstall" in vi_hooks)
+    check("STTN's hard-coded cuda:1 is repointed at the only visible device",
+          "cuda:1" in vi_hooks and "cuda:0" in vi_hooks)
+
+    tps = "".join("".join(c) for c in envs["tpsmm"].post_install)
+    check("TPSMM asks face-alignment for the enum member it still has",
+          "LandmarksType.TWO_D" in tps)
+    check("face-alignment is not pinned back to a release that wants opencv-python",
+          not any("face-alignment==" in r for r in envs["tpsmm"].pip_requirements()))
+
+    w2l = "".join("".join(c) for c in envs["wav2lip"].post_install)
+    check("Wav2Lip's shared intermediates become per-job", "CSF_JOB_TMP" in w2l)
+    for shared in ("'temp/temp.wav'", "'temp/result.avi'"):
+        check(f"{shared} is rewritten", shared in w2l)
+    worker = (ROOT / "csf/generation/adapters/workers/worker_wav2lip.py").read_text()
+    check("the worker sets the variable the patch reads", "CSF_JOB_TMP" in worker)
+
+    sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
+    check("SadTalker's downloader is skipped when the checkpoints are there",
+          "already present" in sad)
+    check("it is no longer judged by its own exit code", "check=False" in sad)
+    check("but the build still fails if the weights are absent afterwards",
+          "did not produce" in sad)
+
+    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    check("FuseFormer's output is read from the clone it actually writes to",
+          "_result.mp4" in vi and "state.repo" in vi)
+    check("and is named per job, so concurrent workers cannot collide",
+          "tag = tmp.name" in vi and "f\"{tag}_frames\"" in vi)
+    check("nothing is left behind in the shared clone", "in_repo.unlink()" in vi)
+
+
+def test_torch_library_ceilings() -> None:
+    """torch 2.4.1 envs must not take a diffusers that registers PEP-604 custom ops."""
+    print("library ceilings")
+    envs = env_specs()
+    torch_241 = [name for name, spec in envs.items() if "torch==2.4.1" in spec.torch]
+    for name in sorted(torch_241):
+        for req in envs[name].pip_requirements():
+            if req.startswith("diffusers"):
+                check(f"{name} caps diffusers below the flash-attn-3 registration",
+                      "<0.33" in req or "<0.36" in req, req)
+            if req.startswith("transformers"):
+                check(f"{name} caps transformers where torch 2.4.1 can still follow",
+                      "<4.50" in req, req)
+
+    sam2 = envs["sam2_diffusers"]
+    check("the env on torch 2.5.1 is left uncapped",
+          "2.5.1" in sam2.torch and any(r == "diffusers>=0.31,<1" for r in sam2.pip_requirements()),
+          "it parses the newer annotations and already reaches the Hub")
+
+
+def test_ffmpeg_shim() -> None:
+    """Repos that shell out to a bare `ffmpeg` must find one on the env's PATH."""
+    print("ffmpeg shim")
+    import tempfile
+    from csf.generation import envs as envs_mod
+
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("the shim is applied where the environment is built, not at install time",
+          "_ffmpeg_shim(venv_bin)" in src,
+          "envs built before it existed must pick it up without a rebuild")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        binaries = root / "lib" / "python3.12" / "site-packages" / "imageio_ffmpeg" / "binaries"
+        binaries.mkdir(parents=True)
+        real = binaries / "ffmpeg-linux-x86_64-v7.0.2"
+        real.write_text("#!/bin/sh\n")
+        real.chmod(0o755)
+        venv_bin = root / "bin"
+        venv_bin.mkdir()
+
+        envs_mod._ffmpeg_shim(venv_bin)
+        link = venv_bin / "ffmpeg"
+        check("the bundled binary is exposed under the name repos call",
+              link.exists() and link.resolve() == real.resolve())
+
+        envs_mod._ffmpeg_shim(venv_bin)
+        check("running it again is a no-op", link.exists())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        venv_bin = Path(tmp) / "bin"
+        venv_bin.mkdir()
+        envs_mod._ffmpeg_shim(venv_bin)
+        check("an env without imageio-ffmpeg is left alone", not (venv_bin / "ffmpeg").exists())
+
+
 def test_child_process_errors() -> None:
     """A failed upstream CLI must report the head of its traceback, not only the tail."""
     print("child process errors")
@@ -1674,7 +1782,8 @@ def main() -> int:
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
-               test_disk_probe, test_worker_dependencies, test_child_process_errors,
+               test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
+               test_torch_library_ceilings, test_ffmpeg_shim, test_child_process_errors,
                test_smoke_selection):
         fn()
     print()

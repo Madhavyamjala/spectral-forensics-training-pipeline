@@ -68,10 +68,15 @@ def render(state: State, payload: dict) -> dict:
 
     with scratch(payload["job_id"]) as tmp:
         tmp = Path(tmp)
-        frame_dir, mask_dir = tmp / "frames", tmp / "masks"
+        # FuseFormer names its output after the *basename* of --video and writes it into the
+        # working directory, which is the clone every FuseFormer worker shares. With a fixed
+        # name ("frames") two jobs in flight would overwrite each other, and the newest-mp4
+        # search below could hand one job another's video - so the name carries the job's
+        # unique scratch directory and the file is read by that exact name.
+        tag = tmp.name
+        frame_dir, mask_dir = tmp / f"{tag}_frames", tmp / f"{tag}_masks"
         write_frames(frames, str(frame_dir))
         write_masks(masks, str(mask_dir))
-        out_mp4 = tmp / "result.mp4"
         cmd = [os.sys.executable, state.spec["script"], "--video", str(frame_dir),
                "--mask", str(mask_dir), "--ckpt", str(state.ckpt)]
         if state.name == "e2fgvi_hq":
@@ -79,11 +84,16 @@ def render(state: State, payload: dict) -> dict:
                     "--savefps", str(int(round(fps)))]
         run_cmd(cmd, cwd=str(state.repo), timeout=1800)
 
-        produced = sorted(list(tmp.rglob("*.mp4")) + list(Path(state.repo, "results").glob("*.mp4")),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
+        in_repo = Path(state.repo) / f"{frame_dir.name}_result.mp4"
+        candidates = list(tmp.rglob("*.mp4")) + list(Path(state.repo, "results").glob("*.mp4"))
+        if in_repo.exists():
+            candidates.append(in_repo)
+        produced = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
         result = []
         if produced:
             result, _ = read_video(str(produced[0]), max_side=0)
+        if in_repo.exists():
+            in_repo.unlink()          # never leave a job's output in the shared clone
         if not result:
             dirs = [p for p in tmp.rglob("*") if p.is_dir() and p.name.startswith("result")]
             if dirs:

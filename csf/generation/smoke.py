@@ -46,7 +46,8 @@ class Result:
     ok: bool
     seconds: float = 0.0
     output: str = ""
-    size_mb: float = 0.0
+    size_kb: float = 0.0
+    frames: int = 0
     error: str = ""
     stderr: str = ""
 
@@ -141,8 +142,11 @@ def run_smoke(cfg, models: Sequence[str], gpu: int, out_dir: Path,
                     result.stderr = worker.stderr_tail(30)
             result.seconds = time.monotonic() - started
             if result.ok and out.exists():
-                result.size_mb = out.stat().st_size / 2 ** 20
-                if not result.size_mb:
+                result.size_kb = out.stat().st_size / 1024
+                # a frame count, because a plausible-looking file size is not evidence that a
+                # model rendered anything - a one-frame or duration-zero mp4 weighs the same
+                result.frames = int((msg.get("metadata") or {}).get("frames") or 0)
+                if not result.size_kb:
                     result.ok, result.error = False, "the worker reported success but wrote an "\
                                                      "empty file"
             results.append(result)
@@ -153,11 +157,12 @@ def run_smoke(cfg, models: Sequence[str], gpu: int, out_dir: Path,
 
 def report(results: Sequence[Result]) -> int:
     """Print the summary table and return the number of failures."""
-    print(f"\n{'model':<22}{'runs as':<18}{'env':<14}{'status':<9}{'secs':>7}{'MB':>7}")
-    print("-" * 77)
+    print(f"\n{'model':<22}{'runs as':<18}{'env':<14}{'status':<9}"
+          f"{'secs':>7}{'KB':>9}{'frames':>8}")
+    print("-" * 85)
     for r in results:
         print(f"{r.model:<22}{r.runs_as:<18}{r.env:<14}{r.status:<9}"
-              f"{r.seconds:>7.0f}{r.size_mb:>7.1f}")
+              f"{r.seconds:>7.0f}{r.size_kb:>9.0f}{r.frames:>8}")
     failed = [r for r in results if not r.ok]
     for r in failed:
         print(f"\n--- {r.model} ({r.env}) ---\n{r.error}")
