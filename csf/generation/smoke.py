@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -105,7 +106,10 @@ def run_smoke(cfg, models: Sequence[str], gpu: int, out_dir: Path,
               timeout: int = 1800) -> List[Result]:
     """Render one video per model and return a result per model, in the order asked for."""
     gen = cfg.generation
-    out_dir = Path(out_dir)
+    # absolute, always: workers run with cwd set to their own env root, so a relative output
+    # path makes each one write into its environment instead of here - the same trap the
+    # scheduler's video_root already had
+    out_dir = Path(os.path.abspath(out_dir))
     # before spending a model load on it: every worker writes its video and its log here, and
     # a quota refuses both while the filesystem still reports free space
     require_writable(out_dir, mib=16, label="the smoke output")

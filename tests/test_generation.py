@@ -1708,6 +1708,21 @@ def test_ffmpeg_shim() -> None:
         check("an env without imageio-ffmpeg is left alone", not (venv_bin / "ffmpeg").exists())
 
 
+def test_smoke_output_location() -> None:
+    """Workers run with cwd set to their env root, so a relative output path goes astray."""
+    print("smoke output location")
+    src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("the smoke output directory is made absolute", "os.path.abspath(out_dir)" in src,
+          "a relative path put eight rendered videos under cache/regen/envs/<env>/ instead")
+    base = (ROOT / "csf/generation/adapters/base.py").read_text()
+    check("workers really do run from their env root", "cwd=str(self.env.root)" in base)
+
+    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    check("STTN is handed a video file, not the frame folder", "video_is_file" in vi,
+          "it opens --video with cv2.VideoCapture, which reads a directory as zero frames")
+    check("the other two still get the folder they expect", vi.count("video_is_file") == 2)
+
+
 def test_quota_probe() -> None:
     """Free space is not permission to write, and a quota is invisible to disk_usage."""
     print("quota probe")
@@ -1845,7 +1860,8 @@ def main() -> int:
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
-               test_env_selection_typos, test_child_process_errors,
+               test_env_selection_typos, test_smoke_output_location,
+               test_child_process_errors,
                test_smoke_selection):
         fn()
     print()

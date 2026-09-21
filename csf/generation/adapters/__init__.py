@@ -490,7 +490,8 @@ ENVS: Dict[str, EnvSpec] = {
         # distribution and does not provide it
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
                       "onnxruntime-gpu==1.18.1", "onnx", "requests", "rich", "pyyaml",
-                      "albumentations", "tqdm"),
+                      # the vendored insightface's face_align imports skimage too
+                      "scikit-image", "albumentations", "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
         post_install=(hub_snapshot("KlingTeam/LivePortrait",
                                    "repos", "LivePortrait", "pretrained_weights"),),
@@ -505,7 +506,10 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
-                      "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
+                      # VACE's annotators package is imported by vace_wan_inference.py and
+                      # opens with pycocotools, from upstream's annotator requirements
+                      "easydict", "ftfy", "regex", "omegaconf", "decord", "pycocotools",
+                      "tqdm"),
         # `wan` is not derivable from the requirements, and neither is the fact that VACE
         # dies on it at job time rather than build time - name it so a broken install fails
         # here, where the error says which env and can be retried

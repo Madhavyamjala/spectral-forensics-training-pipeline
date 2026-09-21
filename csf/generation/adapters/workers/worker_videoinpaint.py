@@ -28,7 +28,7 @@ SPECS = {
     "e2fgvi_hq": {"repo": "E2FGVI", "script": "test.py", "model": "e2fgvi_hq",
                   "ckpt": "release_model/E2FGVI-HQ-CVPR22.pth"},
     "sttn":      {"repo": "STTN", "script": "test.py", "model": "sttn",
-                  "ckpt": "checkpoints/sttn.pth"},
+                  "ckpt": "checkpoints/sttn.pth", "video_is_file": True},
     "fuseformer": {"repo": "FuseFormer", "script": "test.py", "model": "fuseformer",
                    "ckpt": "checkpoints/fuseformer.pth"},
 }
@@ -77,7 +77,13 @@ def render(state: State, payload: dict) -> dict:
         frame_dir, mask_dir = tmp / f"{tag}_frames", tmp / f"{tag}_masks"
         write_frames(frames, str(frame_dir))
         write_masks(masks, str(mask_dir))
-        cmd = [os.sys.executable, state.spec["script"], "--video", str(frame_dir),
+        # STTN opens --video with cv2.VideoCapture, so it needs a file; E2FGVI and FuseFormer
+        # read the folder. Its masks are still a directory - only the video side differs.
+        video_arg = frame_dir
+        if state.spec.get("video_is_file"):
+            video_arg = tmp / f"{tag}_input.mp4"
+            write_video(frames, str(video_arg), fps=fps)
+        cmd = [os.sys.executable, state.spec["script"], "--video", str(video_arg),
                "--mask", str(mask_dir), "--ckpt", str(state.ckpt)]
         if state.name == "e2fgvi_hq":
             cmd += ["--model", "e2fgvi_hq", "--set_size", "--width", str(w8), "--height", str(h8),

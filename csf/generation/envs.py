@@ -789,8 +789,17 @@ def diagnose(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, Dict[str, o
 def _main() -> int:
     """`python -m csf.generation.envs --build <name|all>` pre-builds envs before a run."""
     import argparse
+    import logging as _logging
 
     from csf.generation.adapters import ADAPTERS, env_specs
+
+    # Nothing configures logging when this module is run directly, so every step this command
+    # narrates - which env, which of its steps, the pip output - went to a logger with no
+    # handler. A thirteen-env rebuild taking twenty minutes looked identical to one that did
+    # nothing at all, twice, while we were trying to work out whether it had run.
+    if not _logging.getLogger().handlers:
+        _logging.basicConfig(level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                             datefmt="%H:%M:%S")
 
     ap = argparse.ArgumentParser(description="Build the per-model environments")
     ap.add_argument("--build", default="", help="env or adapter name, or 'all'")
