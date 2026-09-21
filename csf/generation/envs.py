@@ -823,9 +823,12 @@ def _main() -> int:
 
     ap = argparse.ArgumentParser(description="Build the per-model environments")
     ap.add_argument("--build", default="", help="env or adapter name, or 'all'")
-    ap.add_argument("--envs-root", default="./cache/generation/envs")
+    ap.add_argument("--config", default="configs/regen.yaml",
+                    help="config to read generation.envs_root and staged_weights_dir from")
+    ap.add_argument("--envs-root", default=None,
+                    help="override the root from --config")
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--staged-weights-dir", default="./model_paths",
+    ap.add_argument("--staged-weights-dir", default=None,
                     help="folder holding checkpoints that cannot be downloaded unattended")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--scan", default="", metavar="NAME",
@@ -837,6 +840,26 @@ def _main() -> int:
                                                "environment(s) so they are recreated from "
                                                "scratch. Combine with --build to rebuild now.")
     args = ap.parse_args()
+
+    # The run stage builds its envs under generation.envs_root. This command used to default
+    # somewhere else entirely, so a rebuild landed in a tree nothing reads, the pipeline
+    # quietly rebuilt the real one on its next run, and the two drifted apart while looking
+    # like they agreed. Read the same config unless told otherwise.
+    envs_root, staged = args.envs_root, args.staged_weights_dir
+    source = "--envs-root" if envs_root else args.config
+    if envs_root is None or staged is None:
+        try:
+            from csf.config import load_config
+            cfg = load_config(args.config, [])
+            envs_root = envs_root or cfg.generation.envs_root
+            staged = staged or cfg.generation.staged_weights_dir
+        except Exception as exc:                     # noqa: BLE001 - a missing config is fine
+            log.warning("Could not read %s (%s); falling back to the built-in defaults",
+                        args.config, exc)
+            envs_root = envs_root or "./cache/regen/envs"
+            staged = staged or "./model_paths"
+    args.envs_root, args.staged_weights_dir = envs_root, staged
+    log.info("Environments root: %s (from %s)", envs_root, source)
 
     specs = env_specs()
     root = Path(args.envs_root)

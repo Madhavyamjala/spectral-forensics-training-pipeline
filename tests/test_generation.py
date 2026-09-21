@@ -1707,6 +1707,25 @@ def test_import_scanner() -> None:
     check("an unusable interpreter is reported, not raised", broken.get("error"))
 
 
+def test_envs_cli_root() -> None:
+    """The envs command must build where the pipeline looks."""
+    print("envs cli root")
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("the CLI has no hard-coded env root of its own",
+          '"./cache/generation/envs"' not in src,
+          "it used to default somewhere the run stage never reads, so a rebuild landed in a "
+          "tree nothing used and the pipeline silently rebuilt the real one")
+    check("it reads the same config the run stage does", '"--config"' in src)
+    check("--envs-root still overrides it", '"override the root from --config"' in src)
+    check("and it says which root it chose", "Environments root: %s (from %s)" in src)
+
+    from csf.config import load_config
+    cfg = load_config(str(ROOT / "configs/regen.yaml"), [])
+    check("the config's env root is the regen tree",
+          cfg.generation.envs_root.rstrip("/").endswith("cache/regen/envs"),
+          cfg.generation.envs_root)
+
+
 def test_entry_points_declared() -> None:
     """Every env with a repo must say which file its worker runs."""
     print("entry points")
@@ -1977,7 +1996,8 @@ def test_quota_probe() -> None:
             check("a genuinely full filesystem is reported too", write_probe(tmp, mib=1))
 
     main_src = (ROOT / "main.py").read_text()
-    check("preflight probes before a run starts", "require_writable(cfg.paths.cache_dir" in main_src)
+    check("preflight probes before a run starts",
+          "require_writable(cfg.paths.cache_dir" in main_src)
     sched_src = (ROOT / "csf/generation/scheduler.py").read_text()
     check("the scheduler re-probes while it runs", "write_probe(self.video_root" in sched_src)
     check("but not once per job", "probe_interval_s" in sched_src)
@@ -2070,7 +2090,7 @@ def main() -> int:
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
-               test_import_scanner, test_entry_points_declared,
+               test_import_scanner, test_envs_cli_root, test_entry_points_declared,
                test_musetalk_dwpose_patch,
                test_third_round_dependencies, test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
