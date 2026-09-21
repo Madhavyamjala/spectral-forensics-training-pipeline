@@ -113,6 +113,10 @@ def run_smoke(cfg, models: Sequence[str], gpu: int, out_dir: Path,
     # before spending a model load on it: every worker writes its video and its log here, and
     # a quota refuses both while the filesystem still reports free space
     require_writable(out_dir, mib=16, label="the smoke output")
+    # the run stage sets this from the same config key; without it REFace's worker refuses to
+    # start, and a smoke sweep would report a licence gate as if it were a broken model
+    if getattr(gen, "accept_noncommercial", False):
+        os.environ["CSF_ACCEPT_NONCOMMERCIAL"] = "1"
     jobs = _first_jobs(cfg, models)
 
     pool = WorkerPool(

@@ -117,6 +117,22 @@ for path in sorted(root.rglob('*.py')):
         path.write_text(fixed, encoding='utf-8')
         patched += 1
 print('sadtalker: replaced removed numpy scalar aliases in %d file(s)' % patched)
+
+# align_img packs its scale and translation straight into np.array([...]), but they arrive as
+# length-1 arrays, not scalars. numpy used to broadcast that; since 1.24 it is an error
+# ("inhomogeneous shape"), raised after the 3DMM step has already run.
+ragged = root / 'src' / 'face3d' / 'util' / 'preprocess.py'
+old = 'trans_params = np.array([w0, h0, s, t[0], t[1]])'
+new = ('trans_params = np.array([w0, h0, float(np.squeeze(s)), '
+       'float(np.squeeze(t[0])), float(np.squeeze(t[1]))])')
+text = ragged.read_text(encoding='utf-8')
+if old in text:
+    ragged.write_text(text.replace(old, new), encoding='utf-8')
+    print('sadtalker: flattened the alignment parameters align_img packs')
+elif new in text:
+    print('sadtalker: alignment parameters already flattened')
+else:
+    print('sadtalker: WARNING - align_img no longer matches the expected line')
 """
 
 
@@ -345,10 +361,12 @@ ENVS: Dict[str, EnvSpec] = {
                       "av", "einops", "tqdm", "scikit-image",
                       # all three test.py entry points import matplotlib for their colour maps
                       "matplotlib",
-                      # E2FGVI's flow_comp.py imports mmcv.cnn.ConvModule. mmcv-lite is the
-                      # pure-Python half of mmcv - the wheel carries ConvModule and needs no
-                      # nvcc, unlike mmcv-full, which would have to compile CUDA ops here.
-                      "mmcv-lite"),
+                      # E2FGVI's flow_comp.py wants both mmcv.cnn.ConvModule and
+                      # mmcv.runner.load_checkpoint, and mmcv 2.0 deleted mmcv.runner - so the
+                      # 1.x line is the one that works. In 1.x the distribution named `mmcv` is
+                      # the ops-free build (MMCV_WITH_OPS defaults to 0, and `mmcv-full` is the
+                      # one that compiles), so this needs no nvcc either.
+                      "mmcv==1.7.2"),
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
@@ -409,6 +427,8 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "tqdm",
+                      # TokenFlow's util.py imports kornia.geometry.transform
+                      "kornia",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
     ),
@@ -420,6 +440,8 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.32,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      # latentsync/utils/affine_transform.py imports kornia
+                      "kornia",
                       "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
                       "decord", "mediapipe", "tqdm"),
         repos=(GitRepo("https://github.com/bytedance/LatentSync.git", name="LatentSync"),),
@@ -490,8 +512,9 @@ ENVS: Dict[str, EnvSpec] = {
         # distribution and does not provide it
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
                       "onnxruntime-gpu==1.18.1", "onnx", "requests", "rich", "pyyaml",
-                      # the vendored insightface's face_align imports skimage too
-                      "scikit-image", "albumentations", "tqdm"),
+                      # the vendored insightface's face_align imports skimage; src/utils/filter
+                      # smooths its keypoint tracks with pykalman
+                      "scikit-image", "pykalman", "albumentations", "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
         post_install=(hub_snapshot("KlingTeam/LivePortrait",
                                    "repos", "LivePortrait", "pretrained_weights"),),
@@ -508,8 +531,10 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       # VACE's annotators package is imported by vace_wan_inference.py and
                       # opens with pycocotools, from upstream's annotator requirements
+                      # the annotators package reaches pycocotools and, through dwpose,
+                      # matplotlib - both from upstream's annotator requirements
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "pycocotools",
-                      "tqdm"),
+                      "matplotlib", "tqdm"),
         # `wan` is not derivable from the requirements, and neither is the fact that VACE
         # dies on it at job time rather than build time - name it so a broken install fails
         # here, where the error says which env and can be retried
@@ -530,7 +555,9 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
-                      "scipy", "tqdm"),
+                      # DiffuEraser bundles a copy of ProPainter, whose core/utils.py imports
+                      # matplotlib
+                      "scipy", "matplotlib", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
         post_install=(hub_snapshot("lixiaowen/diffuEraser",
                                    "repos", "DiffuEraser", "weights", "diffuEraser"),),
@@ -551,7 +578,9 @@ ENVS: Dict[str, EnvSpec] = {
                       "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
                       "insightface==2.0", "easydict", "ftfy", "tqdm",
-                      "mediapipe", "dashscope"),
+                      # mediapipe 1.0 ships only `modules` and `tasks`: the legacy
+                      # Solutions API that express_adaption/media_pipe imports is gone
+                      "mediapipe<1", "dashscope"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
@@ -604,6 +633,11 @@ ENVS: Dict[str, EnvSpec] = {
                             staged_name="vox.pth.tar",
                             where="https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model "
                                   "(Tsinghua Cloud / Google Drive link in the README)"),),
+        # face-alignment 1.4 puts its detector through torch.compile, and inductor then
+        # shells out to gcc to build a CUDA helper - which fails on a node with no libcuda to
+        # link against, taking the whole render with it. This model gains nothing from
+        # compilation; eager is both correct and available.
+        env_vars={"TORCHDYNAMO_DISABLE": "1"},
         note="MIT. The vox checkpoint is Tsinghua-Cloud/Drive hosted, so it is staged by hand.",
     ),
 
@@ -620,8 +654,9 @@ ENVS: Dict[str, EnvSpec] = {
         # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
         # it installs `dlib` under the same import name.
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
-                      # psp.py imports matplotlib, and the vendored lpips imports skimage
-                      "dlib-bin", "matplotlib", "scikit-image", "tqdm"),
+                      # psp.py imports matplotlib, the vendored lpips imports skimage, and
+                      # its base_model.py still has a debugging `from IPython import embed`
+                      "dlib-bin", "matplotlib", "scikit-image", "ipython", "tqdm"),
         verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib",
                         "skimage"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),

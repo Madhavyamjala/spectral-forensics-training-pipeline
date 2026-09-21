@@ -22,6 +22,7 @@ import numpy as np
 from _common import (env_root, feather, has_audio, note, read_video, repo_path, require, serve,
                      write_video)
 
+SOURCE_SCAN = 12          # frames searched for the source face
 CROP = 256
 MAX_FRAMES = 120
 
@@ -65,10 +66,24 @@ def load() -> State:
     return State(generator, kp_detector, cascade)
 
 
+def _sample(frames, count: int):
+    """Up to `count` frames spread evenly across the clip."""
+    if len(frames) <= count:
+        return list(frames)
+    step = len(frames) / float(count)
+    return [frames[min(len(frames) - 1, int(i * step))] for i in range(count)]
+
+
 def _face_box(state: State, frame):
-    """Detect the primary face and return its bounding box."""
+    """Detect the primary face and return its bounding box.
+
+    The parameters are deliberately looser than the OpenCV defaults. The clip pool was
+    qualified with InsightFace's SCRFD, which finds faces this Haar cascade does not - profile
+    views, motion blur, anything under 64 px - so a strict cascade rejects clips the planner
+    has already promised to this family.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    boxes = state.detector.detectMultiScale(gray, 1.15, 5, minSize=(64, 64))
+    boxes = state.detector.detectMultiScale(gray, 1.05, 3, minSize=(32, 32))
     if len(boxes) == 0:
         return None
     x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
@@ -94,11 +109,22 @@ def render(state: State, payload: dict) -> dict:
     if len(drive) < 4:
         raise RuntimeError("driving clip is too short to reenact")
 
-    box = _face_box(state, target[0])
+    # Search for the source frame rather than insisting on frame 0. A clip qualifies for this
+    # family on `face_ratio >= 0.5` - a face in half its frames, not necessarily the first one -
+    # so demanding one in frame 0 threw away clips that were correctly selected. FOMM conditions
+    # on a single source frame, so any frame with a clear face will do, and the biggest
+    # detection is the best-posed one available.
+    source_frame, box = None, None
+    for frame in _sample(full or target, SOURCE_SCAN):
+        found = _face_box(state, frame)
+        if found is not None and (box is None or found[2] * found[3] > box[2] * box[3]):
+            source_frame, box = frame, found
     if box is None:
-        raise RuntimeError("no face found in the target clip")
+        raise RuntimeError(
+            f"no face found in any of {SOURCE_SCAN} frames sampled from the target clip")
     x, y, w, h = box
-    crop = cv2.resize(target[0][y:y + h, x:x + w], (CROP, CROP), interpolation=cv2.INTER_AREA)
+    crop = cv2.resize(source_frame[y:y + h, x:x + w], (CROP, CROP),
+                      interpolation=cv2.INTER_AREA)
 
     dboxes = [_face_box(state, f) for f in drive]
     dcrops = []

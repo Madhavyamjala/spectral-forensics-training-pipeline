@@ -1609,8 +1609,9 @@ def test_second_round_dependencies() -> None:
 
     reqs = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
                          for r in envs[name].pip_requirements()]
-    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv-lite" in reqs("videoinpaint"))
-    check("it is the lite build, which needs no nvcc", "mmcv-full" not in reqs("videoinpaint"))
+    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv" in reqs("videoinpaint"))
+    check("it is a build that needs no nvcc", "mmcv-full" not in reqs("videoinpaint"),
+          "which version is the ops-free one is checked in test_third_round_dependencies")
     check("stylegan installs scikit-image for the vendored lpips",
           "scikit-image" in reqs("stylegan"))
     check("liveportrait installs requests for the vendored insightface downloader",
@@ -1650,6 +1651,63 @@ def test_second_round_dependencies() -> None:
     check("and is named per job, so concurrent workers cannot collide",
           "tag = tmp.name" in vi and "f\"{tag}_frames\"" in vi)
     check("nothing is left behind in the shared clone", "in_repo.unlink()" in vi)
+
+
+def test_third_round_dependencies() -> None:
+    """What the first full sweep found once the quota stopped masking everything."""
+    print("third-round dependencies")
+    envs = env_specs()
+    reqs = lambda name: list(envs[name].pip_requirements())
+    names = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip() for r in reqs(name)]
+
+    for env_name, dist in (("liveportrait", "pykalman"), ("latentsync", "kornia"),
+                           ("tokenflow", "kornia"), ("stylegan", "ipython"),
+                           ("diffueraser", "matplotlib"), ("vace", "matplotlib")):
+        check(f"env '{env_name}' installs {dist}", dist in names(env_name), str(names(env_name)))
+
+    # mmcv 2.0 deleted mmcv.runner, which E2FGVI imports; in the 1.x line the distribution
+    # called `mmcv` is the one without compiled ops
+    vi = reqs("videoinpaint")
+    check("videoinpaint takes mmcv 1.x, which still has mmcv.runner",
+          any(r == "mmcv==1.7.2" for r in vi), str(vi))
+    check("and not the 2.x lite build that only has mmcv.cnn",
+          not any("mmcv-lite" in r for r in vi))
+
+    # mediapipe 1.0 ships `modules` and `tasks` only - the Solutions API is gone
+    check("dreamid pins mediapipe below the release that dropped Solutions",
+          any(r.startswith("mediapipe") and "<1" in r for r in reqs("dreamid")))
+
+    check("tpsmm turns off the torch.compile path face-alignment 1.4 added",
+          envs["tpsmm"].env_vars.get("TORCHDYNAMO_DISABLE") == "1",
+          "inductor shells out to gcc for a CUDA helper and the link fails on these nodes")
+
+    sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
+    check("SadTalker's ragged alignment array is flattened", "np.squeeze(s)" in sad)
+
+    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke honours accept_noncommercial like the run stage does",
+          "CSF_ACCEPT_NONCOMMERCIAL" in smoke_src,
+          "otherwise REFace reports a licence gate as though it were a broken model")
+
+
+def test_fomm_source_frame() -> None:
+    """A clip qualifies on half its frames; FOMM must not demand a face in the first one."""
+    print("fomm source frame")
+    src = (ROOT / "csf/generation/adapters/workers/worker_fomm.py").read_text()
+    check("the source frame is searched for, not assumed to be frame 0",
+          "_sample(full or target, SOURCE_SCAN)" in src)
+    check("the old single-frame check is gone", "_face_box(state, target[0])" not in src)
+    check("the cascade is loosened towards what SCRFD qualified",
+          "1.05, 3, minSize=(32, 32)" in src)
+    check("and the error says how hard it looked", "frames sampled from the target clip" in src)
+
+    # the planner's own promise: these clips carry a face in at least half their frames
+    from csf.generation.filters import ClipFeatures
+    marginal = ClipFeatures(clip_id="c", label="l", path="p", frames_scanned=20,
+                            face_ratio=0.5, mean_face_size=0.08)
+    check("a clip with a face in half its frames qualifies for the face pool",
+          marginal.qualifies("face"),
+          "so frame 0 having no face is expected, not exceptional")
 
 
 def test_torch_library_ceilings() -> None:
@@ -1859,6 +1917,7 @@ def main() -> int:
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
+               test_third_round_dependencies, test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
                test_env_selection_typos, test_smoke_output_location,
                test_child_process_errors,
