@@ -95,7 +95,9 @@ def render(state: State, payload: dict) -> dict:
             drive_frames, _ = read_video(driving, max_frames=MAX_FRAMES, max_side=512)
             driving_mp4 = tmp / "driving.mp4"
             write_video(drive_frames, str(driving_mp4), fps=fps)
-            cmd += ["-d", str(driving_mp4), "--flag_relative_motion", "true"]
+            # LivePortrait's CLI is tyro over a dataclass: a bool field is a switch and
+            # takes no value, and relative motion is on by default anyway
+            cmd += ["-d", str(driving_mp4)]
             meta.update(reenactment_model="liveportrait",
                         driving_video_id=Path(driving).stem, target_video_id=Path(src).stem,
                         target_identity=Path(src).stem, driving_identity=Path(driving).stem)
@@ -110,12 +112,17 @@ def render(state: State, payload: dict) -> dict:
             eye, lip = EXPRESSION_RETARGET[variant]
             magnitude = float((payload.get("metadata") or {}).get("edit_magnitude", 0.5) or 0.5)
             # drive the clip with itself, then let retargeting supply the edit
-            cmd += ["-d", str(source_mp4),
-                    "--flag_eye_retargeting", "true", "--flag_lip_retargeting", "true",
-                    "--eye_retargeting_multiplier", f"{1.0 + eye * magnitude:.3f}",
-                    "--lip_retargeting_multiplier", f"{1.0 + lip * magnitude:.3f}"]
+            # There are no retargeting multipliers in this release - the flags that do
+            # exist are switches with ratios computed internally, which would leave
+            # edit_magnitude recording a number nothing acted on. `driving_multiplier` is a
+            # real scalar: drive the clip with itself and scale the motion, with
+            # animation_region=exp so only the expression moves and the pose stays put.
+            strength = 1.0 + max(abs(eye), abs(lip)) * magnitude
+            cmd += ["-d", str(source_mp4), "--animation_region", "exp",
+                    "--driving_multiplier", f"{strength:.3f}"]
             meta.update(edit_model="liveportrait_expr", manipulation_type=variant,
-                        edit_magnitude=magnitude, eye_ratio=eye, lip_ratio=lip,
+                        edit_magnitude=magnitude, driving_multiplier=round(strength, 3),
+                        eye_ratio=eye, lip_ratio=lip,
                         # retargeting edits the face in place, so identity is preserved
                         identity_preserved=True)
         else:

@@ -1246,7 +1246,12 @@ def test_env_interpreter() -> None:
           not any("huggingface-cli" in h for h in hooks.values()),
           str([n for n, h in hooks.items() if "huggingface-cli" in h]))
     hub_hooks = [n for n, h in hooks.items() if "snapshot_download" in h]
-    check("the Hub pulls use snapshot_download", len(hub_hooks) == 4, str(sorted(hub_hooks)))
+    # a floor, not a count: envs gain snapshots as upstream repos turn out to want whole
+    # directories rather than the single files they were first staged from
+    check("the Hub pulls use snapshot_download", len(hub_hooks) >= 4, str(sorted(hub_hooks)))
+    check("every env that snapshots also declares those repos for prefetch",
+          all(specs_all[n].hub_repos for n in hub_hooks),
+          str([n for n in hub_hooks if not specs_all[n].hub_repos]))
     check("each snapshot lands under the env root",
           all("CSF_ENV_ROOT" in hooks[n] for n in hub_hooks))
 
@@ -1988,6 +1993,84 @@ def test_last_three_findings() -> None:
           "being reported as missing")
 
 
+def test_runtime_failures() -> None:
+    """The fourteen the first clean-scan sweep still failed on, each for its own reason."""
+    print("runtime failures")
+    envs = env_specs()
+    worker = lambda name: (ROOT / f"csf/generation/adapters/workers/worker_{name}.py").read_text()
+    hooks = lambda name: "".join("".join(c) for c in envs[name].post_install)
+
+    # VACE: the DiT calls flash_attention() directly, and that function asserts
+    wan = hooks("vace")
+    check("Wan's DiT is routed through the attention dispatcher",
+          "from .attention import attention as flash_attention" in wan,
+          "flash_attention() opens with assert FLASH_ATTN_2_AVAILABLE")
+    check("the patch is applied to the installed package, not a repo",
+          "site-packages" in wan or "sysconfig" in wan,
+          "wan is pip-installed; the clone has no copy to edit")
+
+    # E2FGVI: mmcv.ops needs compiled kernels, torchvision already has the operator
+    shim = (ROOT / "csf/generation/adapters/shims/e2fgvi_deform.py").read_text()
+    check("the deformable-conv shim exists", "def modulated_deform_conv2d" in shim)
+    check("it is backed by torchvision", "from torchvision.ops import deform_conv2d" in shim)
+    check("its weight shape matches what the checkpoint holds",
+          "out_channels, in_channels // groups, *self.kernel_size" in shim)
+    check("E2FGVI is repointed at it", "csf_deform_shim" in hooks("videoinpaint"))
+
+    # LivePortrait: tyro switches take no value, and the multipliers never existed
+    lp = worker("liveportrait")
+    check("no boolean flag is passed a value", '", "true"' not in lp and '"true"' not in lp)
+    check("the retargeting multipliers are gone",
+          "eye_retargeting_multiplier" not in lp and "lip_retargeting_multiplier" not in lp)
+    check("magnitude rides a scalar that exists",
+          "--driving_multiplier" in lp and "--animation_region" in lp)
+
+    # TokenFlow and StyleGANEX: what the upstream script actually reads
+    tf = worker("tokenflow")
+    check("TokenFlow's preprocess gets a video file", 'str(clip_mp4)' in tf,
+          "it opens --data_path with torchvision's reader and extracts frames itself")
+    sg = worker("styleganex")
+    check("StyleGANEX is handed a clip that starts on a detectable face",
+          "_first_dlib_frame" in sg)
+    check("and the frame is chosen with dlib, the detector it uses itself",
+          "dlib.get_frontal_face_detector" in sg)
+
+    # DreamID-V: the MediaPipe entry point imports a module that is not in the repository
+    dm = worker("dreamid")
+    check("DreamID-V runs the DWPose entry point", "generate_dreamidv_dwpose.py" in dm)
+    check("and not the one importing express_adaption",
+          '"generate_dreamidv.py"' not in dm)
+    check("its two ONNX models are staged",
+          all(any(w.dest.endswith(n) for w in envs["dreamid"].weights)
+              for n in ("dw-ll_ucoco_384.onnx", "yolox_l.onnx")))
+
+    # REFace: one model load per clip, not per frame
+    rf = hooks("reface")
+    check("REFace's per-frame loop is enabled", "CSF_REFACE_BATCH" in rf)
+    check("its bound is not n_samples, which is also the batch size",
+          "CSF_REFACE_FRAMES" in rf)
+    rfw = worker("reface")
+    check("frames follow upstream's index naming", 'f"{i}.jpg"' in rfw)
+    check("and the reference is offset by one, as its loop reconstructs",
+          'f"{i + 1}.jpg"' in rfw)
+    check("results are ordered numerically", 'int(q.stem.split("_")[0])' in rfw)
+    check("a short return is a failure, not a short video", "did not run to completion" in rfw)
+
+    # weights that upstream expects as whole directories
+    de = hooks("diffueraser")
+    for folder in ("sd-vae-ft-mse", "stable-diffusion-v1-5"):
+        check(f"diffueraser stages {folder}", folder in de)
+    check("and ProPainter, its priori model",
+          any("propainter" in w.dest for w in envs["diffueraser"].weights))
+    mt = hooks("musetalk")
+    check("musetalk stages whisper as a directory", "whisper" in mt and "snapshot" in mt)
+    check("and the VAE as a directory", "sd-vae" in mt)
+
+    ls = hooks("latentsync")
+    check("LatentSync's fixed mask is verified at build time", "mask.png" in ls)
+    check("and re-fetched when it does not decode", "does not decode" in ls)
+
+
 def test_fomm_source_frame() -> None:
     """A clip qualifies on half its frames; FOMM must not demand a face in the first one."""
     print("fomm source frame")
@@ -2219,7 +2302,7 @@ def main() -> int:
                test_import_scanner, test_envs_cli_root, test_entry_points_declared,
                test_musetalk_dwpose_patch,
                test_third_round_dependencies, test_scanned_dependencies,
-               test_last_three_findings,
+               test_last_three_findings, test_runtime_failures,
                test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
                test_env_selection_typos, test_smoke_output_location,

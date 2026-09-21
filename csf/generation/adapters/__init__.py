@@ -145,6 +145,106 @@ else:
 WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
 
 
+#: Wan2.1's DiT calls `flash_attention()` directly (wan/modules/model.py), not the
+#: `attention()` dispatcher beside it - and `flash_attention()` opens with
+#: `assert FLASH_ATTN_2_AVAILABLE`. Installing Wan with --no-deps keeps flash-attn out of
+#: an env where it would have to be compiled, so every VACE render asserted its way out.
+#:
+#: The dispatcher is upstream's own fallback: when no flash-attention build is importable
+#: it runs torch's scaled_dot_product_attention instead. Both call sites pass only q, k, v,
+#: k_lens and window_size, and the two signatures differ in nothing else that is used, so
+#: importing the dispatcher under the old name is enough. Slower than flash-attn, and
+#: correct, which the assert was not.
+WAN_SDPA_PATCH = r"""
+import glob, sysconfig
+roots = {sysconfig.get_paths()[k] for k in ('purelib', 'platlib')}
+files = sorted({p for r in roots for p in glob.glob(r + '/wan/modules/model.py')})
+if not files:
+    raise SystemExit('wan is not installed in this environment')
+old = 'from .attention import flash_attention'
+new = ('from .attention import attention as flash_attention  '
+       '# csf: dispatcher, which falls back to torch SDPA')
+patched = 0
+for path in files:
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    if new in text:
+        continue
+    if old not in text:
+        raise SystemExit('wan/modules/model.py does not import flash_attention as expected; '
+                         'upstream changed and this patch needs revisiting')
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(text.replace(old, new))
+    patched += 1
+print('wan: routed %d module(s) through the attention dispatcher' % patched)
+import importlib
+m = importlib.import_module('wan.modules.model')
+assert hasattr(m, 'flash_attention'), 'the alias did not survive the rewrite'
+print('wan.modules.model imports cleanly')
+"""
+
+
+#: E2FGVI-HQ's feature propagation imports ModulatedDeformConv2d from mmcv.ops, which is
+#: the half of mmcv that ships compiled CUDA kernels - mmcv 1.x lite has mmcv.cnn and
+#: mmcv.runner but no mmcv._ext, and building mmcv-full takes nvcc and hours.
+#:
+#: torchvision already ships the operator: deform_conv2d with a mask argument IS DCNv2,
+#: with the same offset and mask layouts and the same weight shape, so the released
+#: checkpoint loads unchanged. The shim is written into the repo and the import repointed.
+E2FGVI_MMCV_SHIM = r"""
+import os, pathlib, shutil
+repo = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'E2FGVI'
+source = pathlib.Path(os.environ['CSF_SHIM_DIR']) / 'e2fgvi_deform.py'
+dest = repo / 'model' / 'modules' / 'csf_deform_shim.py'
+shutil.copyfile(source, dest)
+
+target = repo / 'model' / 'modules' / 'feat_prop.py'
+text = target.read_text(encoding='utf-8')
+old = 'from mmcv.ops import ModulatedDeformConv2d, modulated_deform_conv2d'
+new = ('from model.modules.csf_deform_shim import ModulatedDeformConv2d, '
+       'modulated_deform_conv2d')
+if new in text:
+    print('e2fgvi: feat_prop.py already uses the torchvision deformable-conv shim')
+elif old in text:
+    target.write_text(text.replace(old, new), encoding='utf-8')
+    print('e2fgvi: feat_prop.py now uses the torchvision deformable-conv shim')
+else:
+    raise SystemExit('e2fgvi: feat_prop.py does not import mmcv.ops as expected; upstream '
+                     'changed and this patch needs revisiting')
+"""
+
+
+#: LatentSync's fixed mouth mask is a 1.8 KB PNG in the repo, and the clone made during
+#: the disk-quota exhaustion got a truncated copy: cv2.imread returned None and the
+#: pipeline died on an empty array, several minutes into a render. Decode it at build
+#: time and re-fetch it if it does not decode, so a bad checkout cannot reach a job.
+LATENTSYNC_MASK_FIX = r"""
+import os, pathlib, urllib.request
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'LatentSync' / 'latentsync' /
+        'utils' / 'mask.png')
+URL = 'https://raw.githubusercontent.com/bytedance/LatentSync/main/latentsync/utils/mask.png'
+
+
+def readable(p):
+    try:
+        import cv2
+        return p.is_file() and cv2.imread(str(p)) is not None
+    except Exception:
+        return False
+
+
+if readable(path):
+    print('latentsync: the fixed mask decodes cleanly')
+else:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = urllib.request.urlopen(URL, timeout=120).read()
+    path.write_bytes(data)
+    if not readable(path):
+        raise SystemExit('latentsync: mask.png still does not decode after re-downloading')
+    print('latentsync: replaced an unreadable mask.png (%d bytes)' % len(data))
+"""
+
+
 
 
 #: MuseTalk's preprocessing.py loads DWPose through mmpose, and mmpose needs mmcv 2.x
@@ -229,6 +329,47 @@ elif old in text:
 else:
     raise SystemExit('tokenflow: util.py has no recognisable create_meshgrid import; '
                      'upstream changed and this patch needs revisiting')
+"""
+
+
+#: REFace's inference script renders ONE image per process: it has a per-index loop for
+#: whole benchmark folders, but ships with `USE_HARD_CODED=False`, which makes every
+#: iteration fall back to the single `--image_path`. A hundred-frame clip would therefore
+#: mean a hundred model loads.
+#:
+#: The loop is enabled through an environment variable rather than by flipping the
+#: constant, and its bound comes from a second variable rather than from `--n_samples` -
+#: which is also the batch size, so raising it to the frame count would change what is
+#: sent to the GPU in one go. The result is one model load per clip and one frame per
+#: iteration, which is what upstream's own naming convention was written for.
+REFACE_BATCH_PATCH = r"""
+import os, pathlib
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'REFace' / 'scripts' /
+        'inference.py')
+text = path.read_text(encoding='utf-8')
+swaps = [
+    # upstream disables its own per-index loop, so one process renders one image; the loop
+    # is what lets a whole clip share a single model load
+    ("    USE_HARD_CODED=False",
+     "    USE_HARD_CODED = os.environ.get('CSF_REFACE_BATCH') == '1'  # csf"),
+    # and the loop count comes from us, not from n_samples, which is also the batch size
+    ("        GEN_NUMS=opt.n_samples",
+     "        GEN_NUMS = int(os.environ.get('CSF_REFACE_FRAMES', opt.n_samples))  # csf"),
+]
+applied, already = 0, 0
+for old, new in swaps:
+    if new in text:
+        already += 1
+    elif old in text:
+        text = text.replace(old, new)
+        applied += 1
+    else:
+        raise SystemExit('reface: inference.py has no %r - upstream changed and this patch '
+                         'needs revisiting' % old.strip())
+if 'import os' not in text:
+    text = 'import os\n' + text
+path.write_text(text, encoding='utf-8')
+print('reface: enabled the per-frame loop (%d rewritten, %d already done)' % (applied, already))
 """
 
 
@@ -381,7 +522,8 @@ MMCV_1X_INSTALL = (
 )
 
 
-def hub_snapshot(repo_id: str, *dest: str) -> tuple:
+def hub_snapshot(repo_id: str, *dest: str, allow: Sequence[str] = (),
+                 ignore: Sequence[str] = ()) -> tuple:
     """A post-install step that downloads a Hub repo into `<env root>/<dest...>`.
 
     Through `huggingface_hub.snapshot_download`, not a CLI: `huggingface-cli` was removed in
@@ -392,11 +534,18 @@ def hub_snapshot(repo_id: str, *dest: str) -> tuple:
     from the shared Hub cache instead of re-downloading.
     """
     joined = ", ".join(repr(part) for part in dest)
+    # Whole repos are often mostly duplicates - Stable Diffusion 1.5 ships the same weights
+    # as .ckpt, .safetensors and fp16 variants, three times the download for one usable copy
+    filters = ""
+    if allow:
+        filters += f", allow_patterns={list(allow)!r}"
+    if ignore:
+        filters += f", ignore_patterns={list(ignore)!r}"
     return ("-c",
             "import os;from huggingface_hub import snapshot_download;"
             f"p=os.path.join(os.environ['CSF_ENV_ROOT'], {joined});"
             f"print('downloading {repo_id} ->', p);"
-            f"snapshot_download({repo_id!r}, local_dir=p, max_workers=8);"
+            f"snapshot_download({repo_id!r}, local_dir=p, max_workers=8{filters});"
             "print('done')")
 
 
@@ -490,7 +639,8 @@ ENVS: Dict[str, EnvSpec] = {
                        where="https://github.com/ruiliu-ai/FuseFormer (Drive link in README)"),
         ),
         # mmcv first, then the OpenCV it drags in behind it is swapped back for headless
-        post_install=(*MMCV_1X_INSTALL, opencv_headless_swap(), ("-c", STTN_DEVICE_PATCH)),
+        post_install=(*MMCV_1X_INSTALL, opencv_headless_swap(),
+                      ("-c", E2FGVI_MMCV_SHIM), ("-c", STTN_DEVICE_PATCH)),
         note="All three checkpoints are Drive-hosted upstream, so they are staged by hand into "
              "generation.staged_weights_dir and copied into place by the build.",
     ),
@@ -545,8 +695,11 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "tqdm",
-                      # TokenFlow's util.py imports kornia.geometry.transform
-                      "kornia",
+                      # TokenFlow's util.py imports kornia.geometry.transform, and
+                      # torchvision's video reader still references av.AVError, which PyAV 14
+                      # removed - it surfaces only on the error path, but that is exactly
+                      # where a useful message would otherwise be
+                      "kornia", "av<14",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
         post_install=(("-c", TOKENFLOW_KORNIA_PATCH),),
@@ -570,7 +723,7 @@ ENVS: Dict[str, EnvSpec] = {
                       "decord", "mediapipe", "tqdm"),
         repos=(GitRepo("https://github.com/bytedance/LatentSync.git", name="LatentSync"),),
         # insightface pulls the CPU onnxruntime and full OpenCV behind it
-        post_install=(onnxruntime_gpu_swap(),),
+        post_install=(onnxruntime_gpu_swap(), ("-c", LATENTSYNC_MASK_FIX)),
         weights=(WeightFile(dest="repos/LatentSync/checkpoints/latentsync_unet.pt",
                             hf_repo="ByteDance/LatentSync-1.6", hf_file="latentsync_unet.pt"),
                  WeightFile(dest="repos/LatentSync/checkpoints/whisper/tiny.pt",
@@ -589,22 +742,24 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "librosa==0.10.2",
                       "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
         repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
-        post_install=(("-c", MUSETALK_DWPOSE_PATCH),),
+        # MuseTalk loads both of these as directories - diffusers wants the VAE's
+        # safetensors beside its config, and transformers' AutoFeatureExtractor wants
+        # whisper's preprocessor_config.json. Single files left both looking half-present.
+        post_install=(hub_snapshot("stabilityai/sd-vae-ft-mse", "repos", "MuseTalk", "models",
+                                   "sd-vae", ignore=("*.ckpt", "*.bin")),
+                      hub_snapshot("openai/whisper-tiny", "repos", "MuseTalk", "models",
+                                   "whisper", ignore=("*.msgpack", "*.h5", "*.ot")),
+                      ("-c", MUSETALK_DWPOSE_PATCH)),
         weights=(
             WeightFile(dest="repos/MuseTalk/models/musetalkV15/unet.pth",
                        hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/unet.pth"),
             WeightFile(dest="repos/MuseTalk/models/musetalkV15/musetalk.json",
                        hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/musetalk.json"),
-            WeightFile(dest="repos/MuseTalk/models/sd-vae/diffusion_pytorch_model.bin",
-                       hf_repo="stabilityai/sd-vae-ft-mse",
-                       hf_file="diffusion_pytorch_model.bin"),
-            WeightFile(dest="repos/MuseTalk/models/sd-vae/config.json",
-                       hf_repo="stabilityai/sd-vae-ft-mse", hf_file="config.json"),
-            WeightFile(dest="repos/MuseTalk/models/whisper/tiny.pt",
-                       hf_repo="openai/whisper-tiny", hf_file="pytorch_model.bin"),
             WeightFile(dest="repos/MuseTalk/models/dwpose/dw-ll_ucoco_384.pth",
                        hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.pth"),
         ),
+        hub_repos=("TMElyralab/MuseTalk", "stabilityai/sd-vae-ft-mse",
+                   "openai/whisper-tiny", "yzd-v/DWPose"),
         note="MIT, commercial use allowed. face-parse-bisent is Drive-hosted upstream; the "
              "worker degrades to MuseTalk's own bbox path when it is absent. DWPose is "
              "patched out - MUSETALK_DWPOSE_PATCH says what that costs.",
@@ -688,6 +843,7 @@ ENVS: Dict[str, EnvSpec] = {
                         "decord", "wan", "onnxruntime", "insightface", "timm", "skimage"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
         post_install=(pip_install("--no-deps", WAN2_1_PACKAGE),
+                      ("-c", WAN_SDPA_PATCH),
                       hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),
                       # last: insightface drags the CPU runtime and full OpenCV in behind it
                       onnxruntime_gpu_swap()),
@@ -710,9 +866,34 @@ ENVS: Dict[str, EnvSpec] = {
                       # matplotlib
                       "scipy", "matplotlib", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
+        # its defaults are weights/{stable-diffusion-v1-5,sd-vae-ft-mse,diffuEraser,
+        # propainter}, and only the third was ever staged - the others resolved as Hub repo
+        # ids, which is why it 404'd on "weights/sd-vae-ft-mse"
         post_install=(hub_snapshot("lixiaowen/diffuEraser",
-                                   "repos", "DiffuEraser", "weights", "diffuEraser"),),
-        hub_repos=("lixiaowen/diffuEraser",),
+                                   "repos", "DiffuEraser", "weights", "diffuEraser"),
+                      hub_snapshot("stabilityai/sd-vae-ft-mse",
+                                   "repos", "DiffuEraser", "weights", "sd-vae-ft-mse",
+                                   ignore=("*.ckpt", "*.bin")),
+                      hub_snapshot("stable-diffusion-v1-5/stable-diffusion-v1-5",
+                                   "repos", "DiffuEraser", "weights",
+                                   "stable-diffusion-v1-5",
+                                   allow=("*.json", "*.txt", "*/*.safetensors"),
+                                   ignore=("*.ckpt", "*.bin", "*.pt"))),
+        weights=(
+            # the priori model is ProPainter, whose released weights we already fetch by URL
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/ProPainter.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/ProPainter.pth"),
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/raft-things.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/raft-things.pth"),
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/"
+                            "recurrent_flow_completion.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/recurrent_flow_completion.pth"),
+        ),
+        hub_repos=("lixiaowen/diffuEraser", "stabilityai/sd-vae-ft-mse",
+                   "stable-diffusion-v1-5/stable-diffusion-v1-5"),
         note="Apache-2.0. Diffusion removal - a different artifact class from ProPainter's "
              "flow propagation, which is why it is worth a slot of its own.",
     ),
@@ -749,7 +930,13 @@ ENVS: Dict[str, EnvSpec] = {
         post_install=(onnxruntime_gpu_swap(),
                       hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V"),
                       hub_snapshot("Wan-AI/Wan2.1-T2V-1.3B", "weights", "Wan2.1-T2V-1.3B")),
-        hub_repos=("XuGuo699/DreamID-V", "Wan-AI/Wan2.1-T2V-1.3B"),
+        # the DWPose entry point reads these two from pose/models/ - upstream tells you to
+        # place them by hand, which is exactly the kind of step a build should not leave out
+        weights=(WeightFile(dest="repos/DreamID-V/pose/models/dw-ll_ucoco_384.onnx",
+                            hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.onnx"),
+                 WeightFile(dest="repos/DreamID-V/pose/models/yolox_l.onnx",
+                            hf_repo="yzd-v/DWPose", hf_file="yolox_l.onnx")),
+        hub_repos=("XuGuo699/DreamID-V", "Wan-AI/Wan2.1-T2V-1.3B", "yzd-v/DWPose"),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
     ),
@@ -772,7 +959,7 @@ ENVS: Dict[str, EnvSpec] = {
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
                         "cv2", "numpy", "omegaconf", "huggingface_hub"),
         repos=(GitRepo("https://github.com/Sanoojan/REFace.git", name="REFace"),),
-        post_install=(onnxruntime_gpu_swap(),),
+        post_install=(onnxruntime_gpu_swap(), ("-c", REFACE_BATCH_PATCH)),
         weights=(WeightFile(dest="repos/REFace/checkpoints/last.ckpt",
                             hf_repo="Sanoojan/REFace", hf_file="last.ckpt"),),
         note="LICENCE WARNING: MIT code, but trained on CelebAMask-HQ, which restricts use to "

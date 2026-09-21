@@ -210,6 +210,10 @@ class ReadyEnv:
             env.pop("PYTHONPATH")
         env.update(self.spec.env_vars)
         env.setdefault("CSF_ENV_ROOT", str(self.root))
+        # where post-install hooks find the source files they copy into a cloned repo, such
+        # as the deformable-conv shim E2FGVI needs in place of mmcv's compiled ops
+        env.setdefault("CSF_SHIM_DIR",
+                       str(Path(__file__).resolve().parent / "adapters" / "shims"))
         return env
 
 

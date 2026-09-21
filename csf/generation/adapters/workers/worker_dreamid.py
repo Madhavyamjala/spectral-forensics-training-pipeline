@@ -31,7 +31,7 @@ from _common import (has_audio, note, read_video, repo_path, require, run_cmd, s
 N_FRAMES = 49
 MAX_SIDE = 640
 SIZE = "832*480"
-SAMPLE_STEPS = 20          # the README's single-GPU setting for the MediaPipe entry point
+SAMPLE_STEPS = 20          # the README's single-GPU setting
 
 
 class State:
@@ -53,8 +53,14 @@ def load() -> State:
             f"The Wan2.1 backbone DreamID-V builds on is missing at {ckpt_dir}. Fetch it "
             f"with:\n    hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir {ckpt_dir}")
     dreamid_ckpt = require(weights / "DreamID-V" / "dreamidv.pth", "dreamidv.pth")
-    script = require(repo / "generate_dreamidv.py", "generate_dreamidv.py")
-    note(f"dreamid: repo {repo}, script {script.name}, backbone {ckpt_dir.name}")
+    # Not generate_dreamidv.py: that one imports express_adaption.media_pipe, whose mp_utils
+    # does `from . import face_landmark` - a module that is not in the repository at all
+    # (404 upstream), so the import can never succeed. The DWPose entry point is the same
+    # model with a different landmark front end, and it does not touch express_adaption.
+    script = require(repo / "generate_dreamidv_dwpose.py", "generate_dreamidv_dwpose.py")
+    require(repo / "pose" / "models" / "dw-ll_ucoco_384.onnx", "DWPose keypoint model")
+    require(repo / "pose" / "models" / "yolox_l.onnx", "DWPose detector")
+    note(f"dreamid: repo {repo}, script {script.name} (DWPose), backbone {ckpt_dir.name}")
     return State(repo, ckpt_dir, dreamid_ckpt, script)
 
 
@@ -107,6 +113,7 @@ def render(state: State, payload: dict) -> dict:
     write_video(result, payload["output_path"], fps=out_fps or fps,
                 audio_from=src if has_audio(src) else None)
     return {"face_swap_model": "dreamid_v", "backbone": "Wan2.1-1.3B-DiT",
+            "landmark_frontend": "dwpose",
             "substitutes_for": payload.get("spec_model", "simswap"),
             "source_identity_id": Path(donor).stem, "target_identity_id": Path(src).stem,
             "frames": len(result)}

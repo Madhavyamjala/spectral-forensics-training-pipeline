@@ -64,6 +64,22 @@ def load() -> State:
     return State(repo, script, ckpts)
 
 
+def _first_dlib_frame(frames):
+    """Index of the first frame dlib's frontal detector accepts, or None.
+
+    dlib is what StyleGANEX itself uses, so agreeing with it is the point: any other
+    detector could nominate a frame that video_editing.py then rejects.
+    """
+    import dlib
+
+    detector = dlib.get_frontal_face_detector()
+    for index, frame in enumerate(frames):
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        if len(detector(gray, 1)) > 0:
+            return index
+    return None
+
+
 def render(state: State, payload: dict) -> dict:
     """Render one generation job with the loaded worker state."""
     src = payload["source_path"]
@@ -85,6 +101,18 @@ def render(state: State, payload: dict) -> dict:
         tmp = Path(tmp)
         out_dir = tmp / "out"
         out_dir.mkdir(parents=True, exist_ok=True)
+        # video_editing.py reads only the FIRST frame to find its crop, with dlib's frontal
+        # detector, and asserts if that frame has no detectable face. The clip pool was
+        # qualified with SCRFD, which finds faces dlib does not, so a perfectly good clip
+        # fails on its opening frame. Re-cut the clip to start where dlib agrees - using
+        # dlib itself, so the answer here is the answer video_editing.py will get.
+        start = _first_dlib_frame(frames)
+        if start is None:
+            raise RuntimeError(
+                f"dlib found no frontal face in any of {len(frames)} frames; StyleGANEX "
+                f"crops from the first frame and cannot run on this clip")
+        src = str(tmp / "aligned.mp4")
+        write_video(frames[start:], src, fps=fps)
         # video_editing.py reads the video itself and writes
         # <output_path>/<video stem>_<ckpt stem>.mp4 at 4x the cropped face resolution.
         run_cmd([sys.executable, str(state.script),
