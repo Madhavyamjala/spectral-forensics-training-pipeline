@@ -15,8 +15,14 @@ Two distinctions matter for the answer to be worth acting on:
   * `mmcv.runner` is not `mmcv`. A repo that imports the submodule needs the release that
     still has it, so the dotted name is what gets reported.
   * An import inside `try: ... except ImportError:` is optional by construction - upstream
-    ships a fallback. Wan2.1 guards flash-attn that way and runs fine without it. Those are
-    reported separately and never fail the check.
+    ships a fallback. Wan2.1 guards flash-attn that way and runs fine without it.
+  * An import inside a function body only runs if something calls that function, and the
+    files it in turn imports are deferred with it. Wav2Lip imports `lws` inside
+    `_lws_processor()`, which its default config never calls - and Wav2Lip renders. Reporting
+    that as missing is how a list of 41 findings hides the six that matter.
+
+  Only the imports that execute when the entry point is imported are counted as missing;
+  the other two are listed under it so nothing is silently dropped.
 
 `python -m csf.generation.envs --scan all` prints the report.
 """
@@ -44,9 +50,10 @@ entries = [Path(e) for e in args["entries"]]
 
 STDLIB = set(getattr(sys, "stdlib_module_names", ()))
 OPTIONAL_EXC = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+DEFER_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 def local_path(dotted):
-    """The file a dotted name resolves to inside the repos, or None."""
+    # the file a dotted name resolves to inside the repos, or None
     rel = dotted.replace(".", "/")
     for root in roots:
         for candidate in (root / (rel + ".py"), root / rel / "__init__.py"):
@@ -54,96 +61,125 @@ def local_path(dotted):
                 return candidate
     return None
 
-def optional_handlers(node):
-    """Names of exceptions a try/except catches, flattened."""
-    names = set()
+def catches_import(node):
+    # whether a try/except swallows an import failure
     for handler in node.handlers:
         exc = handler.type
-        parts = exc.elts if isinstance(exc, ast.Tuple) else [exc]
-        for part in parts:
-            if isinstance(part, ast.Name):
-                names.add(part.id)
-            elif isinstance(part, ast.Attribute):
-                names.add(part.attr)
-            elif part is None:
-                names.add("BaseException")
-    return names
+        if exc is None:
+            return True
+        for part in (exc.elts if isinstance(exc, ast.Tuple) else [exc]):
+            name = getattr(part, "id", None) or getattr(part, "attr", None)
+            if name in OPTIONAL_EXC:
+                return True
+    return False
 
-seen_files, queue = set(), list(entries)
-external = {}          # dotted name -> {"by": file, "optional": bool}
+def is_type_checking(test):
+    # `if TYPE_CHECKING:` - a block that never executes at runtime
+    return (getattr(test, "id", None) == "TYPE_CHECKING"
+            or getattr(test, "attr", None) == "TYPE_CHECKING")
+
+seen = {}                      # path -> reached only through a deferred import
+queue = [(e, False) for e in entries]
+external = {}
 unparsed = []
 
-def record(dotted, source_file, optional):
+def enqueue(target, deferred):
+    if target not in seen or (seen[target] and not deferred):
+        queue.append((target, deferred))
+
+def record(dotted, source_file, deferred, guarded):
     top = dotted.split(".")[0]
     if not top or top in STDLIB or top == "__future__":
         return
-    if local_path(dotted) is not None or local_path(top) is not None:
-        target = local_path(dotted) or local_path(top)
-        if target not in seen_files:
-            queue.append(target)
+    target = local_path(dotted) or local_path(top)
+    if target is not None:
+        enqueue(target, deferred)
         return
-    entry = external.setdefault(dotted, {"by": str(source_file), "optional": optional})
-    # an import that appears both guarded and unguarded is genuinely required
-    if not optional:
-        entry["optional"] = False
+    row = external.setdefault(dotted, {"by": str(source_file), "deferred": True,
+                                       "optional": True})
+    # the worst case across every path that reaches it is what matters
+    if not deferred:
+        row["deferred"] = False
+    if not guarded:
+        row["optional"] = False
+    if not deferred and not guarded:
+        row["by"] = str(source_file)
+
+def enqueue_relative(node, package_dir, deferred):
+    # `from . import x` / `from .mod import y`, resolved against the importing file
+    base = package_dir
+    for _ in range(node.level - 1):
+        base = base.parent
+    candidate = base / (node.module.replace(".", "/") if node.module else "")
+    targets = [Path(str(candidate) + ".py"), candidate / "__init__.py"]
+    for alias in node.names:
+        targets += [candidate / (alias.name + ".py"), candidate / alias.name / "__init__.py"]
+    for target in targets:
+        if target.is_file():
+            enqueue(target, deferred)
+
+def walk(node, path, package_dir, deferred, guarded):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            record(alias.name, path, deferred, guarded)
+        return
+    if isinstance(node, ast.ImportFrom):
+        if node.level:
+            enqueue_relative(node, package_dir, deferred)
+        elif node.module:
+            record(node.module, path, deferred, guarded)
+        return
+    if isinstance(node, DEFER_SCOPES):
+        deferred = True            # a body that runs only when something calls it
+    if isinstance(node, ast.If) and is_type_checking(node.test):
+        deferred = True
+    if isinstance(node, ast.Try) and catches_import(node):
+        for child in node.body:
+            walk(child, path, package_dir, deferred, True)
+        for handler in node.handlers:
+            for child in handler.body:
+                walk(child, path, package_dir, deferred, guarded)
+        for child in list(node.orelse) + list(node.finalbody):
+            walk(child, path, package_dir, deferred, guarded)
+        return
+    for child in ast.iter_child_nodes(node):
+        walk(child, path, package_dir, deferred, guarded)
 
 while queue:
-    path = queue.pop()
-    if path in seen_files or not path.is_file():
+    path, deferred = queue.pop()
+    if not path.is_file():
         continue
-    seen_files.add(path)
+    if path in seen and (seen[path] == deferred or not seen[path]):
+        continue                   # already walked, and not newly reachable eagerly
+    seen[path] = deferred
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
     except SyntaxError as exc:
         unparsed.append({"file": str(path), "error": str(exc)})
         continue
+    walk(tree, path, path.parent, deferred, False)
 
-    guarded = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Try) and optional_handlers(node) & OPTIONAL_EXC:
-            for child in ast.walk(node):
-                if isinstance(child, (ast.Import, ast.ImportFrom)):
-                    guarded.add(id(child))
-
-    package_dir = path.parent
-    for node in ast.walk(tree):
-        optional = id(node) in guarded
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                record(alias.name, path, optional)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:                       # relative: resolve against this file's package
-                base = package_dir
-                for _ in range(node.level - 1):
-                    base = base.parent
-                parts = [base / (node.module.replace(".", "/") if node.module else "")]
-                for candidate in parts:
-                    for target in (Path(str(candidate) + ".py"), candidate / "__init__.py"):
-                        if target.is_file() and target not in seen_files:
-                            queue.append(target)
-                    for alias in node.names:     # `from . import x` where x is a module
-                        for target in (candidate / (alias.name + ".py"),
-                                       candidate / alias.name / "__init__.py"):
-                            if target.is_file() and target not in seen_files:
-                                queue.append(target)
-            elif node.module:
-                record(node.module, path, optional)
-
-missing, optional_missing = [], []
+missing, deferred_missing, optional_missing = [], [], []
 for dotted in sorted(external):
     try:
         found = importlib.util.find_spec(dotted) is not None
         reason = ""
-    except Exception as exc:                     # a parent that raises is as good as absent
-        found, reason = False, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:       # a parent that raises is as good as absent
+        found, reason = False, "%s: %s" % (type(exc).__name__, exc)
     if found:
         continue
-    row = {"module": dotted, "imported_by": external[dotted]["by"], "reason": reason}
-    (optional_missing if external[dotted]["optional"] else missing).append(row)
+    info = external[dotted]
+    row = {"module": dotted, "imported_by": info["by"], "reason": reason}
+    if info["optional"]:
+        optional_missing.append(row)
+    elif info["deferred"]:
+        deferred_missing.append(row)
+    else:
+        missing.append(row)
 
-print(json.dumps({"files_scanned": len(seen_files), "external": len(external),
-                  "missing": missing, "optional_missing": optional_missing,
-                  "unparsed": unparsed}))
+print(json.dumps({"files_scanned": len(seen), "external": len(external),
+                  "missing": missing, "deferred_missing": deferred_missing,
+                  "optional_missing": optional_missing, "unparsed": unparsed}))
 '''
 
 
@@ -162,15 +198,15 @@ def scan(python: Path, roots: Sequence[Path], entries: Sequence[Path],
     except (OSError, subprocess.TimeoutExpired) as exc:
         # one unusable interpreter must not end a sweep over every environment
         return {"error": f"could not run {python}: {exc}",
-                "missing": [], "optional_missing": [], "unparsed": []}
+                "missing": [], "deferred_missing": [], "optional_missing": [], "unparsed": []}
     if proc.returncode != 0:
         return {"error": (proc.stderr or proc.stdout or "").strip()[-1500:],
-                "missing": [], "optional_missing": [], "unparsed": []}
+                "missing": [], "deferred_missing": [], "optional_missing": [], "unparsed": []}
     try:
         return json.loads(proc.stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
         return {"error": f"unreadable scan output: {proc.stdout[-500:]}",
-                "missing": [], "optional_missing": [], "unparsed": []}
+                "missing": [], "deferred_missing": [], "optional_missing": [], "unparsed": []}
 
 
 def format_report(name: str, report: Dict[str, object], root: Optional[Path] = None) -> List[str]:
@@ -189,6 +225,9 @@ def format_report(name: str, report: Dict[str, object], root: Optional[Path] = N
         detail = f"  ({row['reason']})" if row.get("reason") else ""
         lines.append(f"    MISSING  {row['module']:<28} imported by {short(row['imported_by'])}"
                      f"{detail}")
+    for row in report.get("deferred_missing") or []:
+        lines.append(f"    deferred {row['module']:<28} inside a function in "
+                     f"{short(row['imported_by'])}")
     for row in report.get("optional_missing") or []:
         lines.append(f"    optional {row['module']:<28} guarded in {short(row['imported_by'])}")
     for row in report.get("unparsed") or []:

@@ -1703,6 +1703,38 @@ def test_import_scanner() -> None:
         check("the report names the env and the count", "fake" in lines[0])
         check("and is relative to the env root", not any(str(repo) in ln for ln in lines[1:]))
 
+    # an import inside a function only runs when something calls it, and so does everything
+    # the modules it reaches import. Wav2Lip imports lws in _lws_processor(), its default
+    # config never calls it, and Wav2Lip renders - counting that as missing buries the real
+    # findings under noise.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        (repo / "entry.py").write_text(
+            "import eager_absent\n"
+            "from helper import thing\n"
+            "def later():\n    import deferred_absent\n    from lazychain import x\n"
+            "if TYPE_CHECKING:\n    import typing_only_absent\n")
+        (repo / "helper.py").write_text("import eager_from_helper_absent\n")
+        (repo / "lazychain.py").write_text("import absent_under_a_deferred_module\n")
+
+        report = scan(Path(sys.executable), [repo], [repo / "entry.py"])
+        missing = {row["module"] for row in report["missing"]}
+        deferred = {row["module"] for row in report["deferred_missing"]}
+
+        check("a module-scope import is missing", "eager_absent" in missing)
+        check("so is one a module-scope import reaches",
+              "eager_from_helper_absent" in missing)
+        check("an import inside a function is deferred, not missing",
+              "deferred_absent" in deferred and "deferred_absent" not in missing)
+        check("and so is everything a deferred module imports",
+              "absent_under_a_deferred_module" in deferred,
+              "the whole subtree only runs when the function does")
+        check("a TYPE_CHECKING block never runs, so it is deferred too",
+              "typing_only_absent" in deferred)
+        check("the counts only promise what actually executes", len(missing) == 2,
+              str(sorted(missing)))
+
     broken = scan(Path("/definitely/not/an/interpreter"), [], [])
     check("an unusable interpreter is reported, not raised", broken.get("error"))
 
@@ -1860,6 +1892,41 @@ def test_third_round_dependencies() -> None:
     check("smoke honours accept_noncommercial like the run stage does",
           "CSF_ACCEPT_NONCOMMERCIAL" in smoke_src,
           "otherwise REFace reports a licence gate as though it were a broken model")
+
+
+def test_scanned_dependencies() -> None:
+    """Every module-scope import the first full scan reported, answered."""
+    print("scanned dependencies")
+    envs = env_specs()
+    names = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                          for r in envs[name].pip_requirements()]
+
+    for env_name, dist in (("stylegan", "wget"),
+                           ("latentsync", "deepcache"), ("latentsync", "ffmpeg-python"),
+                           ("latentsync", "insightface"),
+                           ("dreamid", "ipython"), ("dreamid", "decord"),
+                           ("sadtalker", "realesrgan"), ("sadtalker", "trimesh"),
+                           ("vace", "scipy"), ("vace", "scikit-image"), ("vace", "timm"),
+                           ("vace", "insightface")):
+        check(f"env '{env_name}' installs {dist}", dist in names(env_name), str(names(env_name)))
+
+    reface = " ".join(envs["reface"].pip_requirements())
+    check("reface gets OpenAI's CLIP, which is not on PyPI", "openai/CLIP.git" in reface)
+    check("and invisible-watermark for imwatermark", "invisible-watermark" in reface)
+
+    # insightface installs the CPU runtime and full OpenCV behind it, in every env
+    for env_name in ("latentsync", "vace", "reface", "dreamid"):
+        hooks = "".join("".join(c) for c in envs[env_name].post_install)
+        check(f"{env_name} puts the GPU runtime and headless OpenCV back",
+              "onnxruntime-gpu" in hooks and "opencv-python-headless" in hooks)
+
+    # what the scan proved we do NOT have to install
+    for env_name, dist in (("sadtalker", "pytorch3d"), ("sadtalker", "lws"),
+                           ("liveportrait", "MultiScaleDeformableAttention"),
+                           ("vace", "xfuser"), ("dreamid", "xfuser")):
+        check(f"{env_name} does not install {dist}", dist.lower() not in
+              " ".join(names(env_name)).lower(),
+              "it is only reached inside a function, and compiling it would cost hours")
 
 
 def test_fomm_source_frame() -> None:
@@ -2092,7 +2159,8 @@ def main() -> int:
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
                test_import_scanner, test_envs_cli_root, test_entry_points_declared,
                test_musetalk_dwpose_patch,
-               test_third_round_dependencies, test_fomm_source_frame,
+               test_third_round_dependencies, test_scanned_dependencies,
+               test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
                test_env_selection_typos, test_smoke_output_location,
                test_child_process_errors,

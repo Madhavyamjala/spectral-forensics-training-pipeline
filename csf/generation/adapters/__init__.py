@@ -526,11 +526,15 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.32,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
-                      # latentsync/utils/affine_transform.py imports kornia
-                      "kornia",
+                      # kornia for affine_transform, DeepCache for the UNet cache its
+                      # inference script imports, ffmpeg-python for the bundled whisper, and
+                      # insightface for its face detector
+                      "kornia", "deepcache", "ffmpeg-python", "insightface==2.0",
                       "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
                       "decord", "mediapipe", "tqdm"),
         repos=(GitRepo("https://github.com/bytedance/LatentSync.git", name="LatentSync"),),
+        # insightface pulls the CPU onnxruntime and full OpenCV behind it
+        post_install=(onnxruntime_gpu_swap(),),
         weights=(WeightFile(dest="repos/LatentSync/checkpoints/latentsync_unet.pt",
                             hf_repo="ByteDance/LatentSync-1.6", hf_file="latentsync_unet.pt"),
                  WeightFile(dest="repos/LatentSync/checkpoints/whisper/tiny.pt",
@@ -579,7 +583,10 @@ ENVS: Dict[str, EnvSpec] = {
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]",
                       "scipy", "yacs", "pydub", "kornia", "face-alignment", "safetensors",
-                      "basicsr", "facexlib", "gfpgan", "tqdm"),
+                      # face_enhancer.py imports realesrgan and facerecon_model trimesh,
+                      # both at module scope - pytorch3d is only reached inside nvdiffrast's
+                      # functions, and it would have to be compiled, so it stays out
+                      "basicsr", "facexlib", "gfpgan", "realesrgan", "trimesh", "tqdm"),
         repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),),
         post_install=(
             # basicsr 1.4.2 imports torchvision.transforms.functional_tensor, deprecated in
@@ -631,18 +638,23 @@ ENVS: Dict[str, EnvSpec] = {
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       # VACE's annotators package is imported by vace_wan_inference.py and
                       # opens with pycocotools, from upstream's annotator requirements
-                      # the annotators package reaches pycocotools and, through dwpose,
-                      # matplotlib - both from upstream's annotator requirements
+                      # vace_wan_inference.py imports the annotators package, whose
+                      # __init__ imports every annotator - so depth (timm), mask (scipy,
+                      # skimage), dwpose (matplotlib, onnxruntime) and face (insightface) are
+                      # all reached at import time, not only when one is used
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "pycocotools",
-                      "matplotlib", "tqdm"),
+                      "matplotlib", "scipy", "scikit-image", "timm", "insightface==2.0",
+                      "tqdm"),
         # `wan` is not derivable from the requirements, and neither is the fact that VACE
         # dies on it at job time rather than build time - name it so a broken install fails
         # here, where the error says which env and can be retried
         verify_imports=("torch", "diffusers", "transformers", "cv2", "numpy", "einops",
-                        "decord", "wan"),
+                        "decord", "wan", "onnxruntime", "insightface", "timm", "skimage"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
         post_install=(pip_install("--no-deps", WAN2_1_PACKAGE),
-                      hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B")),
+                      hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),
+                      # last: insightface drags the CPU runtime and full OpenCV in behind it
+                      onnxruntime_gpu_swap()),
         hub_repos=("Wan-AI/Wan2.1-VACE-1.3B",),
         note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
              "prompt-driven V2V, so it fills several slots the document's models cannot.",
@@ -686,7 +698,9 @@ ENVS: Dict[str, EnvSpec] = {
                       "insightface==2.0", "easydict", "ftfy", "tqdm",
                       # mediapipe 1.0 ships only `modules` and `tasks`: the legacy
                       # Solutions API that express_adaption/media_pipe imports is gone
-                      "mediapipe<1", "dashscope"),
+                      # get_video_npy.py imports IPython.display; the vendored wan utils
+                      # read video with decord
+                      "mediapipe<1", "dashscope", "ipython", "decord"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
@@ -712,7 +726,10 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
+                      # scripts/inference.py carries the Stable Diffusion scaffolding:
+                      # OpenAI's CLIP package (not on PyPI) and invisible-watermark
                       "omegaconf", "pytorch-lightning", "kornia", "insightface==2.0",
+                      "git+https://github.com/openai/CLIP.git", "invisible-watermark",
                       "tqdm"),
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
                         "cv2", "numpy", "omegaconf", "huggingface_hub"),
@@ -771,7 +788,9 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
                       # psp.py imports matplotlib, the vendored lpips imports skimage, and
                       # its base_model.py still has a debugging `from IPython import embed`
-                      "dlib-bin", "matplotlib", "scikit-image", "ipython", "tqdm"),
+                      # video_editing.py imports wget at module scope, whether or not it
+                      # needs to fetch anything (the build already places the predictor)
+                      "dlib-bin", "matplotlib", "scikit-image", "ipython", "wget", "tqdm"),
         verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib",
                         "skimage"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
