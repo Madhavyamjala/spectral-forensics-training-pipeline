@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Sequence
 
 from csf.generation.adapters import ADAPTERS, WorkerPool, env_specs
 from csf.generation.adapters.base import AdapterError
+from csf.generation.diskcheck import require_writable
 from csf.generation.envs import EnvBuildError
 from csf.logging_utils import get_logger
 
@@ -105,7 +106,9 @@ def run_smoke(cfg, models: Sequence[str], gpu: int, out_dir: Path,
     """Render one video per model and return a result per model, in the order asked for."""
     gen = cfg.generation
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # before spending a model load on it: every worker writes its video and its log here, and
+    # a quota refuses both while the filesystem still reports free space
+    require_writable(out_dir, mib=16, label="the smoke output")
     jobs = _first_jobs(cfg, models)
 
     pool = WorkerPool(

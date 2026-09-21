@@ -1708,6 +1708,67 @@ def test_ffmpeg_shim() -> None:
         check("an env without imageio-ffmpeg is left alone", not (venv_bin / "ffmpeg").exists())
 
 
+def test_quota_probe() -> None:
+    """Free space is not permission to write, and a quota is invisible to disk_usage."""
+    print("quota probe")
+    import errno
+    import tempfile
+    from unittest import mock
+
+    from csf.generation.diskcheck import EDQUOT, require_writable, write_probe
+
+    with tempfile.TemporaryDirectory() as tmp:
+        check("a writable directory passes", write_probe(tmp, mib=2) is None)
+        leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith(".csf_write_probe")]
+        check("the probe file is cleaned up", not leftovers, str(leftovers))
+
+        nested = Path(tmp) / "not" / "there" / "yet"
+        check("a directory that does not exist yet is created and probed",
+              write_probe(nested, mib=1) is None and nested.exists())
+
+        # the failure this exists for: the write is refused although the filesystem is not full
+        quota = OSError(EDQUOT, "Disk quota exceeded")
+        quota.errno = EDQUOT
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=quota):
+            problem = write_probe(tmp, mib=1)
+        check("a quota refusal is reported", problem is not None)
+        check("and named as a quota, not as free space",
+              problem and "quota" in problem.lower())
+        check("with the command that shows the limit", problem and "quota -s" in problem)
+
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=quota):
+            try:
+                require_writable(tmp, mib=1, label="the videos")
+                raised = ""
+            except RuntimeError as exc:
+                raised = str(exc)
+        check("require_writable refuses to continue", raised)
+        check("and says which directory it means", "the videos" in raised)
+
+        full = OSError(errno.ENOSPC, "No space left on device")
+        full.errno = errno.ENOSPC
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=full):
+            check("a genuinely full filesystem is reported too", write_probe(tmp, mib=1))
+
+    main_src = (ROOT / "main.py").read_text()
+    check("preflight probes before a run starts", "require_writable(cfg.paths.cache_dir" in main_src)
+    sched_src = (ROOT / "csf/generation/scheduler.py").read_text()
+    check("the scheduler re-probes while it runs", "write_probe(self.video_root" in sched_src)
+    check("but not once per job", "probe_interval_s" in sched_src)
+    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke probes before loading a model", "require_writable(out_dir" in smoke_src)
+
+
+def test_env_selection_typos() -> None:
+    """One typo in a list of envs must not silently build nothing."""
+    print("env selection")
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("an unknown name raises rather than returning an empty list",
+          "unknown env/adapter {part!r} in {name!r}" in src)
+    for verb in ("built", "burned", "checked"):
+        check(f"--{verb} reports what it did not do", f"Nothing was {verb}" in src)
+
+
 def test_child_process_errors() -> None:
     """A failed upstream CLI must report the head of its traceback, not only the tail."""
     print("child process errors")
@@ -1783,7 +1844,8 @@ def main() -> int:
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
-               test_torch_library_ceilings, test_ffmpeg_shim, test_child_process_errors,
+               test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
+               test_env_selection_typos, test_child_process_errors,
                test_smoke_selection):
         fn()
     print()

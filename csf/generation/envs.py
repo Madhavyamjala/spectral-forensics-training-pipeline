@@ -829,12 +829,19 @@ def _main() -> int:
             elif part in ADAPTERS:
                 picked.append(specs[ADAPTERS[part].env_name])
             else:
-                return []
+                # name the offending entry: a list of thirteen with one typo in it used to
+                # come back empty, and the command then did nothing that looked like nothing
+                raise ValueError(
+                    f"unknown env/adapter {part!r} in {name!r}. Known envs: {sorted(specs)}")
         # de-duplicate while preserving order: several adapters can share one env
         return list({spec.name: spec for spec in picked}.values())
 
     if args.burn:
-        wanted = _select(args.burn)
+        try:
+            wanted = _select(args.burn)
+        except ValueError as exc:
+            print(f"Nothing was burned: {exc}")
+            return 2
         if not wanted:
             print(f"Unknown env/adapter {args.burn!r}. Known envs: {sorted(specs)}")
             return 2
@@ -845,7 +852,11 @@ def _main() -> int:
             return 0
 
     if args.doctor:
-        wanted = _select(args.doctor)
+        try:
+            wanted = _select(args.doctor)
+        except ValueError as exc:
+            print(f"Nothing was checked: {exc}")
+            return 2
         if not wanted:
             print(f"Unknown env/adapter {args.doctor!r}. Known envs: {sorted(specs)}")
             return 2
@@ -886,7 +897,11 @@ def _main() -> int:
               f"{len(status)} environment(s) a runnable model needs")
         return 0
 
-    wanted = _select(args.build)
+    try:
+        wanted = _select(args.build)
+    except ValueError as exc:
+        print(f"Nothing was built: {exc}")
+        return 2
     if not wanted:
         print(f"Unknown env/adapter {args.build!r}. Known envs: {sorted(specs)}")
         return 2

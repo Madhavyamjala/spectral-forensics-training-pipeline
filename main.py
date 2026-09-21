@@ -169,6 +169,14 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
         info["video_disk_free_gib"] = round(video_free, 1)
         info["video_disk_probe"] = str(video_probed)
     log.info("Environment: %s", json.dumps(info))
+
+    # free space is not permission to write: a per-user quota refuses the write with terabytes
+    # still free on the filesystem, and every symptom downstream wears a different costume
+    from csf.generation.diskcheck import require_writable
+    require_writable(cfg.paths.cache_dir, mib=16, label="the cache")
+    if Path(cfg.paths.video_dir).resolve() != Path(cfg.paths.cache_dir).resolve():
+        require_writable(cfg.paths.video_dir, mib=16, label="the videos")
+
     for label, gib, where in (("cache", free_gb, probed), ("videos", video_free, video_probed)):
         if gib < (20 if cfg.mode == "test" else 120):
             log.warning("Only %.1f GiB free for the %s directory (measured on %s); the feature "

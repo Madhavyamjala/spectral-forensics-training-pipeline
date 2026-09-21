@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from csf.generation.adapters import ADAPTERS, WorkerPool, adapter_for, env_specs
 from csf.generation.adapters.base import AdapterError
+from csf.generation.diskcheck import write_probe
 from csf.generation.envs import EnvBuildError
 from csf.generation import progress as progress_ui
 from csf.generation.jobs import Job
@@ -313,13 +314,17 @@ class GenerationScheduler:
         self.max_workers_per_gpu = max(1, max_workers_per_gpu)
         self.failures: List[Tuple[str, str, str]] = []
         self._fail_lock = threading.Lock()
+        self._probe_lock = threading.Lock()
+        self._probed_at = 0.0
+        self._probe_error: Optional[str] = None
+        self.probe_interval_s = 60.0
 
     def output_path(self, job: Job) -> Path:
         """Return the destination video path for a job."""
         return self.video_root / "AI Edited" / job.family / f"{job.video_id}.mp4"
 
     def _disk_ok(self) -> bool:
-        """Return whether enough free disk space remains for generation."""
+        """Return whether generation can still write videos: free space *and* quota."""
         try:
             free_gb = shutil.disk_usage(self.video_root).free / 2 ** 30
         except OSError:
@@ -327,6 +332,21 @@ class GenerationScheduler:
         if free_gb < self.min_free_gb:
             log.error("Only %.1f GiB free under %s (min_free_gb=%.1f) - pausing generation",
                       free_gb, self.video_root, self.min_free_gb)
+            return False
+        # A quota refuses writes while disk_usage still reports the filesystem's free blocks,
+        # so the space check above cannot see it. Probe rather than trust, but throttled: this
+        # runs before every job and the answer does not change by the second.
+        now = time.monotonic()
+        with self._probe_lock:
+            due = now - self._probed_at >= self.probe_interval_s
+            if due:
+                self._probed_at = now
+        if due:
+            problem = write_probe(self.video_root, mib=8)
+            self._probe_error = problem
+        if self._probe_error:
+            log.error("Cannot write under %s - pausing generation. %s",
+                      self.video_root, self._probe_error)
             return False
         return True
 
