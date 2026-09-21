@@ -68,6 +68,58 @@ print('basicsr imports cleanly')
 """
 
 
+#: Wav2Lip's audio.py calls `librosa.filters.mel(sample_rate, n_fft, ...)` positionally.
+#: librosa 0.10 made every argument of that function keyword-only, so the call raises
+#: `TypeError: mel() takes 0 positional arguments` before a single frame is rendered. Pinning
+#: librosa back below 0.10 would drag numba and llvmlite down with it - and those are what
+#: decide whether this env builds at all on a given Python - so the call site is rewritten
+#: instead. The keyword form means the same thing on every librosa that has ever shipped it.
+WAV2LIP_LIBROSA_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'Wav2Lip' / 'audio.py'
+text = path.read_text(encoding='utf-8')
+old = 'librosa.filters.mel(hp.sample_rate, hp.n_fft,'
+new = 'librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft,'
+if old in text:
+    path.write_text(text.replace(old, new), encoding='utf-8')
+    print('wav2lip: rewrote the positional librosa.filters.mel call in audio.py')
+elif new in text:
+    print('wav2lip: audio.py already uses the keyword form')
+else:
+    raise SystemExit('wav2lip: audio.py has no recognisable librosa.filters.mel call; the '
+                     'upstream file changed and this patch needs revisiting')
+"""
+
+#: SadTalker still uses `np.float`, removed in numpy 1.24 while these envs resolve to 1.26 under
+#: the `numpy<2` pin - `src/face3d/util/my_awing_arch.py` raises on it mid-render, after the
+#: model has loaded. Pinning numpy below 1.24 instead would put this env alone on a numpy older
+#: than basicsr, facexlib and gfpgan build against, so the aliases are rewritten to the builtins
+#: they were aliases *for*. numpy's own removal note prescribes exactly this substitution.
+SADTALKER_NUMPY_PATCH = r"""
+import os, pathlib, re
+root = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'SadTalker'
+# \b...(?!\w) so np.float32 / np.int64 and friends are left alone - only the bare aliases go
+pattern = re.compile(r'\bnp\.(float|int|bool|object|str)\b(?!\w)')
+patched = 0
+for path in sorted(root.rglob('*.py')):
+    text = path.read_text(encoding='utf-8', errors='ignore')
+    fixed = pattern.sub(lambda m: m.group(1), text)
+    if fixed != text:
+        path.write_text(fixed, encoding='utf-8')
+        patched += 1
+print('sadtalker: replaced removed numpy scalar aliases in %d file(s)' % patched)
+"""
+
+
+#: VACE's `vace_wan_inference.py` opens with `import wan`: the Wan2.1 package is a separate
+#: install that upstream leaves commented out in requirements/framework.txt for you to add.
+#: `--no-deps` is deliberate - Wan2.1's dependency list pins `flash_attn`, which compiles from
+#: source against nvcc and takes hours, and `wan/modules/attention.py` guards both
+#: flash-attention imports and falls back to torch's scaled_dot_product_attention when neither
+#: is importable. Everything else it imports is already in this env's requirements.
+WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
+
+
 #: `onnxruntime` / `onnxruntime-gpu` and `opencv-python` / `opencv-python-headless` are pairs of
 #: distributions that install the SAME import name. Uninstalling one deletes the shared files
 #: even when the other is still recorded as installed - and pip then answers the reinstall with
@@ -101,6 +153,11 @@ def onnxruntime_gpu_swap() -> tuple:
     to repeat it after any insightface install or upgrade. This is that step.
     """
     return ("-c", RUNTIME_SWAP)
+
+
+def pip_install(*args: str) -> tuple:
+    """A post-install step that runs `pip install` inside the env's own interpreter."""
+    return ("-m", "pip", "install", *args)
 
 
 def hub_snapshot(repo_id: str, *dest: str) -> tuple:
@@ -163,7 +220,10 @@ ENVS: Dict[str, EnvSpec] = {
         name="propainter",
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
-                      "av", "einops", "timm", "tqdm", "matplotlib", "scikit-image"),
+                      "av", "einops", "timm", "tqdm", "matplotlib", "scikit-image",
+                      # ProPainter/utils/download_util.py imports requests at module scope,
+                      # so inference_propainter.py cannot even be imported without it
+                      "requests"),
         repos=(GitRepo("https://github.com/sczhou/ProPainter.git", name="ProPainter"),),
         weights=(
             WeightFile(dest="repos/ProPainter/weights/ProPainter.pth",
@@ -180,7 +240,9 @@ ENVS: Dict[str, EnvSpec] = {
         name="videoinpaint",
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
-                      "av", "einops", "tqdm", "scikit-image"),
+                      "av", "einops", "tqdm", "scikit-image",
+                      # all three test.py entry points import matplotlib for their colour maps
+                      "matplotlib"),
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
@@ -213,6 +275,7 @@ ENVS: Dict[str, EnvSpec] = {
                  WeightFile(dest="repos/Wav2Lip/face_detection/detection/sfd/s3fd.pth",
                             hf_repo="camenduru/Wav2Lip",
                             hf_file="checkpoints/s3fd-619a316812.pth")),
+        post_install=(("-c", WAV2LIP_LIBROSA_PATCH),),
     ),
 
     # --- First Order Motion Model (reenactment) ------------------------------------------
@@ -301,6 +364,7 @@ ENVS: Dict[str, EnvSpec] = {
             ("-c", BASICSR_PATCH),
             ("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
                    "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),
+            ("-c", SADTALKER_NUMPY_PATCH),
         ),
         hub_repos=(),   # its downloader pulls from GitHub Releases, not the Hub
         note="Apache-2.0 (non-commercial restriction was removed upstream). Its own "
@@ -311,8 +375,12 @@ ENVS: Dict[str, EnvSpec] = {
     "liveportrait": EnvSpec(
         name="liveportrait",
         torch=TORCH_CU121,
+        # LivePortrait vendors its own copy of insightface under src/utils/dependencies,
+        # and that copy's arcface_onnx.py imports `onnx` itself - onnxruntime is a different
+        # distribution and does not provide it
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
-                      "onnxruntime-gpu==1.18.1", "rich", "pyyaml", "albumentations", "tqdm"),
+                      "onnxruntime-gpu==1.18.1", "onnx", "rich", "pyyaml", "albumentations",
+                      "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
         post_install=(hub_snapshot("KlingTeam/LivePortrait",
                                    "repos", "LivePortrait", "pretrained_weights"),),
@@ -327,8 +395,14 @@ ENVS: Dict[str, EnvSpec] = {
         requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
                       "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
+        # `wan` is not derivable from the requirements, and neither is the fact that VACE
+        # dies on it at job time rather than build time - name it so a broken install fails
+        # here, where the error says which env and can be retried
+        verify_imports=("torch", "diffusers", "transformers", "cv2", "numpy", "einops",
+                        "decord", "wan"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
-        post_install=(hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),),
+        post_install=(pip_install("--no-deps", WAN2_1_PACKAGE),
+                      hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B")),
         hub_repos=("Wan-AI/Wan2.1-VACE-1.3B",),
         note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
              "prompt-driven V2V, so it fills several slots the document's models cannot.",
@@ -353,17 +427,25 @@ ENVS: Dict[str, EnvSpec] = {
     "dreamid": EnvSpec(
         name="dreamid",
         torch=TORCH_CU121,
+        # generate_dreamidv.py is the MediaPipe entry point (the alternative, _faster, wants
+        # DWPose ONNX models placed by hand), and it reaches mediapipe through the repo's own
+        # express_adaption package. dashscope is imported by the vendored prompt-extend module
+        # that the entry point loads at import time, whether or not prompt extension is used.
         requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
-                      "insightface==2.0", "easydict", "ftfy", "tqdm"),
+                      "insightface==2.0", "easydict", "ftfy", "tqdm",
+                      "mediapipe", "dashscope"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
-                        "cv2", "numpy", "huggingface_hub"),
+                        "cv2", "numpy", "mediapipe", "huggingface_hub"),
         repos=(GitRepo("https://github.com/bytedance/DreamID-V.git", name="DreamID-V"),),
+        # Two checkpoints, not one: DreamID-V ships only its own DiT weights and borrows the
+        # VAE and T5 text encoder from the Wan2.1 1.3B release, which --ckpt_dir points at.
         post_install=(onnxruntime_gpu_swap(),
-                      hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V")),
-        hub_repos=("XuGuo699/DreamID-V",),
+                      hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V"),
+                      hub_snapshot("Wan-AI/Wan2.1-T2V-1.3B", "weights", "Wan2.1-T2V-1.3B")),
+        hub_repos=("XuGuo699/DreamID-V", "Wan-AI/Wan2.1-T2V-1.3B"),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
     ),
@@ -392,7 +474,11 @@ ENVS: Dict[str, EnvSpec] = {
         name="tpsmm",
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
-                      "pyyaml", "scipy", "matplotlib", "tqdm"),
+                      "pyyaml", "scipy", "matplotlib", "tqdm",
+                      # demo.py imports face_alignment inside find_best_frame(), which the
+                      # worker asks for - the alignment it picks is what keeps the driving
+                      # pose from jumping on the first frame
+                      "face-alignment"),
         repos=(GitRepo("https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model.git",
                        name="TPSMM"),),
         weights=(WeightFile(dest="repos/TPSMM/checkpoints/vox.pth.tar",
@@ -415,8 +501,9 @@ ENVS: Dict[str, EnvSpec] = {
         # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
         # it installs `dlib` under the same import name.
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
-                      "dlib-bin", "tqdm"),
-        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib"),
+                      # StyleGANEX/models/psp.py imports matplotlib at module scope
+                      "dlib-bin", "matplotlib", "tqdm"),
+        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
         weights=(
             # Upstream releases one checkpoint PER EDITING DIRECTION, not one "editing" model:

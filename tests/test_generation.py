@@ -1531,6 +1531,141 @@ def test_disk_probe() -> None:
     check("the new probe does not collapse to the root", str(probed) != "/")
 
 
+def test_worker_dependencies() -> None:
+    """Every import a worker's upstream repo makes at module scope must be installed.
+
+    Each check here is one model that rendered nothing in a two-day run: the traceback was
+    always a bare ModuleNotFoundError or a signature change, hours after the env was declared
+    ready. An env's requirements are the only place that knowledge can live, because the repos
+    themselves either ship no requirements file or ship one that fights the pinned torch.
+    """
+    print("worker dependencies")
+    envs = env_specs()
+
+    # (env, distribution, who imports it)
+    required = [
+        ("videoinpaint", "matplotlib", "E2FGVI / STTN / FuseFormer test.py"),
+        ("stylegan", "matplotlib", "StyleGANEX models/psp.py"),
+        ("propainter", "requests", "ProPainter utils/download_util.py"),
+        ("liveportrait", "onnx", "LivePortrait's vendored insightface arcface_onnx.py"),
+        ("tpsmm", "face-alignment", "TPSMM demo.py find_best_frame"),
+    ]
+    for env_name, dist, who in required:
+        reqs = [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                for r in envs[env_name].pip_requirements()]
+        check(f"env '{env_name}' installs {dist} for {who}", dist in reqs, f"has {reqs}")
+
+    # onnxruntime is a different distribution from onnx and does not provide that import
+    lp = [r for r in envs["liveportrait"].pip_requirements()]
+    check("onnxruntime is not mistaken for onnx",
+          any(r.startswith("onnx") and not r.startswith("onnxruntime") for r in lp))
+
+    vace = envs["vace"]
+    wan_install = [c for c in vace.post_install if "pip" in c and any("Wan2.1" in a for a in c)]
+    check("the vace env installs the Wan2.1 package its entry point imports", wan_install)
+    check("it installs it without dependencies (flash_attn would build from source)",
+          wan_install and "--no-deps" in wan_install[0])
+    check("a failed wan install fails the build, not 2,883 jobs", "wan" in vace.verify_imports)
+
+    w2l = "".join("".join(c) for c in envs["wav2lip"].post_install)
+    check("wav2lip rewrites the positional librosa.filters.mel call",
+          "librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft," in w2l)
+    check("it keeps librosa itself unpinned below 0.10",
+          not any("librosa<0.10" in r for r in envs["wav2lip"].pip_requirements()))
+
+    sad = [c for c in envs["sadtalker"].post_install if "np.float" in "".join(c)]
+    check("sadtalker rewrites the numpy aliases removed in 1.24", sad)
+    if sad:
+        pattern = re.search(r"re\.compile\(r'([^']+)'\)", "".join(sad[0]))
+        check("the patch's pattern is recoverable", pattern is not None)
+        if pattern:
+            rx = re.compile(pattern.group(1))
+            check("it rewrites the bare alias",
+                  rx.sub(lambda m: m.group(1), "x.astype(np.float, copy=False)")
+                  == "x.astype(float, copy=False)")
+            check("it leaves the sized dtypes alone",
+                  rx.sub(lambda m: m.group(1), "np.float32 np.int64 np.bool_")
+                  == "np.float32 np.int64 np.bool_")
+
+    dreamid = (ROOT / "csf/generation/adapters/workers/worker_dreamid.py").read_text()
+    for flag in ("--ref_image", "--ref_video", "--save_file", "--dreamidv_ckpt",
+                 "generate_dreamidv.py"):
+        check(f"the DreamID-V worker uses {flag}", flag in dreamid)
+    for gone in ("--target_video", "--source_image", "--output_dir", '"inference.py"'):
+        check(f"it no longer uses {gone}, which upstream never had", gone not in dreamid)
+    check("the Wan2.1 backbone DreamID-V borrows its VAE and T5 from is staged",
+          any("Wan2.1-T2V-1.3B" in repo for repo in envs["dreamid"].hub_repos))
+    check("frame_num stays on upstream's 4n+1 grid",
+          re.search(r"N_FRAMES = (\d+)", dreamid) and
+          (int(re.search(r"N_FRAMES = (\d+)", dreamid).group(1)) - 1) % 4 == 0)
+
+
+def test_child_process_errors() -> None:
+    """A failed upstream CLI must report the head of its traceback, not only the tail."""
+    print("child process errors")
+    common = ROOT / "csf/generation/adapters/workers/_common.py"
+    src = common.read_text()
+    namespace: dict = {}
+    body = src[src.index("def clip_output"):src.index("def run_cmd")]
+    exec(compile(body, str(common), "exec"), namespace)
+    clip_output = namespace["clip_output"]
+
+    short = "traceback\nline\nerror"
+    check("output that fits is passed through untouched", clip_output(short) == short)
+
+    head, tail = "H" * 4000, "T" * 4000
+    clipped = clip_output(head + "middle" * 500 + tail)
+    check("the first frames survive", clipped.startswith("H" * 1500))
+    check("the last frames survive", clipped.endswith("T" * 1500))
+    check("the elision is stated, not silent", "characters elided" in clipped)
+    check("nothing is smuggled through the middle", "middle" not in clipped)
+
+    check("run_cmd no longer keeps the tail alone", "[-1500:]" not in src,
+          "the import chain that names the broken dependency lives in the head")
+    check("run_cmd reports through clip_output", "clip_output(proc.stderr" in src)
+
+
+def test_smoke_selection() -> None:
+    """The per-model smoke command must refuse what it cannot honestly test."""
+    print("smoke selection")
+    from csf.generation import smoke
+
+    wired = smoke.selectable()
+    check("every selectable model is wired up", all(ADAPTERS[k].implemented for k in wired))
+    check("--all offers every wired model",
+          set(smoke._resolve([], "", True)) == set(wired))
+    check("a comma-separated list is split",
+          smoke._resolve(["inswapper,wav2lip"], "", False) == ["inswapper", "wav2lip"])
+    check("a family selects its wired models",
+          set(smoke._resolve([], "video_inpainting", False))
+          == {k for k in wired if ADAPTERS[k].family == "video_inpainting"})
+
+    for bad, why in ((["no_such_model"], "unknown model"),
+                     ([""], "empty selection")):
+        try:
+            resolved = smoke._resolve(bad, "", False)
+        except SystemExit:
+            resolved = None
+        check(f"{why} is rejected or empty", not resolved)
+
+    scaffolds = [k for k, a in ADAPTERS.items() if not a.implemented]
+    if scaffolds:
+        try:
+            smoke._resolve([scaffolds[0]], "", False)
+            refused = False
+        except SystemExit:
+            refused = True
+        check("a tier-2 scaffold cannot be smoke-tested", refused)
+
+    src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke renders into its own directory, never the dataset tree",
+          "AI Edited" not in src)
+    check("one resident worker, so a full sweep needs one model's VRAM",
+          "max_resident=1" in src)
+    check("a worker that reports success but writes nothing is a failure",
+          "empty file" in src)
+
+
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
                test_substitutions, test_budget, test_reallocation, test_concurrency,
@@ -1539,7 +1674,8 @@ def main() -> int:
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
-               test_disk_probe):
+               test_disk_probe, test_worker_dependencies, test_child_process_errors,
+               test_smoke_selection):
         fn()
     print()
     if FAILURES:
