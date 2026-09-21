@@ -52,6 +52,21 @@ STDLIB = set(getattr(sys, "stdlib_module_names", ()))
 OPTIONAL_EXC = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
 DEFER_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
+# Every module name anywhere in the repos, by top-level name. Upstream code edits sys.path
+# at import time - MuseTalk's musetalk/utils/__init__.py appends its own directory, so
+# preprocessing.py can say `from face_detection import ...` about a package nested three
+# levels down. That is unreachable by static path resolution and reporting it as missing is
+# simply wrong, so a name that exists as a module anywhere under a repo counts as local.
+repo_index = {}
+for root in roots:
+    if not root.is_dir():
+        continue
+    for path in root.rglob("*.py"):
+        if path.name == "__init__.py":
+            repo_index.setdefault(path.parent.name, path)
+        else:
+            repo_index.setdefault(path.stem, path)
+
 def local_path(dotted):
     # the file a dotted name resolves to inside the repos, or None
     rel = dotted.replace(".", "/")
@@ -59,7 +74,7 @@ def local_path(dotted):
         for candidate in (root / (rel + ".py"), root / rel / "__init__.py"):
             if candidate.is_file():
                 return candidate
-    return None
+    return repo_index.get(dotted.split(".")[0])
 
 def catches_import(node):
     # whether a try/except swallows an import failure

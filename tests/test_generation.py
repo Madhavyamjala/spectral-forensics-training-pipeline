@@ -1737,6 +1737,29 @@ def test_import_scanner() -> None:
               str(sorted(missing)))
 
     broken = scan(Path("/definitely/not/an/interpreter"), [], [])
+    # upstream edits sys.path at import time: MuseTalk's musetalk/utils/__init__.py appends
+    # its own directory so preprocessing.py can import a package nested three levels down.
+    # Static path resolution cannot see that, and calling it missing is simply wrong.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        (repo / "pkg" / "utils" / "vendored").mkdir(parents=True)
+        (repo / "entry.py").write_text("from pkg.utils.helper import x\n")
+        (repo / "pkg" / "__init__.py").write_text("")
+        (repo / "pkg" / "utils" / "__init__.py").write_text(
+            "import sys\nsys.path.append('utils')\n")
+        (repo / "pkg" / "utils" / "helper.py").write_text(
+            "from vendored import thing\nimport genuinely_absent\n")
+        (repo / "pkg" / "utils" / "vendored" / "__init__.py").write_text(
+            "import absent_in_vendored\n")
+
+        report = scan(Path(sys.executable), [repo], [repo / "entry.py"])
+        missing = {row["module"] for row in report["missing"]}
+        check("a package reachable only through a sys.path edit is not called missing",
+              "vendored" not in missing)
+        check("and the scan follows into it", "absent_in_vendored" in missing,
+              "resolving it locally is what makes its own imports visible")
+        check("a genuinely absent module is still reported", "genuinely_absent" in missing)
+
     check("an unusable interpreter is reported, not raised", broken.get("error"))
 
 
@@ -1893,7 +1916,9 @@ def test_third_round_dependencies() -> None:
 
     # mediapipe 1.0 ships `modules` and `tasks` only - the Solutions API is gone
     check("dreamid pins mediapipe below the release that dropped Solutions",
-          any(r.startswith("mediapipe") and "<1" in r for r in reqs("dreamid")))
+          any(r.startswith("mediapipe") and ("<1" in r or "==0.10.21" in r)
+              for r in reqs("dreamid")),
+          "which release, and why an exact pin, is checked in test_last_three_findings")
 
     check("tpsmm turns off the torch.compile path face-alignment 1.4 added",
           envs["tpsmm"].env_vars.get("TORCHDYNAMO_DISABLE") == "1",
@@ -1941,6 +1966,26 @@ def test_scanned_dependencies() -> None:
         check(f"{env_name} does not install {dist}", dist.lower() not in
               " ".join(names(env_name)).lower(),
               "it is only reached inside a function, and compiling it would cost hours")
+
+
+def test_last_three_findings() -> None:
+    """The three the scan still reported after every environment was rebuilt."""
+    print("last three findings")
+    envs = env_specs()
+
+    # mediapipe dropped Solutions and framework before 1.0, so `<1` did not cover it
+    pin = [r for r in envs["dreamid"].pip_requirements() if r.startswith("mediapipe")]
+    check("dreamid pins mediapipe to an exact release", pin == ["mediapipe==0.10.21"], str(pin))
+
+    tf = "".join("".join(c) for c in envs["tokenflow"].post_install)
+    check("TokenFlow's create_meshgrid import is moved off kornia.utils.grid",
+          "kornia.utils.grid" in tf and "from kornia.geometry import create_meshgrid" in tf,
+          "kornia 0.8 collapsed kornia/utils into a deprecation shim")
+
+    scan_src = (ROOT / "csf/generation/importscan.py").read_text()
+    check("a module reached through a sys.path edit counts as local", "repo_index" in scan_src,
+          "MuseTalk appends its own directory, so face_detection is importable and was "
+          "being reported as missing")
 
 
 def test_fomm_source_frame() -> None:
@@ -2174,6 +2219,7 @@ def main() -> int:
                test_import_scanner, test_envs_cli_root, test_entry_points_declared,
                test_musetalk_dwpose_patch,
                test_third_round_dependencies, test_scanned_dependencies,
+               test_last_three_findings,
                test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
                test_env_selection_typos, test_smoke_output_location,

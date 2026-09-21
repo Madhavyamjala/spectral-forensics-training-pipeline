@@ -211,6 +211,27 @@ print('musetalk: took the mmpose-free path (%d rewritten, %d already done)' % (a
 """
 
 
+#: kornia 0.8 collapsed `kornia/utils/` into a single deprecation shim, so the module
+#: `kornia.utils.grid` no longer exists - TokenFlow's util.py imports create_meshgrid from it.
+#: The function moved to `kornia.geometry`, which is where kornia's own shim now re-exports it
+#: from, and where it has lived for years: the import works on old and new kornia alike.
+TOKENFLOW_KORNIA_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'TokenFlow' / 'util.py'
+text = path.read_text(encoding='utf-8')
+old = 'from kornia.utils.grid import create_meshgrid'
+new = 'from kornia.geometry import create_meshgrid'
+if new in text:
+    print('tokenflow: util.py already imports create_meshgrid from kornia.geometry')
+elif old in text:
+    path.write_text(text.replace(old, new), encoding='utf-8')
+    print('tokenflow: moved the create_meshgrid import to kornia.geometry')
+else:
+    raise SystemExit('tokenflow: util.py has no recognisable create_meshgrid import; '
+                     'upstream changed and this patch needs revisiting')
+"""
+
+
 #: STTN's test.py opens `torch.device("cuda:1")` - hard-coded, not from a flag. Workers run with
 #: CUDA_VISIBLE_DEVICES pinned to one card, so the only ordinal that exists is 0 and every job
 #: dies with "invalid device ordinal" whichever GPU it was scheduled on.
@@ -528,6 +549,7 @@ ENVS: Dict[str, EnvSpec] = {
                       "kornia",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
+        post_install=(("-c", TOKENFLOW_KORNIA_PATCH),),
     ),
 
     # --- LatentSync 1.6: audio-conditioned latent diffusion lip-sync ---------------------
@@ -710,11 +732,13 @@ ENVS: Dict[str, EnvSpec] = {
                       "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
                       "insightface==2.0", "easydict", "ftfy", "tqdm",
-                      # mediapipe 1.0 ships only `modules` and `tasks`: the legacy
-                      # Solutions API that express_adaption/media_pipe imports is gone
+                      # `mediapipe<1` was not enough: 0.10.35 already ships only `modules`
+                      # and `tasks`, with neither the Solutions API mp_utils.py imports nor
+                      # the framework.formats draw_util.py needs. 0.10.21 is the newest
+                      # release whose cp312 wheel still carries both.
                       # get_video_npy.py imports IPython.display; the vendored wan utils
                       # read video with decord
-                      "mediapipe<1", "dashscope", "ipython", "decord"),
+                      "mediapipe==0.10.21", "dashscope", "ipython", "decord"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
