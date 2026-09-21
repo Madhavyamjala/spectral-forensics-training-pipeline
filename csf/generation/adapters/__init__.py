@@ -145,6 +145,70 @@ else:
 WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
 
 
+#: MuseTalk's preprocessing.py loads DWPose through mmpose, and mmpose needs mmcv 2.x
+#: *with* compiled CUDA ops - an nvcc build measured in hours, on nodes whose inductor
+#: cannot even link libcuda. It uses that pose model for one thing: 133 wholebody
+#: keypoints, of which it keeps the 68 face landmarks, to raise the top edge of each crop
+#: from the detector's box to a line level with the nose.
+#:
+#: The box itself comes from the S3FD detector MuseTalk vendors, which needs no mmpose -
+#: and upstream already falls back to that raw box whenever the landmark-derived one comes
+#: out degenerate. This takes that supported path for every frame. The crop is then the
+#: detector's box rather than a landmark-refined one, so the framing sits a little higher
+#: than upstream's default; MuseTalk exposes bbox_shift precisely to trim that, and the
+#: mouth region the model conditions on is well inside either box.
+MUSETALK_DWPOSE_PATCH = r"""
+import os, pathlib
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'MuseTalk' / 'musetalk' /
+        'utils' / 'preprocessing.py')
+text = path.read_text(encoding='utf-8')
+swaps = [
+    ("from mmpose.apis import inference_topdown, init_model",
+     "inference_topdown = init_model = None  # csf: mmpose needs compiled mmcv ops"),
+    ("from mmpose.structures import merge_data_samples",
+     "merge_data_samples = None  # csf: see above"),
+    ("model = init_model(config_file, checkpoint_file, device=device)",
+     "model = None  # csf: the S3FD detector below supplies the bounding boxes"),
+    # the pose model is still *called* at the top of each batch loop, in both functions that
+    # use it - patching the import alone leaves inference_topdown(None, ...) to raise
+    ("        results = inference_topdown(model, np.asarray(fb)[0])\n"
+     "        results = merge_data_samples(results)\n"
+     "        keypoints = results.pred_instances.keypoints\n"
+     "        face_land_mark= keypoints[0][23:91]\n"
+     "        face_land_mark = face_land_mark.astype(np.int32)\n",
+     "        face_land_mark = None  # csf: no pose model; the detector box is used below\n"),
+    # take upstream's own fallback - the detector's own box - for every frame
+    ("            if f is None: # no face in the image\n"
+     "                coords_list += [coord_placeholder]\n"
+     "                continue",
+     "            if f is None: # no face in the image\n"
+     "                coords_list += [coord_placeholder]\n"
+     "                continue\n"
+     "            coords_list += [f]  # csf: detector box, upstream's own fallback\n"
+     "            continue"),
+    # with no landmarks those ranges stay empty, and upstream's summary divides by their length
+    ("sum(average_range_minus) / len(average_range_minus)",
+     "sum(average_range_minus) / max(1, len(average_range_minus))"),
+    ("sum(average_range_plus) / len(average_range_plus)",
+     "sum(average_range_plus) / max(1, len(average_range_plus))"),
+]
+applied, already = 0, 0
+for old, new in swaps:
+    # the replacement is tested first: one of these rewrites keeps the original lines and adds
+    # to them, so `old in text` stays true afterwards and a second build would append again
+    if new in text:
+        already += 1
+    elif old in text:
+        text = text.replace(old, new)
+        applied += 1
+    else:
+        raise SystemExit('musetalk: preprocessing.py has no %r - upstream changed and this '
+                         'patch needs revisiting' % old[:60])
+path.write_text(text, encoding='utf-8')
+print('musetalk: took the mmpose-free path (%d rewritten, %d already done)' % (applied, already))
+"""
+
+
 #: STTN's test.py opens `torch.device("cuda:1")` - hard-coded, not from a flag. Workers run with
 #: CUDA_VISIBLE_DEVICES pinned to one card, so the only ordinal that exists is 0 and every job
 #: dies with "invalid device ordinal" whichever GPU it was scheduled on.
@@ -336,6 +400,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- ProPainter: flow-guided video inpainting ---------------------------------------
     "propainter": EnvSpec(
         name="propainter",
+        entry_points=(
+                       "repos/ProPainter/inference_propainter.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
                       "av", "einops", "timm", "tqdm", "matplotlib", "scikit-image",
@@ -356,6 +423,11 @@ ENVS: Dict[str, EnvSpec] = {
     # --- E2FGVI / STTN / FuseFormer: transformer video inpainting -----------------------
     "videoinpaint": EnvSpec(
         name="videoinpaint",
+        entry_points=(
+                       "repos/E2FGVI/test.py",
+                       "repos/STTN/test.py",
+                       "repos/FuseFormer/test.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
                       "av", "einops", "tqdm", "scikit-image",
@@ -391,6 +463,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- Wav2Lip ------------------------------------------------------------------------
     "wav2lip": EnvSpec(
         name="wav2lip",
+        entry_points=(
+                       "repos/Wav2Lip/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "numba",
                       "imageio[ffmpeg]", "tqdm", "scipy"),
@@ -408,6 +483,10 @@ ENVS: Dict[str, EnvSpec] = {
     # --- First Order Motion Model (reenactment) ------------------------------------------
     "fomm": EnvSpec(
         name="fomm",
+        entry_points=(
+                       "repos/fomm/modules/generator.py",
+                       "repos/fomm/modules/keypoint_detector.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
                       "pyyaml", "tqdm", "scipy", "cffi", "matplotlib"),
@@ -423,6 +502,10 @@ ENVS: Dict[str, EnvSpec] = {
     # --- TokenFlow / InsV2V: diffusion video editing -------------------------------------
     "tokenflow": EnvSpec(
         name="tokenflow",
+        entry_points=(
+                       "repos/TokenFlow/preprocess.py",
+                       "repos/TokenFlow/run_tokenflow_pnp.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
@@ -436,6 +519,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- LatentSync 1.6: audio-conditioned latent diffusion lip-sync ---------------------
     "latentsync": EnvSpec(
         name="latentsync",
+        entry_points=(
+                       "repos/LatentSync/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.32,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
@@ -455,11 +541,15 @@ ENVS: Dict[str, EnvSpec] = {
     # --- MuseTalk 1.5: latent-space audio-conditioned inpainting -------------------------
     "musetalk": EnvSpec(
         name="musetalk",
+        entry_points=(
+                       "repos/MuseTalk/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.30,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "opencv-python-headless", "numpy<2", "librosa==0.10.2",
                       "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
         repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
+        post_install=(("-c", MUSETALK_DWPOSE_PATCH),),
         weights=(
             WeightFile(dest="repos/MuseTalk/models/musetalkV15/unet.pth",
                        hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/unet.pth"),
@@ -476,12 +566,16 @@ ENVS: Dict[str, EnvSpec] = {
                        hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.pth"),
         ),
         note="MIT, commercial use allowed. face-parse-bisent is Drive-hosted upstream; the "
-             "worker degrades to MuseTalk's own bbox path when it is absent.",
+             "worker degrades to MuseTalk's own bbox path when it is absent. DWPose is "
+             "patched out - MUSETALK_DWPOSE_PATCH says what that costs.",
     ),
 
     # --- SadTalker: audio -> 3DMM coefficients -> neural rendering -----------------------
     "sadtalker": EnvSpec(
         name="sadtalker",
+        entry_points=(
+                       "repos/SadTalker/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]",
                       "scipy", "yacs", "pydub", "kornia", "face-alignment", "safetensors",
@@ -506,6 +600,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- LivePortrait: implicit-keypoint animation + stitching/retargeting ---------------
     "liveportrait": EnvSpec(
         name="liveportrait",
+        entry_points=(
+                       "repos/LivePortrait/inference.py",
+        ),
         torch=TORCH_CU121,
         # LivePortrait vendors its own copy of insightface under src/utils/dependencies,
         # and that copy's arcface_onnx.py imports `onnx` itself - onnxruntime is a different
@@ -525,6 +622,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- VACE (Wan2.1): all-in-one masked video editing ---------------------------------
     "vace": EnvSpec(
         name="vace",
+        entry_points=(
+                       "repos/VACE/vace/vace_wan_inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
                       "safetensors",
@@ -551,6 +651,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- DiffuEraser: diffusion video object removal --------------------------------------
     "diffueraser": EnvSpec(
         name="diffueraser",
+        entry_points=(
+                       "repos/DiffuEraser/run_diffueraser.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
@@ -569,6 +672,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- DreamID-V: DiT video face swapping ----------------------------------------------
     "dreamid": EnvSpec(
         name="dreamid",
+        entry_points=(
+                       "repos/DreamID-V/generate_dreamidv.py",
+        ),
         torch=TORCH_CU121,
         # generate_dreamidv.py is the MediaPipe entry point (the alternative, _faster, wants
         # DWPose ONNX models placed by hand), and it reaches mediapipe through the repo's own
@@ -599,6 +705,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- REFace: diffusion face swapping --------------------------------------------------
     "reface": EnvSpec(
         name="reface",
+        entry_points=(
+                       "repos/REFace/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "safetensors",
@@ -619,6 +728,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- Thin-Plate-Spline Motion Model: reenactment ---------------------------------------
     "tpsmm": EnvSpec(
         name="tpsmm",
+        entry_points=(
+                       "repos/TPSMM/demo.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
                       "pyyaml", "scipy", "matplotlib", "tqdm",
@@ -649,7 +761,10 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/neuralchen/SimSwap.git", name="SimSwap"),),
         note="Weights (arcface + 512 checkpoint) are hosted on Google Drive / OneDrive upstream."),
     "stylegan": EnvSpec(
-        name="stylegan", torch=TORCH_CU121,
+        name="stylegan",
+        entry_points=(
+                       "repos/StyleGANEX/video_editing.py",
+        ), torch=TORCH_CU121,
         # `dlib` builds through cmake against Python.h. dlib-bin is the same library shipped
         # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
         # it installs `dlib` under the same import name.

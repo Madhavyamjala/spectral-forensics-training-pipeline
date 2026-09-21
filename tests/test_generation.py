@@ -17,6 +17,7 @@ import inspect
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -1653,6 +1654,158 @@ def test_second_round_dependencies() -> None:
     check("nothing is left behind in the shared clone", "in_repo.unlink()" in vi)
 
 
+def test_import_scanner() -> None:
+    """The scanner must find every missing import at once, not the first one."""
+    print("import scanner")
+    import tempfile
+
+    from csf.generation.importscan import format_report, scan
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        (repo / "pkg" / "sub").mkdir(parents=True)
+        (repo / "entry.py").write_text(
+            "import os, absent_top_level\n"
+            "from pkg.helper import thing\n"
+            "from mmcv.runner import load_checkpoint\n"
+            "try:\n    import flash_attn\nexcept ImportError:\n    flash_attn = None\n")
+        (repo / "pkg" / "__init__.py").write_text("from .helper import thing\n")
+        (repo / "pkg" / "helper.py").write_text(
+            "import json\nfrom .sub import deep\nimport absent_in_a_helper\n")
+        (repo / "pkg" / "sub" / "__init__.py").write_text("")
+        (repo / "pkg" / "sub" / "deep.py").write_text("import ast\nimport absent_three_deep\n")
+        # a script beside its own package, the way VACE runs vace/vace_wan_inference.py
+        (repo / "nested").mkdir()
+        (repo / "nested" / "run.py").write_text("from sibling import helper\n")
+        (repo / "nested" / "sibling.py").write_text("import absent_beside_the_script\n")
+
+        report = scan(Path(sys.executable), [repo],
+                      [repo / "entry.py", repo / "nested" / "run.py"])
+        missing = {row["module"] for row in report["missing"]}
+
+        check("a missing import in the entry point is found", "absent_top_level" in missing)
+        check("and one three local modules deep", "absent_three_deep" in missing,
+              "following local imports is the whole point")
+        check("and one beside a script run from a subdirectory",
+              "absent_beside_the_script" in missing)
+        check("all of them in a single pass", len(missing) >= 4, str(sorted(missing)))
+        check("a submodule is reported as the submodule", "mmcv.runner" in missing,
+              "mmcv 2.x has mmcv but not mmcv.runner - reporting 'mmcv' would hide that")
+        check("an import guarded by except ImportError is not called missing",
+              "flash_attn" not in missing)
+        check("but it is still reported, separately",
+              "flash_attn" in {r["module"] for r in report["optional_missing"]})
+        check("stdlib imports are not reported", not {"os", "json", "ast"} & missing)
+        check("each finding says which file imports it",
+              all(r.get("imported_by") for r in report["missing"]))
+
+        lines = format_report("fake", report, repo)
+        check("the report names the env and the count", "fake" in lines[0])
+        check("and is relative to the env root", not any(str(repo) in ln for ln in lines[1:]))
+
+    broken = scan(Path("/definitely/not/an/interpreter"), [], [])
+    check("an unusable interpreter is reported, not raised", broken.get("error"))
+
+
+def test_entry_points_declared() -> None:
+    """Every env with a repo must say which file its worker runs."""
+    print("entry points")
+    envs = env_specs()
+    for name, spec in sorted(envs.items()):
+        if not spec.repos:
+            continue
+        if name == "vid2vid":                       # no implemented adapter drives it
+            continue
+        check(f"env '{name}' declares an entry point", spec.entry_points, "--scan cannot see it")
+        for entry in spec.entry_points:
+            check(f"  {name}: {entry} is under a cloned repo", entry.startswith("repos/"))
+
+    # entry points describe where to look, not what to install
+    before = envs["vace"].digest()
+    spec = envs["vace"]
+    object.__setattr__(spec, "entry_points", tuple(spec.entry_points) + ("repos/VACE/other.py",))
+    check("naming a new entry point does not rebuild the env", spec.digest() == before)
+
+
+def test_musetalk_dwpose_patch() -> None:
+    """MuseTalk must run without mmpose, and the patch must survive a second build."""
+    print("musetalk dwpose patch")
+    import tempfile
+
+    from csf.generation.adapters import MUSETALK_DWPOSE_PATCH
+
+    # the lines the patch targets, exactly as upstream writes them
+    upstream = (
+        "import numpy as np\n"
+        "from mmpose.apis import inference_topdown, init_model\n"
+        "from mmpose.structures import merge_data_samples\n"
+        "device = 'cuda'\n"
+        "model = init_model(config_file, checkpoint_file, device=device)\n"
+        "coord_placeholder = (0.0,0.0,0.0,0.0)\n"
+        "def get_landmark_and_bbox(img_list):\n"
+        "    for fb in batches:\n"
+        "        results = inference_topdown(model, np.asarray(fb)[0])\n"
+        "        results = merge_data_samples(results)\n"
+        "        keypoints = results.pred_instances.keypoints\n"
+        "        face_land_mark= keypoints[0][23:91]\n"
+        "        face_land_mark = face_land_mark.astype(np.int32)\n"
+        "        bbox = fa.get_detections_for_batch(np.asarray(fb))\n"
+        "        for j, f in enumerate(bbox):\n"
+        "            if f is None: # no face in the image\n"
+        "                coords_list += [coord_placeholder]\n"
+        "                continue\n"
+        "            half_face_coord = face_land_mark[29]\n"
+        "    print(f\"{int(sum(average_range_minus) / len(average_range_minus))}\")\n"
+        "    print(f\"{int(sum(average_range_plus) / len(average_range_plus))}\")\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "repos" / "MuseTalk" / "musetalk" / "utils"
+        target.mkdir(parents=True)
+        pre = target / "preprocessing.py"
+        pre.write_text(upstream)
+
+        env = dict(os.environ, CSF_ENV_ROOT=tmp)
+        proc = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                              capture_output=True, text=True, env=env)
+        check("the patch runs", proc.returncode == 0, proc.stderr[-300:])
+        patched = pre.read_text()
+        check("the patched file is valid python", _parses(patched))
+        check("no pose model is called any more",
+              "inference_topdown(model" not in patched and "merge_data_samples(" not in patched,
+              "patching the import alone leaves inference_topdown(None, ...) to raise")
+        check("the detector's own box is used instead", "coords_list += [f]" in patched)
+        check("the empty-range summary cannot divide by zero",
+              patched.count("max(1, len(average_range") == 2)
+
+        again = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                               capture_output=True, text=True, env=again_env(env))
+        check("a second build changes nothing", again.returncode == 0 and
+              pre.read_text() == patched,
+              "one rewrite keeps the original lines, so `old in text` stays true")
+        check("and says so", "0 rewritten" in again.stdout)
+
+        pre.write_text("import numpy as np\n")       # upstream moved on
+        moved = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                               capture_output=True, text=True, env=env)
+        check("a file it no longer recognises fails loudly", moved.returncode != 0)
+        check("naming what it could not find", "needs revisiting" in moved.stdout + moved.stderr)
+
+
+def again_env(env):
+    """The same environment; a helper so the second run reads identically."""
+    return env
+
+
+def _parses(source: str) -> bool:
+    """Whether a source string compiles."""
+    import ast as _ast
+    try:
+        _ast.parse(source)
+        return True
+    except SyntaxError:
+        return False
+
+
 def test_third_round_dependencies() -> None:
     """What the first full sweep found once the quota stopped masking everything."""
     print("third-round dependencies")
@@ -1917,6 +2070,8 @@ def main() -> int:
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
                test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
+               test_import_scanner, test_entry_points_declared,
+               test_musetalk_dwpose_patch,
                test_third_round_dependencies, test_fomm_source_frame,
                test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
                test_env_selection_typos, test_smoke_output_location,

@@ -104,6 +104,12 @@ class EnvSpec:
     #: so a half-installed env fails at build time (where the error names the env and can be
     #: retried) instead of at job time as a bare ModuleNotFoundError from 200 workers.
     verify_imports: Sequence[str] = ()
+    #: The upstream files a worker actually executes, relative to the env root. Their import
+    #: graphs are what `--scan` walks, so a missing dependency is found by reading the repo
+    #: rather than by rendering a video and waiting for the first ImportError. Deliberately
+    #: NOT part of `digest()`: naming an entry point changes nothing about what is installed,
+    #: and no env should rebuild because we pointed the scanner somewhere new.
+    entry_points: Sequence[str] = ()
     note: str = ""
 
     def needs_hub(self) -> bool:
@@ -163,6 +169,20 @@ class ReadyEnv:
     root: Path
     python: Path
     repos: Dict[str, Path]
+
+    def scan_imports(self) -> Dict[str, object]:
+        """Report every module this env's entry points import but cannot import."""
+        from csf.generation.importscan import scan
+
+        entries = [self.root / e for e in self.spec.entry_points]
+        present = [e for e in entries if e.is_file()]
+        if not present:
+            return {"missing": [], "optional_missing": [], "unparsed": [], "external": 0,
+                    "files_scanned": 0,
+                    "skipped": "no entry points declared" if not entries
+                               else f"entry point(s) not present: "
+                                    f"{[str(e) for e in entries if not e.is_file()]}"}
+        return scan(self.python, list(self.repos.values()), present)
 
     def environ(self) -> Dict[str, str]:
         """Environment variables for commands run inside this env, isolated from the driver's.
@@ -808,6 +828,9 @@ def _main() -> int:
     ap.add_argument("--staged-weights-dir", default="./model_paths",
                     help="folder holding checkpoints that cannot be downloaded unattended")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--scan", default="", metavar="NAME",
+                    help="env or adapter name, or 'all': read the import graph of each "
+                         "upstream entry point and report every module it cannot import")
     ap.add_argument("--doctor", default="", help="env or adapter name, or 'all': check what is "
                                                  "actually installed in each built env")
     ap.add_argument("--burn", default="", help="env or adapter name, or 'all': delete the built "
@@ -896,6 +919,31 @@ def _main() -> int:
                 print(f"         fix: python -m csf.generation.envs --build {name} --force "
                       f"--envs-root {root}")
         return 1 if bad else 0
+
+    if args.scan:
+        try:
+            wanted = _select(args.scan)
+        except ValueError as exc:
+            print(f"Nothing was scanned: {exc}")
+            return 2
+        from csf.generation.importscan import format_report
+        total = 0
+        for spec in wanted:
+            env_root = root / spec.name
+            py = _venv_python(env_root / "venv")
+            if not py.exists():
+                print(f"{spec.name:<16} not built - nothing to scan")
+                continue
+            ready = ReadyEnv(spec, env_root, py,
+                             {r.folder: env_root / "repos" / r.folder for r in spec.repos})
+            report = ready.scan_imports()
+            if report.get("skipped"):
+                print(f"{spec.name:<16} skipped: {report['skipped']}")
+                continue
+            total += len(report.get("missing") or [])
+            print("\n".join(format_report(spec.name, report, env_root)))
+        print(f"\n{total} missing module(s) across {len(wanted)} environment(s)")
+        return 1 if total else 0
 
     if args.status or not args.build:
         status = env_status(_select("all"), root)
