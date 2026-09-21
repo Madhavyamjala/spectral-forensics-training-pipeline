@@ -1610,8 +1610,9 @@ def test_second_round_dependencies() -> None:
 
     reqs = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
                          for r in envs[name].pip_requirements()]
-    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv" in reqs("videoinpaint"))
-    check("it is a build that needs no nvcc", "mmcv-full" not in reqs("videoinpaint"),
+    vi_hooks_all = "".join(" ".join(c) for c in envs["videoinpaint"].post_install)
+    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv==" in vi_hooks_all)
+    check("it is a build that needs no nvcc", "mmcv-full" not in vi_hooks_all,
           "which version is the ops-free one is checked in test_third_round_dependencies")
     check("stylegan installs scikit-image for the vendored lpips",
           "scikit-image" in reqs("stylegan"))
@@ -1870,12 +1871,25 @@ def test_third_round_dependencies() -> None:
         check(f"env '{env_name}' installs {dist}", dist in names(env_name), str(names(env_name)))
 
     # mmcv 2.0 deleted mmcv.runner, which E2FGVI imports; in the 1.x line the distribution
-    # called `mmcv` is the one without compiled ops
-    vi = reqs("videoinpaint")
+    # called `mmcv` is the one without compiled ops. It is installed by a hook because its
+    # setup.py imports pkg_resources, which pip's isolated build env no longer provides.
+    hooks = [" ".join(c) for c in envs["videoinpaint"].post_install]
+    joined = " ".join(hooks)
     check("videoinpaint takes mmcv 1.x, which still has mmcv.runner",
-          any(r == "mmcv==1.7.2" for r in vi), str(vi))
-    check("and not the 2.x lite build that only has mmcv.cnn",
-          not any("mmcv-lite" in r for r in vi))
+          "mmcv==1.7.2" in joined, joined[:200])
+    check("and not the 2.x lite build that only has mmcv.cnn", "mmcv-lite" not in joined)
+    check("it builds without isolation, against this env's setuptools",
+          "--no-build-isolation" in joined)
+    check("and that setuptools still ships pkg_resources", "setuptools<81" in joined)
+    check("the pin is installed before the build that needs it",
+          joined.index("setuptools<81") < joined.index("--no-build-isolation"))
+    check("and the headless OpenCV is restored after mmcv drags the full one in",
+          joined.index("mmcv==1.7.2") < joined.index("opencv-python-headless"))
+
+    envs_src = (ROOT / "csf/generation/envs.py").read_text()
+    check("a hook that pip-installs honours the same pins as the requirements step",
+          'hook_env["PIP_CONSTRAINT"]' in envs_src,
+          "mmcv pulls numpy 2 into an env built entirely against numpy<2 otherwise")
 
     # mediapipe 1.0 ships `modules` and `tasks` only - the Solutions API is gone
     check("dreamid pins mediapipe below the release that dropped Solutions",

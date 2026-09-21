@@ -145,6 +145,8 @@ else:
 WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
 
 
+
+
 #: MuseTalk's preprocessing.py loads DWPose through mmpose, and mmpose needs mmcv 2.x
 #: *with* compiled CUDA ops - an nvcc build measured in hours, on nodes whose inductor
 #: cannot even link libcuda. It uses that pose model for one thing: 133 wholebody
@@ -342,6 +344,22 @@ def pip_install(*args: str) -> tuple:
     return ("-m", "pip", "install", *args)
 
 
+#: E2FGVI's flow_comp.py wants both `mmcv.cnn.ConvModule` and `mmcv.runner.load_checkpoint`,
+#: and mmcv 2.0 deleted mmcv.runner - so the 1.x line is the one that works. In 1.x the
+#: distribution named `mmcv` is the ops-free build (MMCV_WITH_OPS defaults to 0; `mmcv-full`
+#: is the one that compiles), so it needs no nvcc.
+#:
+#: It does need its own build, though, and mmcv 1.7.2's setup.py opens with `import
+#: pkg_resources`, which setuptools 81 removed - so pip's isolated build environment, which
+#: always takes the newest setuptools, cannot run it. Installing without isolation lets the
+#: build use this env's own setuptools, pinned below that removal. Both steps run as hooks
+#: because the requirements step always builds in isolation.
+MMCV_1X_INSTALL = (
+    pip_install("setuptools<81", "wheel"),
+    pip_install("--no-build-isolation", "mmcv==1.7.2"),
+)
+
+
 def hub_snapshot(repo_id: str, *dest: str) -> tuple:
     """A post-install step that downloads a Hub repo into `<env root>/<dest...>`.
 
@@ -433,12 +451,9 @@ ENVS: Dict[str, EnvSpec] = {
                       "av", "einops", "tqdm", "scikit-image",
                       # all three test.py entry points import matplotlib for their colour maps
                       "matplotlib",
-                      # E2FGVI's flow_comp.py wants both mmcv.cnn.ConvModule and
-                      # mmcv.runner.load_checkpoint, and mmcv 2.0 deleted mmcv.runner - so the
-                      # 1.x line is the one that works. In 1.x the distribution named `mmcv` is
-                      # the ops-free build (MMCV_WITH_OPS defaults to 0, and `mmcv-full` is the
-                      # one that compiles), so this needs no nvcc either.
-                      "mmcv==1.7.2"),
+                      # mmcv is installed by a post-install hook, not from here - see
+                      # MMCV_1X_INSTALL
+                      ),
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
@@ -453,9 +468,8 @@ ENVS: Dict[str, EnvSpec] = {
                        staged_name="fuseformer.pth",
                        where="https://github.com/ruiliu-ai/FuseFormer (Drive link in README)"),
         ),
-        # mmcv-lite depends on opencv-python (and so does mmengine underneath it), which
-        # would replace the headless build this env installs - so put it back afterwards.
-        post_install=(opencv_headless_swap(), ("-c", STTN_DEVICE_PATCH)),
+        # mmcv first, then the OpenCV it drags in behind it is swapped back for headless
+        post_install=(*MMCV_1X_INSTALL, opencv_headless_swap(), ("-c", STTN_DEVICE_PATCH)),
         note="All three checkpoints are Drive-hosted upstream, so they are staged by hand into "
              "generation.staged_weights_dir and copied into place by the build.",
     ),

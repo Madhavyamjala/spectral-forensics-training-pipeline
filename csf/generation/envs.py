@@ -674,6 +674,10 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
     # the venv's bin dir first so any console script resolves to this env's copy.
     if spec.post_install:
         hook_env = ReadyEnv(spec, root, py, repos).environ()
+        # hooks that pip-install must honour the same pins as the requirements step, or one
+        # of them quietly pulls numpy 2 into an env built entirely against numpy<2
+        if constraints:
+            hook_env["PIP_CONSTRAINT"] = str(constraints)
         for cmd in spec.post_install:
             _run([py, *cmd], cwd=root, env=hook_env,
                  what=announce("running the post-install hook (may download weights)"),
