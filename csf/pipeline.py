@@ -27,6 +27,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
+from csf import LABELS
 from csf.config import Config
 from csf.data.datasets import CachedVideoDataset, LlamaCollator, QwenCollator
 from csf.distributed import DistInfo, all_gather_objects
@@ -37,6 +38,34 @@ from csf.train.classifier_trainer import _move, run_inference
 
 log = get_logger("pipeline")
 VISION_ONLY_KEYS = ("pixel_values", "aspect_ratio_ids", "aspect_ratio_mask")
+
+
+def _active_probs_from_logits(logits: torch.Tensor, active_ids: List[int]) -> torch.Tensor:
+    """Softmax only across trained classes, then scatter probabilities into canonical label slots.
+
+    Note:
+        Two-class runs keep a canonical three-slot head so downstream artefacts remain shape-stable,
+        but the excluded class must not participate in the softmax because its head row was not trained.
+
+    TODO:
+        Remove the compatibility path once all published bundles carry an explicit head schema.
+    """
+    active = list(active_ids)
+    if not active:
+        raise ValueError("active_ids must contain at least one class")
+    if logits.shape[-1] == len(active):
+        active_probs = torch.softmax(logits.float(), dim=-1)
+    elif logits.shape[-1] == len(LABELS):
+        idx = torch.as_tensor(active, device=logits.device, dtype=torch.long)
+        active_probs = torch.softmax(logits.float()[:, idx], dim=-1)
+    else:
+        raise ValueError(
+            f"Unexpected classifier head width {logits.shape[-1]}; expected {len(active)} or {len(LABELS)}."
+        )
+    out = torch.zeros((logits.shape[0], len(LABELS)), device=logits.device, dtype=torch.float32)
+    idx = torch.as_tensor(active, device=logits.device, dtype=torch.long)
+    out[:, idx] = active_probs
+    return out
 
 
 def save_npz(path: Path, data: Dict[str, Any]) -> None:
@@ -72,7 +101,7 @@ def predict_scanner(cfg: Config, dist_info: DistInfo, index: pd.DataFrame, stats
     loader = DataLoader(ds, batch_size=cfg.train.qwen.eval_batch_size, sampler=sampler, shuffle=False,
                         num_workers=cfg.train.num_workers, collate_fn=QwenCollator(processor))
     log.info("Scanner inference on %s split: %d videos", split, len(sub))
-    res = run_inference(model, loader, device, dtype, dist_info, desc=f"scanner {split}")
+    res = run_inference(model, loader, device, dtype, dist_info, desc=f"scanner {split}",\n                        active_ids=cfg.data.active_label_ids())
     keys = _ordered(sub, res)
     return {"keys": np.array(keys), "labels": np.array([res[k]["label"] for k in keys]),
             "methods": sub["method"].astype(str).to_numpy(), "probs": np.stack([res[k]["probs"] for k in keys]),
@@ -83,12 +112,14 @@ def predict_scanner(cfg: Config, dist_info: DistInfo, index: pd.DataFrame, stats
 class ArbiterRunner:
     """Llama-3.2-Vision classifier with optional reuse of cross-attention (vision) states across prompts."""
 
-    def __init__(self, model: VLMClassifier, processor, cfg: Config, device: torch.device):
+    def __init__(self, model: VLMClassifier, processor, cfg: Config, device: torch.device,
+                 active_ids: List[int] | None = None):
         self.model = model
         self.processor = processor
         self.cfg = cfg
         self.device = device
         self.dtype = compute_dtype_for(device)
+        self.active_ids = list(active_ids if active_ids is not None else range(len(LABELS)))
         self.hidden = model.backbone.get_base_model().config.text_config.hidden_size \
             if hasattr(model.backbone.get_base_model().config, "text_config") else None
         self._vision_out = None
@@ -116,7 +147,7 @@ class ArbiterRunner:
         t0 = time.perf_counter()
         with torch.no_grad(), torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == "cuda"):
             logits, pooled = self.model(**{k: v for k, v in batch.items() if k not in NON_MODEL_KEYS})
-        probs = torch.softmax(logits.float(), -1)
+        probs = _active_probs_from_logits(logits, self.active_ids)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         return probs.cpu().numpy(), pooled, (time.perf_counter() - t0) / probs.shape[0]
@@ -152,7 +183,7 @@ def build_outcomes(cfg: Config, dist_info: DistInfo, index: pd.DataFrame, stats,
     from tqdm import tqdm
     device = dist_info.device
     model, processor, _ = model_bundle or load_classifier(llama_ckpt, device, attn_implementation=cfg.models.attn_implementation)
-    runner = ArbiterRunner(model, processor, cfg, device)
+    runner = ArbiterRunner(model, processor, cfg, device, active_ids=cfg.data.active_label_ids())
     bs = cfg.train.llama.eval_batch_size
     none_mask = np.zeros(3, bool)
     all_mask = np.ones(3, bool)
