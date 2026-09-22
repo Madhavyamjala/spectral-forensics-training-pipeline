@@ -81,7 +81,7 @@ def classification_report_dict(y: np.ndarray, probs: np.ndarray, latency_s: Opti
         "cohen_kappa": float(cohen_kappa_score(y, pred)),
         "roc_auc_ovr_macro": _safe(roc_auc_score, onehot, probs, average="macro", multi_class="ovr"),
         "pr_auc_macro": _safe(average_precision_score, onehot, probs, average="macro"),
-        "log_loss": float(log_loss(y, probs, labels=labels)),
+        "log_loss": _safe(log_loss, y, probs, labels=labels),
         "brier": float(np.mean([brier_score_loss(onehot[:, k], probs[:, k]) for k in labels])),
         "ece": expected_calibration_error(y, probs, ece_bins),
         "per_class": {LABELS[k]: {"precision": float(p[k]), "recall": float(r[k]), "f1": float(f[k]),
