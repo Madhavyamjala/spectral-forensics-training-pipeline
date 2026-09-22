@@ -45,10 +45,11 @@ def _level(z: float) -> str:
     return "typical"
 
 
-def build_evidence_graph(z: np.ndarray, mask: np.ndarray) -> nx.DiGraph:
+def build_evidence_graph(z: np.ndarray, mask: np.ndarray, candidate_labels: Optional[List[str]] = None) -> nx.DiGraph:
     g = nx.DiGraph()
     g.add_node("video", kind="root")
-    g.add_node("class_hypothesis", kind="latent_cause", candidates=["Real", "AI-Generated", "AI-Edited"])
+    candidates = list(candidate_labels) if candidate_labels is not None else ["Real", "AI-Generated", "AI-Edited"]
+    g.add_node("class_hypothesis", kind="latent_cause", candidates=candidates)
     g.add_edge("video", "class_hypothesis")
     mechanisms = {"global_synthesis": GLOBAL_SYNTHESIS_EVIDENCE, "local_edit": LOCAL_EDIT_EVIDENCE,
                   "temporal_incoherence": TEMPORAL_EVIDENCE}
