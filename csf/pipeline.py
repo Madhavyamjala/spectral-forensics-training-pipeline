@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
-from csf import LABELS
+from csf import LABELS, PRETTY_LABELS
 from csf.config import Config
 from csf.data.datasets import CachedVideoDataset, LlamaCollator, QwenCollator
 from csf.distributed import DistInfo, all_gather_objects
@@ -99,7 +99,7 @@ def predict_scanner(cfg: Config, dist_info: DistInfo, index: pd.DataFrame, stats
     ds = CachedVideoDataset(sub, cfg.cache_dir, stats)
     sampler = DistributedSampler(ds, dist_info.world_size, dist_info.rank, shuffle=False) if dist_info.distributed else None
     loader = DataLoader(ds, batch_size=cfg.train.qwen.eval_batch_size, sampler=sampler, shuffle=False,
-                        num_workers=cfg.train.num_workers, collate_fn=QwenCollator(processor))
+                        num_workers=cfg.train.num_workers, collate_fn=QwenCollator(processor, [PRETTY_LABELS[LABELS[i]] for i in cfg.data.active_label_ids()]))
     log.info("Scanner inference on %s split: %d videos", split, len(sub))
     res = run_inference(model, loader, device, dtype, dist_info, desc=f"scanner {split}",
                         active_ids=cfg.data.active_label_ids())
@@ -121,6 +121,7 @@ class ArbiterRunner:
         self.device = device
         self.dtype = compute_dtype_for(device)
         self.active_ids = list(active_ids if active_ids is not None else range(len(LABELS)))
+        self.class_names = [PRETTY_LABELS[LABELS[i]] for i in self.active_ids]
         self.hidden = model.backbone.get_base_model().config.text_config.hidden_size \
             if hasattr(model.backbone.get_base_model().config, "text_config") else None
         self._vision_out = None
@@ -140,7 +141,7 @@ class ArbiterRunner:
 
     def collator(self, mask=None) -> LlamaCollator:
         return LlamaCollator(self.processor, self.cfg.data.mosaic_frames, self.cfg.data.mosaic_size,
-                             tool_dropout=0.0, force_mask=mask)
+                             tool_dropout=0.0, force_mask=mask, class_names=self.class_names)
 
     def _forward(self, batch: Dict[str, Any]):
         if self.device.type == "cuda":
