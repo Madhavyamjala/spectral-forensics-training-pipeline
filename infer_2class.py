@@ -17,7 +17,6 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from csf import LABEL2ID
 from csf.inference import CSFDetector
 
 
@@ -70,9 +69,6 @@ def main() -> int:
 
     for video in videos:
         result = det.predict(str(video), mode=args.mode, profile=args.profile)
-        predicted_id = max(LABEL2ID, key=lambda k: result["probs"].get({
-            "real": "Real", "ai_generated": "AI-Generated", "ai_edited": "AI-Edited"
-        }[k], -1.0))
         label = result["label"]
         confidence = float(result["probs"][label])
         verdict = "REAL" if not result["is_fake"] else "FAKE"
