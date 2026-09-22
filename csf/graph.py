@@ -70,8 +70,20 @@ def build_evidence_graph(z: np.ndarray, mask: np.ndarray, candidate_labels: Opti
     return g
 
 
-def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] = None) -> str:
-    lines = ["Forensic evidence graph (z-scores vs. the training distribution):"]
+def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] = None,
+                  candidate_labels: Optional[List[str]] = None) -> str:
+    """Serialize measured tool evidence for the arbiter prompt.
+
+    Note:
+        The default wording remains tri-class for backwards compatibility; two-class runs pass
+        their active class names explicitly.
+
+    TODO:
+        Store prompt-template version in the export manifest for experiment reproducibility.
+    """
+    candidates = list(candidate_labels) if candidate_labels else ["Real", "AI-Generated", "AI-Edited"]
+    lines = ["Forensic evidence graph (z-scores vs. the training distribution):",
+             "Candidate classes: " + ", ".join(candidates)]
     for gi, group in enumerate(TOOL_GROUPS):
         if not mask[gi]:
             lines.append(f"[{group}] not executed")
@@ -87,6 +99,10 @@ def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] =
             lines.append(f"mechanism {mech} <- " + ", ".join(support))
     if scanner_note:
         lines.append(scanner_note)
-    lines.append("Rule of thumb: low DIRE = fits a generative latent manifold (AI-Generated); "
-                 "authentic global statistics with localized phase/colour spikes = AI-Edited.")
+    if "AI-Edited" in candidates:
+        lines.append("Rule of thumb: low DIRE = fits a generative latent manifold (AI-Generated); "
+                     "authentic global statistics with localized phase/colour spikes = AI-Edited.")
+    else:
+        lines.append("Rule of thumb: lower DIRE can support a generative explanation; "
+                     "interpret the evidence jointly with the class hypotheses above.")
     return "\n".join(lines)
