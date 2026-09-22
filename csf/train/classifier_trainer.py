@@ -131,12 +131,27 @@ def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.
     return merged
 
 
-def _val_metrics(results: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+def _val_metrics(results: Dict[str, Dict[str, Any]], active_ids: Optional[List[int]] = None) -> Dict[str, float]:
+    """Compute validation metrics over the classes trained by this run.
+
+    Note:
+        In a two-class run, the classifier keeps a canonical three-slot output, but validation
+        must exclude the intentionally untrained AI-Edited slot from macro-F1 and validation loss.
+
+    TODO:
+        Replace the canonical-head compatibility path with an explicit bundle head schema.
+    """
     y = np.array([r["label"] for r in results.values()])
     p = np.stack([r["probs"] for r in results.values()])
-    pred = p.argmax(1)
-    loss = float(-np.log(np.clip(p[np.arange(len(y)), y], 1e-9, 1)).mean())
-    return {"val_acc": float(accuracy_score(y, pred)), "val_macro_f1": float(f1_score(y, pred, average="macro")),
+    active = list(active_ids) if active_ids is not None else list(range(p.shape[1]))
+    idx = {label_id: i for i, label_id in enumerate(active)}
+    y_local = np.asarray([idx[int(v)] for v in y], dtype=int)
+    p_active = p[:, active]
+    p_active = p_active / p_active.sum(1, keepdims=True)
+    pred_local = p_active.argmax(1)
+    loss = float(-np.log(np.clip(p_active[np.arange(len(y)), y_local], 1e-9, 1)).mean())
+    return {"val_acc": float(accuracy_score(y_local, pred_local)),
+            "val_macro_f1": float(f1_score(y_local, pred_local, average="macro")),
             "val_loss": loss, "val_n": int(len(y))}
 
 
@@ -233,7 +248,7 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
         res = run_inference(ddp_model.module if dist_info.distributed else ddp_model, val_loader, device, dtype,
                             dist_info, max_batches=tcfg.max_eval_batches, desc=f"val {kind}",
                             active_ids=active_ids)
-        m = _val_metrics(res)
+        m = _val_metrics(res, active_ids)
         m.update(step=step, time=time.time())
         history.append(m)
         improved = m["val_macro_f1"] > best_f1 or force_save
