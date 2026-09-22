@@ -512,6 +512,28 @@ python main.py --config configs/full.yaml --stage push
 Base-model weights are not re-uploaded. The adapters load on top of the original Qwen and Llama repos, which keeps
 the Llama licence gating intact.
 
+## 9.1 Full Real vs AI-Generated run
+
+Use the dedicated two-class config to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
+
+```bash
+bash scripts/run_full_2class.sh
+```
+
+The bundle is written to `runs/full_2class/export/` and records the active class schema in `csf_config.json`. The ablation metrics and macro-F1 are computed over the two active classes rather than averaging in an absent AI-Edited class.
+
+To classify a few videos and keep the full inference result (including the evidence graph whenever tools are executed):
+
+```bash
+python infer_2class.py \
+  --model-dir runs/full_2class/export \
+  --profile balanced \
+  --save-dir runs/full_2class/inference \
+  video1.mp4 video2.mp4 video3.mp4
+```
+
+The command prints **REAL/FAKE**, the model label, confidence, and selected routing action. Each saved JSON contains the probability distribution, latency breakdown, tools executed and `evidence_graph`. An agentic `early_exit` intentionally has no measured tool evidence; use `--mode static` when you require all tool groups and therefore an evidence graph for every video.
+
 ## 9. Using the trained model
 
 ```python
