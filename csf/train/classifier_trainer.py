@@ -168,7 +168,12 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
         log.info("[%s] GPU memory after load: %.2f GiB", kind, torch.cuda.memory_allocated() / 2**30)
 
     train_ds = CachedVideoDataset(index[index["split"] == "train"], cfg.cache_dir, stats)
-    val_ds = CachedVideoDataset(index[index["split"] == "valid"], cfg.cache_dir, stats)
+    # The cache index is grouped by class, and the val loader does not shuffle, so capping validation
+    # with max_eval_batches would score only the first class or two - best-checkpoint selection and
+    # early stopping then track one class. A seeded shuffle keeps the capped subset mixed while every
+    # rank still sees the same order, so DistributedSampler(shuffle=False) shards it consistently.
+    val_ds = CachedVideoDataset(index[index["split"] == "valid"].sample(frac=1.0, random_state=cfg.seed),
+                                cfg.cache_dir, stats)
     train_sampler = DistributedSampler(train_ds, dist_info.world_size, dist_info.rank, shuffle=True, seed=cfg.seed) \
         if dist_info.distributed else None
     val_sampler = DistributedSampler(val_ds, dist_info.world_size, dist_info.rank, shuffle=False) \
