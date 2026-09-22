@@ -51,6 +51,7 @@ class HubAsset:
     used_by: str = ""
     allow_patterns: Optional[Sequence[str]] = None
     note: str = ""
+    check_only: bool = False               # access-checked, never downloaded (content streams later)
 
 
 def training_assets(cfg) -> List[HubAsset]:
@@ -107,9 +108,18 @@ def generation_assets() -> List[HubAsset]:
 
 
 def dataset_assets(cfg) -> List[HubAsset]:
-    out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train",
-                    used_by="real / ai_generated classes", files=("manifest.csv",),
-                    note="manifest only; videos stream during the features stage")]
+    local = Path(cfg.data.manifest)
+    if local.is_file():
+        # Mirrors resolve_manifest: a local manifest is used as-is, and the videos stream during
+        # `features`, so only access to the repo matters. Always requesting the repo's root
+        # manifest.csv - which the dataset does not have - 404'd and aborted every default run.
+        out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train", check_only=True,
+                        used_by="training videos",
+                        note=f"access check only; local manifest {local} is used")]
+    else:
+        out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train",
+                        used_by="training videos", files=(local.name,),
+                        note="manifest only; videos stream during the features stage")]
     hf_repo = getattr(cfg.generation.kinetics, "hf_repo", None)
     if hf_repo:
         out.append(HubAsset(hf_repo, kind="dataset", stage="generate",
@@ -141,6 +151,7 @@ def all_assets(cfg, stage: str = "all") -> List[HubAsset]:
         if prior.stage != a.stage:
             prior.stage = "both"
         prior.gated = prior.gated or a.gated
+        prior.check_only = prior.check_only and a.check_only   # download if either side needs it
         prior.files = tuple(sorted(set(prior.files) | set(a.files)))
         used = [u for u in (prior.used_by, a.used_by) if u]
         prior.used_by = "; ".join(dict.fromkeys(used))
@@ -259,7 +270,7 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
     if dry_run:
         return {"assets": len(assets), "blocked": blocked, "dry_run": True}
 
-    todo = [a for a in assets if a.repo_id not in blocked]
+    todo = [a for a in assets if a.repo_id not in blocked and not a.check_only]
     results, failed, total_gb = [], [], 0.0
     with progress.bar(len(todo), "downloading repos", "repo", log_every=1) as pbar:
         for a in todo:
