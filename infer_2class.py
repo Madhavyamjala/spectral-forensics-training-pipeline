@@ -13,6 +13,7 @@ TODO:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 from pathlib import Path
 from typing import Iterable
@@ -31,7 +32,7 @@ def _expand_videos(inputs: Iterable[str]) -> list[Path]:
         elif p.is_file():
             paths.append(p)
         else:
-            paths.extend(Path(".").glob(value))
+            paths.extend(Path(match) for match in glob.glob(value, recursive=True))
     unique = sorted({p.resolve() for p in paths})
     if not unique:
         raise FileNotFoundError("No video files matched the supplied paths.")
@@ -79,6 +80,11 @@ def main() -> int:
             payload = dict(result)
             out = save_dir / f"{video.stem}.json"
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            graph = result.get("evidence_graph")
+            if graph is not None:
+                (save_dir / f"{video.stem}.evidence_graph.json").write_text(
+                    json.dumps(graph, indent=2), encoding="utf-8"
+                )
 
     return 0
 
