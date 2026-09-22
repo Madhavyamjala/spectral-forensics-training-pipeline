@@ -194,9 +194,12 @@ def evaluate_ablation(cfg: Config, index: pd.DataFrame, scanner_test: Dict[str, 
     results: Dict[str, Dict[str, Any]] = {}
     raw: Dict[str, Dict[str, np.ndarray]] = {}
 
+    active_ids = cfg.data.active_label_ids()
+
     def add(name, probs, latency, tool=None, actions=None):
         results[name] = classification_report_dict(y, probs, latency, methods, actions,
-                                                    ACTIONS if actions is not None else None, tool, cfg.eval.ece_bins)
+                                                    ACTIONS if actions is not None else None, tool, cfg.eval.ece_bins,
+                                                    active_label_ids=active_ids)
         raw[name] = {"probs": probs, "latency": latency}
 
     add("A_qwen_scanner", o["scanner_probs"], decode + o["scanner_latency"])
@@ -235,6 +238,7 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     pdir.mkdir(parents=True, exist_ok=True)
     made = []
     main = [k for k in results if k.startswith(("A_", "B_", "C_"))]
+    active_ids = cfg.data.active_label_ids()
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for name, m in results.items():
@@ -256,7 +260,7 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     axes = np.atleast_1d(axes)
     for ax, name in zip(axes, main):
         ConfusionMatrixDisplay(np.array(results[name]["confusion_matrix_normalized"]),
-                               display_labels=[PRETTY_LABELS[l] for l in LABELS]).plot(ax=ax, colorbar=False,
+                               display_labels=[PRETTY_LABELS[LABELS[l]] for l in active_ids]).plot(ax=ax, colorbar=False,
                                                                                          values_format=".2f")
         ax.set_title(name, fontsize=8)
         ax.tick_params(labelsize=7)
@@ -265,8 +269,9 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     plt.close(fig)
     made.append("confusion_matrices.png")
 
-    fig, axes = plt.subplots(1, len(LABELS), figsize=(15, 4.5))
-    for k, ax in enumerate(axes):
+    fig, axes = plt.subplots(1, len(active_ids), figsize=(4.5 * len(active_ids), 4.5))
+    axes = np.atleast_1d(axes)
+    for ax, k in zip(axes, active_ids):
         for name in main:
             try:
                 RocCurveDisplay.from_predictions((y == k).astype(int), raw[name]["probs"][:, k], name=name, ax=ax,
@@ -343,8 +348,8 @@ def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y:
         row["fake_recall"] = m["binary_fake_detection"]["recall"]
         row["miss_rate"] = m["binary_fake_detection"]["miss_rate"]
         row["false_alarm_rate"] = m["binary_fake_detection"]["false_alarm_rate"]
-        for lab in LABELS:
-            row[f"f1_{lab}"] = m["per_class"][lab]["f1"]
+        for lab in active_ids:
+            row[f"f1_{LABELS[lab]}"] = m["per_class"][LABELS[lab]]["f1"]
         rows.append(row)
     df = pd.DataFrame(rows)
     df.to_csv(mdir / "ablation_summary.csv", index=False)
@@ -356,9 +361,10 @@ def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y:
         return f"{100 * v:.2f}" if pct else (f"{v:.1f}" if abs(v) >= 10 else f"{v:.3f}")
 
     lines = [f"# Chrono-Spectral Forensics - ablation report ({cfg.run_name}, mode={cfg.mode})", "",
-             f"Test videos: {len(y)} | class counts: " + ", ".join(f"{PRETTY_LABELS[l]}={int((y == i).sum())}"
-                                                                     for i, l in enumerate(LABELS)), "",
-             "## Main comparison (three model types)", "",
+             f"Test videos: {len(y)} | class counts: " + ", ".join(f"{PRETTY_LABELS[LABELS[i]]}={int((y == i).sum())}"
+                                                                     for i in active_ids), "",
+             f"Active classes: " + ", ".join(PRETTY_LABELS[LABELS[i]] for i in active_ids), "",
+             "## Main comparison (model types)", "",
              "| Model | Acc % | Bal-Acc % | Macro-F1 % | ROC-AUC | Fake recall % | Miss rate % | False alarm % | ECE | p50 ms | p95 ms | videos/s | Early exit |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for _, r in df.iterrows():
