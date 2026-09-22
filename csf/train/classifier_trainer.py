@@ -31,7 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from csf import LABELS
+from csf import LABELS, PRETTY_LABELS
 from csf.config import Config
 from csf.data.datasets import CachedVideoDataset, LlamaCollator, QwenCollator
 from csf.distributed import DistInfo, all_gather_objects, all_reduce_mean, barrier
@@ -42,12 +42,18 @@ log = get_logger("train.classifier")
 
 
 def make_collator(kind: str, processor, cfg: Config, train: bool):
+    """Build a VLM collator using the classes active in this run.
+
+    Note:
+        Two-class runs use Real / AI-Generated wording in both VLM prompts.
+
+    TODO:
+        Consolidate class-name formatting into a shared prompt schema.
+    """
+    class_names = [PRETTY_LABELS[c] for c in (cfg.data.classes or LABELS)]
     if kind == "qwen":
-        labels = [cfg.data.active_label_ids()[i] for i in range(len(cfg.data.active_label_ids()))]
-        from csf import PRETTY_LABELS
-        return QwenCollator(processor, [PRETTY_LABELS[list(PRETTY_LABELS)[i]] if False else PRETTY_LABELS[cfg.data.classes[j]] for j, i in enumerate(cfg.data.active_label_ids())] if cfg.data.classes else [PRETTY_LABELS[x] for x in LABELS])
+        return QwenCollator(processor, class_names)
     tool_dropout = cfg.train.llama.tool_dropout if train else 0.0
-    class_names = [PRETTY_LABELS[c] for c in (cfg.data.classes or ["real", "ai_generated", "ai_edited"])]
     return LlamaCollator(processor, cfg.data.mosaic_frames, cfg.data.mosaic_size, tool_dropout=tool_dropout,
                          class_names=class_names)
 
