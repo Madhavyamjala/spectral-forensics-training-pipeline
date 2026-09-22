@@ -65,6 +65,8 @@ class CSFDetector:
         self.dtype = compute_dtype_for(self.device)
         self.cfg = json.loads((self.dir / "csf_config.json").read_text(encoding="utf-8"))
         self.stats = json.loads((self.dir / "feature_stats.json").read_text(encoding="utf-8"))
+        self.active_ids = list(self.cfg.get("active_label_ids", range(len(LABELS))))
+        self.active_classes = list(self.cfg.get("classes", LABELS))
         components = set(components)
         self.qwen = self.qwen_proc = self.llama = self.runner = self.vae = None
         if "qwen" in components:
@@ -76,7 +78,8 @@ class CSFDetector:
             self.llama, proc, _ = load_classifier(self.dir / "llama_arbiter", self.device, quantization,
                                                   attn_implementation=attn_implementation)
             self.runner = ArbiterRunner(self.llama, proc, _Cfg({"mosaic_frames": self.cfg["mosaic_frames"],
-                                                                "mosaic_size": self.cfg["mosaic_size"]}), self.device)
+                                                                "mosaic_size": self.cfg["mosaic_size"]}), self.device,
+                                         active_ids=self.active_ids)
         if "vae" in components:
             self.vae = LatentTool(self.cfg["vae_id"], self.cfg.get("vae_subfolder"), self.cfg["vae_fallback_id"],
                                   self.device, torch.float16 if self.device.type == "cuda" else torch.float32)
@@ -159,10 +162,14 @@ class CSFDetector:
                    probs={PRETTY_LABELS[l]: float(v) for l, v in zip(LABELS, probs)},
                    action=action, tools_run=groups, profile=profile if mode == "agentic" else None,
                    latency_ms={k: round(v * 1000, 2) for k, v in lat.items()},
-                   total_latency_ms=round(sum(lat.values()) * 1000, 2))
+                   total_latency_ms=round(sum(lat.values()) * 1000, 2),
+                   is_fake=bool(LABELS[int(np.argmax(probs))] != "real"))
         if z is not None:
             from networkx.readwrite import json_graph
-            out["evidence_graph"] = json_graph.node_link_data(build_evidence_graph(z, mask))
+            out["evidence_graph"] = json_graph.node_link_data(
+                build_evidence_graph(z, mask,
+                                     candidate_labels=[PRETTY_LABELS[x] for x in self.active_classes])
+            )
         return out
 
 
