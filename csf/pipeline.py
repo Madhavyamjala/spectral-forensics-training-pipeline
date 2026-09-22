@@ -101,7 +101,8 @@ def predict_scanner(cfg: Config, dist_info: DistInfo, index: pd.DataFrame, stats
     loader = DataLoader(ds, batch_size=cfg.train.qwen.eval_batch_size, sampler=sampler, shuffle=False,
                         num_workers=cfg.train.num_workers, collate_fn=QwenCollator(processor))
     log.info("Scanner inference on %s split: %d videos", split, len(sub))
-    res = run_inference(model, loader, device, dtype, dist_info, desc=f"scanner {split}",\n                        active_ids=cfg.data.active_label_ids())
+    res = run_inference(model, loader, device, dtype, dist_info, desc=f"scanner {split}",
+                        active_ids=cfg.data.active_label_ids())
     keys = _ordered(sub, res)
     return {"keys": np.array(keys), "labels": np.array([res[k]["label"] for k in keys]),
             "methods": sub["method"].astype(str).to_numpy(), "probs": np.stack([res[k]["probs"] for k in keys]),
