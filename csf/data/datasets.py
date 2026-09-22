@@ -31,10 +31,10 @@ from csf.graph import evidence_text, normalize_features
 
 QWEN_SYSTEM = ("You are a forensic video pre-scanner. Inspect faces, lighting boundaries, textures and "
                "motion for signs of synthesis or local manipulation.")
-QWEN_QUESTION = "Is this video Real, AI-Generated, or AI-Edited? Answer:"
+QWEN_QUESTION = "Is this video {classes}? Answer:"
 LLAMA_QUESTION = ("You are a forensic arbiter. The image is a 2x2 mosaic of frames sampled from one video. "
-                  "Using the frames and the evidence graph below, decide whether the video is Real, "
-                  "AI-Generated, or AI-Edited.\n\n{evidence}\n\nAnswer:")
+                  "Using the frames and the evidence graph below, decide which candidate class best explains the video: "
+                  "{classes}.\n\n{evidence}\n\nAnswer:")
 
 
 class CachedVideoDataset(Dataset):
@@ -77,14 +77,16 @@ def _pad_token_fix(processor) -> None:
 
 
 class QwenCollator:
-    def __init__(self, processor):
+    def __init__(self, processor, class_names: Optional[List[str]] = None):
         self.processor = processor
         _pad_token_fix(processor)
+        self.class_names = list(class_names or ["Real", "AI-Generated", "AI-Edited"])
+        question = QWEN_QUESTION.format(classes=", ".join(self.class_names))
         messages = [{"role": "system", "content": [{"type": "text", "text": QWEN_SYSTEM}]},
-                    {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": QWEN_QUESTION}]}]
+                    {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": question}]}]
         video_token = getattr(processor, "video_token", "<|video_pad|>")
         self.prompt = _chat(processor, messages,
-                            f"{QWEN_SYSTEM}\n<|vision_start|>{video_token}<|vision_end|>{QWEN_QUESTION}")
+                            f"{QWEN_SYSTEM}\n<|vision_start|>{video_token}<|vision_end|>{question}")
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         videos = [list(s["frames"]) for s in batch]
@@ -97,16 +99,18 @@ class QwenCollator:
 
 class LlamaCollator:
     def __init__(self, processor, mosaic_frames: int, mosaic_size: int, tool_dropout: float = 0.0,
-                 force_mask: Optional[np.ndarray] = None):
+                 force_mask: Optional[np.ndarray] = None, class_names: Optional[List[str]] = None):
         self.processor = processor
         _pad_token_fix(processor)
         self.mosaic_frames = mosaic_frames
         self.mosaic_size = mosaic_size
         self.tool_dropout = tool_dropout
         self.force_mask = force_mask
+        self.class_names = list(class_names or ["Real", "AI-Generated", "AI-Edited"])
 
     def prompt_for(self, z: np.ndarray, mask: np.ndarray) -> str:
-        text = LLAMA_QUESTION.format(evidence=evidence_text(z, mask))
+        classes = ", ".join(self.class_names)
+        text = LLAMA_QUESTION.format(classes=classes, evidence=evidence_text(z, mask, candidate_labels=self.class_names))
         messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
         bos = getattr(self.processor.tokenizer, "bos_token", "") or ""
         return _chat(self.processor, messages, f"{bos}{getattr(self.processor, 'image_token', '<|image|>')}{text}")
