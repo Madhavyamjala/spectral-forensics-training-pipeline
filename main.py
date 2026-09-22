@@ -325,9 +325,16 @@ def main() -> int:
     if "prefetch" in gen_selected and not cfg.generation.enabled:
         # a training-only run still wants its base models pulled up front
         with stage("prefetch", work_dir, dist_info.rank):
-            if dist_info.is_main and should_run("prefetch"):
-                from csf.generation.prefetch import prefetch
-                mark("prefetch", **prefetch(cfg, stage="train"))
+            if should_run("prefetch"):
+                report = {}
+                if dist_info.is_main:
+                    from csf.generation.prefetch import prefetch
+                    report = prefetch(cfg, stage="train")
+                # mark() ends in a barrier, so every rank has to call it. Calling it on rank 0 only
+                # left rank 0 one barrier ahead for the rest of the run: the other ranks paired their
+                # `prepare` barrier with it and read run_manifest.csv before rank 0 had written it -
+                # or, if rank 0 won that race, deadlocked at a later collective instead.
+                mark("prefetch", **report)
         gen_selected = [s for s in gen_selected if s != "prefetch"]
     if gen_selected and not cfg.generation.enabled:
         log.info("Stage(s) %s requested but generation.enabled is false -> skipping. Use "
@@ -374,7 +381,22 @@ def main() -> int:
     df = pd.read_csv(run_manifest, dtype={"video_id": str})
 
     index_file = cfg.cache_dir / "index.parquet"
-    if should_run("features") or not index_file.exists():
+    # A completed `features` stage is only valid for the manifest it was built from. When the
+    # manifest changes - the regenerated AI-Edited class landing is the case that matters - the old
+    # index is filtered to the new rows below, so every video it lacks is silently dropped and the run
+    # trains without that class. Re-extract when a class is mostly missing; cached items are skipped,
+    # so only the new videos cost anything. The threshold ignores the usual few undecodable videos.
+    stale_index = False
+    if index_file.exists():
+        cached = set(pd.read_parquet(index_file, columns=["video_id"])["video_id"].astype(str))
+        coverage = df.assign(hit=df["video_id"].astype(str).isin(cached)).groupby("class")["hit"].mean()
+        thin = coverage[coverage < 0.5]
+        if not thin.empty:
+            stale_index = True
+            log.warning("Feature cache %s covers too little of this manifest (%s) -> re-running "
+                        "features; already-cached videos are skipped.", index_file,
+                        ", ".join(f"{c} {v:.0%}" for c, v in thin.items()))
+    if should_run("features") or not index_file.exists() or stale_index:
         with stage("features", work_dir, dist_info.rank):
             from csf.data.feature_cache import build_feature_cache
             index = build_feature_cache(df, cfg, dist_info)
