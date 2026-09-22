@@ -104,6 +104,12 @@ class EnvSpec:
     #: so a half-installed env fails at build time (where the error names the env and can be
     #: retried) instead of at job time as a bare ModuleNotFoundError from 200 workers.
     verify_imports: Sequence[str] = ()
+    #: The upstream files a worker actually executes, relative to the env root. Their import
+    #: graphs are what `--scan` walks, so a missing dependency is found by reading the repo
+    #: rather than by rendering a video and waiting for the first ImportError. Deliberately
+    #: NOT part of `digest()`: naming an entry point changes nothing about what is installed,
+    #: and no env should rebuild because we pointed the scanner somewhere new.
+    entry_points: Sequence[str] = ()
     note: str = ""
 
     def needs_hub(self) -> bool:
@@ -164,6 +170,20 @@ class ReadyEnv:
     python: Path
     repos: Dict[str, Path]
 
+    def scan_imports(self) -> Dict[str, object]:
+        """Report every module this env's entry points import but cannot import."""
+        from csf.generation.importscan import scan
+
+        entries = [self.root / e for e in self.spec.entry_points]
+        present = [e for e in entries if e.is_file()]
+        if not present:
+            return {"missing": [], "optional_missing": [], "unparsed": [], "external": 0,
+                    "files_scanned": 0,
+                    "skipped": "no entry points declared" if not entries
+                               else f"entry point(s) not present: "
+                                    f"{[str(e) for e in entries if not e.is_file()]}"}
+        return scan(self.python, list(self.repos.values()), present)
+
     def environ(self) -> Dict[str, str]:
         """Environment variables for commands run inside this env, isolated from the driver's.
 
@@ -180,6 +200,7 @@ class ReadyEnv:
         """
         env = _clean_environ()
         venv_bin = Path(self.python).parent
+        _ffmpeg_shim(venv_bin)
         env["VIRTUAL_ENV"] = str(venv_bin.parent)
         env["PATH"] = os.pathsep.join([str(venv_bin), env.get("PATH", "")]).rstrip(os.pathsep)
         # make the cloned repos importable without each worker hard-coding paths. This
@@ -189,6 +210,10 @@ class ReadyEnv:
             env.pop("PYTHONPATH")
         env.update(self.spec.env_vars)
         env.setdefault("CSF_ENV_ROOT", str(self.root))
+        # where post-install hooks find the source files they copy into a cloned repo, such
+        # as the deformable-conv shim E2FGVI needs in place of mmcv's compiled ops
+        env.setdefault("CSF_SHIM_DIR",
+                       str(Path(__file__).resolve().parent / "adapters" / "shims"))
         return env
 
 
@@ -285,6 +310,34 @@ def _write_constraints(spec: "EnvSpec", root: Path) -> Optional[Path]:
     path = Path(root) / "constraints.txt"
     path.write_text("\n".join(pins) + "\n", encoding="utf-8")
     return path
+
+
+def _ffmpeg_shim(venv_bin: Path) -> None:
+    """Expose imageio-ffmpeg's bundled binary as a plain `ffmpeg` on the env's PATH.
+
+    Several upstream repos shell out to bare `ffmpeg` - Wav2Lip muxes its result that way, and
+    ignores the return code, so on a machine without a system ffmpeg it exits 0 having written
+    nothing at all. Every env already installs imageio-ffmpeg, which ships a binary under a
+    version-stamped name; linking it under the name those repos call makes them work, and
+    `environ()` already puts this directory first on PATH.
+
+    Done here rather than at build time so envs built before this existed pick it up too,
+    without a rebuild. Best-effort: an env with no imageio-ffmpeg, or a filesystem that refuses
+    the link, is left exactly as it was.
+    """
+    target = venv_bin / "ffmpeg"
+    if target.exists():
+        return
+    binaries = sorted((venv_bin.parent).glob(
+        "lib*/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg-*"))
+    usable = [b for b in binaries if b.is_file() and os.access(b, os.X_OK)]
+    if not usable:
+        return
+    try:
+        target.symlink_to(usable[-1])
+        log.debug("Linked %s -> %s", target, usable[-1])
+    except OSError as exc:                                   # noqa: BLE001 - never fatal
+        log.debug("Could not link ffmpeg into %s: %s", venv_bin, exc)
 
 
 def _clean_environ() -> Dict[str, str]:
@@ -625,6 +678,10 @@ def build_env(spec: EnvSpec, envs_root: Path, force: bool = False, offline: bool
     # the venv's bin dir first so any console script resolves to this env's copy.
     if spec.post_install:
         hook_env = ReadyEnv(spec, root, py, repos).environ()
+        # hooks that pip-install must honour the same pins as the requirements step, or one
+        # of them quietly pulls numpy 2 into an env built entirely against numpy<2
+        if constraints:
+            hook_env["PIP_CONSTRAINT"] = str(constraints)
         for cmd in spec.post_install:
             _run([py, *cmd], cwd=root, env=hook_env,
                  what=announce("running the post-install hook (may download weights)"),
@@ -760,22 +817,57 @@ def diagnose(specs: Sequence[EnvSpec], envs_root: Path) -> Dict[str, Dict[str, o
 def _main() -> int:
     """`python -m csf.generation.envs --build <name|all>` pre-builds envs before a run."""
     import argparse
+    import logging as _logging
 
     from csf.generation.adapters import ADAPTERS, env_specs
 
+    # Nothing configures logging when this module is run directly, so every step this command
+    # narrates - which env, which of its steps, the pip output - went to a logger with no
+    # handler. A thirteen-env rebuild taking twenty minutes looked identical to one that did
+    # nothing at all, twice, while we were trying to work out whether it had run.
+    if not _logging.getLogger().handlers:
+        _logging.basicConfig(level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                             datefmt="%H:%M:%S")
+
     ap = argparse.ArgumentParser(description="Build the per-model environments")
     ap.add_argument("--build", default="", help="env or adapter name, or 'all'")
-    ap.add_argument("--envs-root", default="./cache/generation/envs")
+    ap.add_argument("--config", default="configs/regen.yaml",
+                    help="config to read generation.envs_root and staged_weights_dir from")
+    ap.add_argument("--envs-root", default=None,
+                    help="override the root from --config")
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--staged-weights-dir", default="./model_paths",
+    ap.add_argument("--staged-weights-dir", default=None,
                     help="folder holding checkpoints that cannot be downloaded unattended")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--scan", default="", metavar="NAME",
+                    help="env or adapter name, or 'all': read the import graph of each "
+                         "upstream entry point and report every module it cannot import")
     ap.add_argument("--doctor", default="", help="env or adapter name, or 'all': check what is "
                                                  "actually installed in each built env")
     ap.add_argument("--burn", default="", help="env or adapter name, or 'all': delete the built "
                                                "environment(s) so they are recreated from "
                                                "scratch. Combine with --build to rebuild now.")
     args = ap.parse_args()
+
+    # The run stage builds its envs under generation.envs_root. This command used to default
+    # somewhere else entirely, so a rebuild landed in a tree nothing reads, the pipeline
+    # quietly rebuilt the real one on its next run, and the two drifted apart while looking
+    # like they agreed. Read the same config unless told otherwise.
+    envs_root, staged = args.envs_root, args.staged_weights_dir
+    source = "--envs-root" if envs_root else args.config
+    if envs_root is None or staged is None:
+        try:
+            from csf.config import load_config
+            cfg = load_config(args.config, [])
+            envs_root = envs_root or cfg.generation.envs_root
+            staged = staged or cfg.generation.staged_weights_dir
+        except Exception as exc:                     # noqa: BLE001 - a missing config is fine
+            log.warning("Could not read %s (%s); falling back to the built-in defaults",
+                        args.config, exc)
+            envs_root = envs_root or "./cache/regen/envs"
+            staged = staged or "./model_paths"
+    args.envs_root, args.staged_weights_dir = envs_root, staged
+    log.info("Environments root: %s (from %s)", envs_root, source)
 
     specs = env_specs()
     root = Path(args.envs_root)
@@ -800,12 +892,19 @@ def _main() -> int:
             elif part in ADAPTERS:
                 picked.append(specs[ADAPTERS[part].env_name])
             else:
-                return []
+                # name the offending entry: a list of thirteen with one typo in it used to
+                # come back empty, and the command then did nothing that looked like nothing
+                raise ValueError(
+                    f"unknown env/adapter {part!r} in {name!r}. Known envs: {sorted(specs)}")
         # de-duplicate while preserving order: several adapters can share one env
         return list({spec.name: spec for spec in picked}.values())
 
     if args.burn:
-        wanted = _select(args.burn)
+        try:
+            wanted = _select(args.burn)
+        except ValueError as exc:
+            print(f"Nothing was burned: {exc}")
+            return 2
         if not wanted:
             print(f"Unknown env/adapter {args.burn!r}. Known envs: {sorted(specs)}")
             return 2
@@ -816,7 +915,11 @@ def _main() -> int:
             return 0
 
     if args.doctor:
-        wanted = _select(args.doctor)
+        try:
+            wanted = _select(args.doctor)
+        except ValueError as exc:
+            print(f"Nothing was checked: {exc}")
+            return 2
         if not wanted:
             print(f"Unknown env/adapter {args.doctor!r}. Known envs: {sorted(specs)}")
             return 2
@@ -848,6 +951,31 @@ def _main() -> int:
                       f"--envs-root {root}")
         return 1 if bad else 0
 
+    if args.scan:
+        try:
+            wanted = _select(args.scan)
+        except ValueError as exc:
+            print(f"Nothing was scanned: {exc}")
+            return 2
+        from csf.generation.importscan import format_report
+        total = 0
+        for spec in wanted:
+            env_root = root / spec.name
+            py = _venv_python(env_root / "venv")
+            if not py.exists():
+                print(f"{spec.name:<16} not built - nothing to scan")
+                continue
+            ready = ReadyEnv(spec, env_root, py,
+                             {r.folder: env_root / "repos" / r.folder for r in spec.repos})
+            report = ready.scan_imports()
+            if report.get("skipped"):
+                print(f"{spec.name:<16} skipped: {report['skipped']}")
+                continue
+            total += len(report.get("missing") or [])
+            print("\n".join(format_report(spec.name, report, env_root)))
+        print(f"\n{total} missing module(s) across {len(wanted)} environment(s)")
+        return 1 if total else 0
+
     if args.status or not args.build:
         status = env_status(_select("all"), root)
         for name in sorted(status):
@@ -857,7 +985,11 @@ def _main() -> int:
               f"{len(status)} environment(s) a runnable model needs")
         return 0
 
-    wanted = _select(args.build)
+    try:
+        wanted = _select(args.build)
+    except ValueError as exc:
+        print(f"Nothing was built: {exc}")
+        return 2
     if not wanted:
         print(f"Unknown env/adapter {args.build!r}. Known envs: {sorted(specs)}")
         return 2

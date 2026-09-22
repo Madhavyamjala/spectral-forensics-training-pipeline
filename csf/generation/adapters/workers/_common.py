@@ -268,13 +268,29 @@ def has_audio(video_path: str) -> bool:
     return "Audio:" in ((proc.stderr or "") + (proc.stdout or ""))
 
 
+def clip_output(text: str, head: int = 1500, tail: int = 1500) -> str:
+    """Both ends of a child process's output, with the middle elided.
+
+    Keeping only the tail loses the head of a Python traceback - the import chain and the line
+    that actually raised - which is the half that says *which* dependency is wrong. A run of
+    four models once failed identically with the offending import scrolled off the top, and the
+    cause could not be named from the logs at all. The last frames matter too, so keep both ends
+    and drop the middle, where progress bars live.
+    """
+    text = text or ""
+    if len(text) <= head + tail:
+        return text
+    elided = len(text) - head - tail
+    return f"{text[:head]}\n... [{elided} characters elided] ...\n{text[-tail:]}"
+
+
 def run_cmd(cmd: Sequence[str], cwd: Optional[str] = None, timeout: int = 1800) -> str:
-    """Run an upstream repo's CLI, raising with its stderr tail on failure."""
+    """Run an upstream repo's CLI, raising with both ends of its stderr on failure."""
     proc = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True,
                           timeout=timeout)
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "")[-1500:]
-        raise RuntimeError(f"command failed ({' '.join(map(str, cmd[:4]))}...): {tail}")
+        detail = clip_output(proc.stderr or proc.stdout or "")
+        raise RuntimeError(f"command failed ({' '.join(map(str, cmd[:4]))}...): {detail}")
     return proc.stdout
 
 

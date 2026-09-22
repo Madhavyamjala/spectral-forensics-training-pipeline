@@ -62,6 +62,10 @@ def render(state: State, payload: dict) -> dict:
         if extract_audio(donor, str(wav)) is None:
             raise RuntimeError(f"could not extract audio from donor {Path(donor).name}")
         out_mp4 = tmp / "result.mp4"
+        # inference.py writes temp/temp.wav and temp/result.avi relative to the clone it runs
+        # in, with fixed names, and every Wav2Lip worker runs in the same clone. The build
+        # patches those two paths to read this variable, so each job keeps its own.
+        os.environ["CSF_JOB_TMP"] = str(tmp)
         run_cmd([os.sys.executable, "inference.py",
                  "--checkpoint_path", str(state.ckpt),
                  "--face", str(face_mp4), "--audio", str(wav),

@@ -17,6 +17,7 @@ import inspect
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
@@ -1245,7 +1246,12 @@ def test_env_interpreter() -> None:
           not any("huggingface-cli" in h for h in hooks.values()),
           str([n for n, h in hooks.items() if "huggingface-cli" in h]))
     hub_hooks = [n for n, h in hooks.items() if "snapshot_download" in h]
-    check("the Hub pulls use snapshot_download", len(hub_hooks) == 4, str(sorted(hub_hooks)))
+    # a floor, not a count: envs gain snapshots as upstream repos turn out to want whole
+    # directories rather than the single files they were first staged from
+    check("the Hub pulls use snapshot_download", len(hub_hooks) >= 4, str(sorted(hub_hooks)))
+    check("every env that snapshots also declares those repos for prefetch",
+          all(specs_all[n].hub_repos for n in hub_hooks),
+          str([n for n in hub_hooks if not specs_all[n].hub_repos]))
     check("each snapshot lands under the env root",
           all("CSF_ENV_ROOT" in hooks[n] for n in hub_hooks))
 
@@ -1292,8 +1298,10 @@ def test_env_interpreter() -> None:
                  and "<" not in r]
     check("every transformers/diffusers pin has a major-version ceiling", not unbounded,
           str(unbounded))
+    # ",<5" or tighter: the torch-2.4.1 envs cap at 4.50 as well, for a different reason
+    # (see test_torch_library_ceilings), and both ceilings keep it on the 4.x line
     check("the ceiling keeps transformers on the 4.x line",
-          all("transformers>=4" in r and ",<5" in r
+          all("transformers>=4" in r and (",<5" in r or ",<4." in r)
               for sp in specs_all.values() for r in sp.pip_requirements()
               if r.startswith("transformers")))
     from csf.generation.envs import FRAMEWORK_PROBE, _verify_framework
@@ -1531,11 +1539,763 @@ def test_disk_probe() -> None:
     check("the new probe does not collapse to the root", str(probed) != "/")
 
 
-# These exercise POSIX-only mechanics: venv layouts (bin/python), symlinks, and "/" as the
-# anchor of an absolute path. The generator itself is Linux-only - its per-model environments
-# clone Linux-only upstream repos - so skipping them on Windows loses no coverage that matters.
-POSIX_ONLY = {"test_env_paths", "test_env_interpreter", "test_disk_probe"}
+def test_worker_dependencies() -> None:
+    """Every import a worker's upstream repo makes at module scope must be installed.
 
+    Each check here is one model that rendered nothing in a two-day run: the traceback was
+    always a bare ModuleNotFoundError or a signature change, hours after the env was declared
+    ready. An env's requirements are the only place that knowledge can live, because the repos
+    themselves either ship no requirements file or ship one that fights the pinned torch.
+    """
+    print("worker dependencies")
+    envs = env_specs()
+
+    # (env, distribution, who imports it)
+    required = [
+        ("videoinpaint", "matplotlib", "E2FGVI / STTN / FuseFormer test.py"),
+        ("stylegan", "matplotlib", "StyleGANEX models/psp.py"),
+        ("propainter", "requests", "ProPainter utils/download_util.py"),
+        ("liveportrait", "onnx", "LivePortrait's vendored insightface arcface_onnx.py"),
+        ("tpsmm", "face-alignment", "TPSMM demo.py find_best_frame"),
+    ]
+    for env_name, dist, who in required:
+        reqs = [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                for r in envs[env_name].pip_requirements()]
+        check(f"env '{env_name}' installs {dist} for {who}", dist in reqs, f"has {reqs}")
+
+    # onnxruntime is a different distribution from onnx and does not provide that import
+    lp = [r for r in envs["liveportrait"].pip_requirements()]
+    check("onnxruntime is not mistaken for onnx",
+          any(r.startswith("onnx") and not r.startswith("onnxruntime") for r in lp))
+
+    vace = envs["vace"]
+    wan_install = [c for c in vace.post_install if "pip" in c and any("Wan2.1" in a for a in c)]
+    check("the vace env installs the Wan2.1 package its entry point imports", wan_install)
+    check("it installs it without dependencies (flash_attn would build from source)",
+          wan_install and "--no-deps" in wan_install[0])
+    check("a failed wan install fails the build, not 2,883 jobs", "wan" in vace.verify_imports)
+
+    w2l = "".join("".join(c) for c in envs["wav2lip"].post_install)
+    check("wav2lip rewrites the positional librosa.filters.mel call",
+          "librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft," in w2l)
+    check("it keeps librosa itself unpinned below 0.10",
+          not any("librosa<0.10" in r for r in envs["wav2lip"].pip_requirements()))
+
+    sad = [c for c in envs["sadtalker"].post_install if "np.float" in "".join(c)]
+    check("sadtalker rewrites the numpy aliases removed in 1.24", sad)
+    if sad:
+        pattern = re.search(r"re\.compile\(r'([^']+)'\)", "".join(sad[0]))
+        check("the patch's pattern is recoverable", pattern is not None)
+        if pattern:
+            rx = re.compile(pattern.group(1))
+            check("it rewrites the bare alias",
+                  rx.sub(lambda m: m.group(1), "x.astype(np.float, copy=False)")
+                  == "x.astype(float, copy=False)")
+            check("it leaves the sized dtypes alone",
+                  rx.sub(lambda m: m.group(1), "np.float32 np.int64 np.bool_")
+                  == "np.float32 np.int64 np.bool_")
+
+    dreamid = (ROOT / "csf/generation/adapters/workers/worker_dreamid.py").read_text()
+    for flag in ("--ref_image", "--ref_video", "--save_file", "--dreamidv_ckpt",
+                 "generate_dreamidv.py"):
+        check(f"the DreamID-V worker uses {flag}", flag in dreamid)
+    for gone in ("--target_video", "--source_image", "--output_dir", '"inference.py"'):
+        check(f"it no longer uses {gone}, which upstream never had", gone not in dreamid)
+    check("the Wan2.1 backbone DreamID-V borrows its VAE and T5 from is staged",
+          any("Wan2.1-T2V-1.3B" in repo for repo in envs["dreamid"].hub_repos))
+    check("frame_num stays on upstream's 4n+1 grid",
+          re.search(r"N_FRAMES = (\d+)", dreamid) and
+          (int(re.search(r"N_FRAMES = (\d+)", dreamid).group(1)) - 1) % 4 == 0)
+
+
+def test_second_round_dependencies() -> None:
+    """The failures a smoke run found underneath the first round of missing imports."""
+    print("second-round dependencies")
+    envs = env_specs()
+
+    reqs = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                         for r in envs[name].pip_requirements()]
+    vi_hooks_all = "".join(" ".join(c) for c in envs["videoinpaint"].post_install)
+    check("videoinpaint installs mmcv for E2FGVI's ConvModule", "mmcv==" in vi_hooks_all)
+    check("it is a build that needs no nvcc", "mmcv-full" not in vi_hooks_all,
+          "which version is the ops-free one is checked in test_third_round_dependencies")
+    check("stylegan installs scikit-image for the vendored lpips",
+          "scikit-image" in reqs("stylegan"))
+    check("liveportrait installs requests for the vendored insightface downloader",
+          "requests" in reqs("liveportrait"))
+
+    # mmcv-lite and mmengine both depend on opencv-python, which installs the same import name
+    # as the headless build - whichever lands last wins, so the headless one must land last
+    vi_hooks = "".join("".join(c) for c in envs["videoinpaint"].post_install)
+    check("videoinpaint puts the headless OpenCV back after mmcv drags the full one in",
+          "opencv-python-headless" in vi_hooks and "uninstall" in vi_hooks)
+    check("STTN's hard-coded cuda:1 is repointed at the only visible device",
+          "cuda:1" in vi_hooks and "cuda:0" in vi_hooks)
+
+    tps = "".join("".join(c) for c in envs["tpsmm"].post_install)
+    check("TPSMM asks face-alignment for the enum member it still has",
+          "LandmarksType.TWO_D" in tps)
+    check("face-alignment is not pinned back to a release that wants opencv-python",
+          not any("face-alignment==" in r for r in envs["tpsmm"].pip_requirements()))
+
+    w2l = "".join("".join(c) for c in envs["wav2lip"].post_install)
+    check("Wav2Lip's shared intermediates become per-job", "CSF_JOB_TMP" in w2l)
+    for shared in ("'temp/temp.wav'", "'temp/result.avi'"):
+        check(f"{shared} is rewritten", shared in w2l)
+    worker = (ROOT / "csf/generation/adapters/workers/worker_wav2lip.py").read_text()
+    check("the worker sets the variable the patch reads", "CSF_JOB_TMP" in worker)
+
+    sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
+    check("SadTalker's downloader is skipped when the checkpoints are there",
+          "already present" in sad)
+    check("it is no longer judged by its own exit code", "check=False" in sad)
+    check("but the build still fails if the weights are absent afterwards",
+          "did not produce" in sad)
+
+    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    check("FuseFormer's output is read from the clone it actually writes to",
+          "_result.mp4" in vi and "state.repo" in vi)
+    check("and is named per job, so concurrent workers cannot collide",
+          "tag = tmp.name" in vi and "f\"{tag}_frames\"" in vi)
+    check("nothing is left behind in the shared clone", "in_repo.unlink()" in vi)
+
+
+def test_import_scanner() -> None:
+    """The scanner must find every missing import at once, not the first one."""
+    print("import scanner")
+    import tempfile
+
+    from csf.generation.importscan import format_report, scan
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        (repo / "pkg" / "sub").mkdir(parents=True)
+        (repo / "entry.py").write_text(
+            "import os, absent_top_level\n"
+            "from pkg.helper import thing\n"
+            "from mmcv.runner import load_checkpoint\n"
+            "try:\n    import flash_attn\nexcept ImportError:\n    flash_attn = None\n")
+        (repo / "pkg" / "__init__.py").write_text("from .helper import thing\n")
+        (repo / "pkg" / "helper.py").write_text(
+            "import json\nfrom .sub import deep\nimport absent_in_a_helper\n")
+        (repo / "pkg" / "sub" / "__init__.py").write_text("")
+        (repo / "pkg" / "sub" / "deep.py").write_text("import ast\nimport absent_three_deep\n")
+        # a script beside its own package, the way VACE runs vace/vace_wan_inference.py
+        (repo / "nested").mkdir()
+        (repo / "nested" / "run.py").write_text("from sibling import helper\n")
+        (repo / "nested" / "sibling.py").write_text("import absent_beside_the_script\n")
+
+        report = scan(Path(sys.executable), [repo],
+                      [repo / "entry.py", repo / "nested" / "run.py"])
+        missing = {row["module"] for row in report["missing"]}
+
+        check("a missing import in the entry point is found", "absent_top_level" in missing)
+        check("and one three local modules deep", "absent_three_deep" in missing,
+              "following local imports is the whole point")
+        check("and one beside a script run from a subdirectory",
+              "absent_beside_the_script" in missing)
+        check("all of them in a single pass", len(missing) >= 4, str(sorted(missing)))
+        check("a submodule is reported as the submodule", "mmcv.runner" in missing,
+              "mmcv 2.x has mmcv but not mmcv.runner - reporting 'mmcv' would hide that")
+        check("an import guarded by except ImportError is not called missing",
+              "flash_attn" not in missing)
+        check("but it is still reported, separately",
+              "flash_attn" in {r["module"] for r in report["optional_missing"]})
+        check("stdlib imports are not reported", not {"os", "json", "ast"} & missing)
+        check("each finding says which file imports it",
+              all(r.get("imported_by") for r in report["missing"]))
+
+        lines = format_report("fake", report, repo)
+        check("the report names the env and the count", "fake" in lines[0])
+        check("and is relative to the env root", not any(str(repo) in ln for ln in lines[1:]))
+
+    # an import inside a function only runs when something calls it, and so does everything
+    # the modules it reaches import. Wav2Lip imports lws in _lws_processor(), its default
+    # config never calls it, and Wav2Lip renders - counting that as missing buries the real
+    # findings under noise.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        (repo / "entry.py").write_text(
+            "import eager_absent\n"
+            "from helper import thing\n"
+            "def later():\n    import deferred_absent\n    from lazychain import x\n"
+            "if TYPE_CHECKING:\n    import typing_only_absent\n")
+        (repo / "helper.py").write_text("import eager_from_helper_absent\n")
+        (repo / "lazychain.py").write_text("import absent_under_a_deferred_module\n")
+
+        report = scan(Path(sys.executable), [repo], [repo / "entry.py"])
+        missing = {row["module"] for row in report["missing"]}
+        deferred = {row["module"] for row in report["deferred_missing"]}
+
+        check("a module-scope import is missing", "eager_absent" in missing)
+        check("so is one a module-scope import reaches",
+              "eager_from_helper_absent" in missing)
+        check("an import inside a function is deferred, not missing",
+              "deferred_absent" in deferred and "deferred_absent" not in missing)
+        check("and so is everything a deferred module imports",
+              "absent_under_a_deferred_module" in deferred,
+              "the whole subtree only runs when the function does")
+        check("a TYPE_CHECKING block never runs, so it is deferred too",
+              "typing_only_absent" in deferred)
+        check("the counts only promise what actually executes", len(missing) == 2,
+              str(sorted(missing)))
+
+    broken = scan(Path("/definitely/not/an/interpreter"), [], [])
+    # upstream edits sys.path at import time: MuseTalk's musetalk/utils/__init__.py appends
+    # its own directory so preprocessing.py can import a package nested three levels down.
+    # Static path resolution cannot see that, and calling it missing is simply wrong.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        (repo / "pkg" / "utils" / "vendored").mkdir(parents=True)
+        (repo / "entry.py").write_text("from pkg.utils.helper import x\n")
+        (repo / "pkg" / "__init__.py").write_text("")
+        (repo / "pkg" / "utils" / "__init__.py").write_text(
+            "import sys\nsys.path.append('utils')\n")
+        (repo / "pkg" / "utils" / "helper.py").write_text(
+            "from vendored import thing\nimport genuinely_absent\n")
+        (repo / "pkg" / "utils" / "vendored" / "__init__.py").write_text(
+            "import absent_in_vendored\n")
+
+        report = scan(Path(sys.executable), [repo], [repo / "entry.py"])
+        missing = {row["module"] for row in report["missing"]}
+        check("a package reachable only through a sys.path edit is not called missing",
+              "vendored" not in missing)
+        check("and the scan follows into it", "absent_in_vendored" in missing,
+              "resolving it locally is what makes its own imports visible")
+        check("a genuinely absent module is still reported", "genuinely_absent" in missing)
+
+    check("an unusable interpreter is reported, not raised", broken.get("error"))
+
+
+def test_envs_cli_root() -> None:
+    """The envs command must build where the pipeline looks."""
+    print("envs cli root")
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("the CLI has no hard-coded env root of its own",
+          '"./cache/generation/envs"' not in src,
+          "it used to default somewhere the run stage never reads, so a rebuild landed in a "
+          "tree nothing used and the pipeline silently rebuilt the real one")
+    check("it reads the same config the run stage does", '"--config"' in src)
+    check("--envs-root still overrides it", '"override the root from --config"' in src)
+    check("and it says which root it chose", "Environments root: %s (from %s)" in src)
+
+    from csf.config import load_config
+    cfg = load_config(str(ROOT / "configs/regen.yaml"), [])
+    check("the config's env root is the regen tree",
+          cfg.generation.envs_root.rstrip("/").endswith("cache/regen/envs"),
+          cfg.generation.envs_root)
+
+
+def test_entry_points_declared() -> None:
+    """Every env with a repo must say which file its worker runs."""
+    print("entry points")
+    envs = env_specs()
+    for name, spec in sorted(envs.items()):
+        if not spec.repos:
+            continue
+        if name == "vid2vid":                       # no implemented adapter drives it
+            continue
+        check(f"env '{name}' declares an entry point", spec.entry_points, "--scan cannot see it")
+        for entry in spec.entry_points:
+            check(f"  {name}: {entry} is under a cloned repo", entry.startswith("repos/"))
+
+    # entry points describe where to look, not what to install
+    before = envs["vace"].digest()
+    spec = envs["vace"]
+    object.__setattr__(spec, "entry_points", tuple(spec.entry_points) + ("repos/VACE/other.py",))
+    check("naming a new entry point does not rebuild the env", spec.digest() == before)
+
+
+def test_musetalk_dwpose_patch() -> None:
+    """MuseTalk must run without mmpose, and the patch must survive a second build."""
+    print("musetalk dwpose patch")
+    import tempfile
+
+    from csf.generation.adapters import MUSETALK_DWPOSE_PATCH
+
+    # the lines the patch targets, exactly as upstream writes them
+    upstream = (
+        "import numpy as np\n"
+        "from mmpose.apis import inference_topdown, init_model\n"
+        "from mmpose.structures import merge_data_samples\n"
+        "device = 'cuda'\n"
+        "model = init_model(config_file, checkpoint_file, device=device)\n"
+        "coord_placeholder = (0.0,0.0,0.0,0.0)\n"
+        "def get_landmark_and_bbox(img_list):\n"
+        "    for fb in batches:\n"
+        "        results = inference_topdown(model, np.asarray(fb)[0])\n"
+        "        results = merge_data_samples(results)\n"
+        "        keypoints = results.pred_instances.keypoints\n"
+        "        face_land_mark= keypoints[0][23:91]\n"
+        "        face_land_mark = face_land_mark.astype(np.int32)\n"
+        "        bbox = fa.get_detections_for_batch(np.asarray(fb))\n"
+        "        for j, f in enumerate(bbox):\n"
+        "            if f is None: # no face in the image\n"
+        "                coords_list += [coord_placeholder]\n"
+        "                continue\n"
+        "            half_face_coord = face_land_mark[29]\n"
+        "    print(f\"{int(sum(average_range_minus) / len(average_range_minus))}\")\n"
+        "    print(f\"{int(sum(average_range_plus) / len(average_range_plus))}\")\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "repos" / "MuseTalk" / "musetalk" / "utils"
+        target.mkdir(parents=True)
+        pre = target / "preprocessing.py"
+        pre.write_text(upstream)
+
+        env = dict(os.environ, CSF_ENV_ROOT=tmp)
+        proc = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                              capture_output=True, text=True, env=env)
+        check("the patch runs", proc.returncode == 0, proc.stderr[-300:])
+        patched = pre.read_text()
+        check("the patched file is valid python", _parses(patched))
+        check("no pose model is called any more",
+              "inference_topdown(model" not in patched and "merge_data_samples(" not in patched,
+              "patching the import alone leaves inference_topdown(None, ...) to raise")
+        check("the detector's own box is used instead", "coords_list += [f]" in patched)
+        check("the empty-range summary cannot divide by zero",
+              patched.count("max(1, len(average_range") == 2)
+
+        again = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                               capture_output=True, text=True, env=again_env(env))
+        check("a second build changes nothing", again.returncode == 0 and
+              pre.read_text() == patched,
+              "one rewrite keeps the original lines, so `old in text` stays true")
+        check("and says so", "0 rewritten" in again.stdout)
+
+        pre.write_text("import numpy as np\n")       # upstream moved on
+        moved = subprocess.run([sys.executable, "-c", MUSETALK_DWPOSE_PATCH],
+                               capture_output=True, text=True, env=env)
+        check("a file it no longer recognises fails loudly", moved.returncode != 0)
+        check("naming what it could not find", "needs revisiting" in moved.stdout + moved.stderr)
+
+
+def again_env(env):
+    """The same environment; a helper so the second run reads identically."""
+    return env
+
+
+def _parses(source: str) -> bool:
+    """Whether a source string compiles."""
+    import ast as _ast
+    try:
+        _ast.parse(source)
+        return True
+    except SyntaxError:
+        return False
+
+
+def test_third_round_dependencies() -> None:
+    """What the first full sweep found once the quota stopped masking everything."""
+    print("third-round dependencies")
+    envs = env_specs()
+    reqs = lambda name: list(envs[name].pip_requirements())
+    names = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip() for r in reqs(name)]
+
+    for env_name, dist in (("liveportrait", "pykalman"), ("latentsync", "kornia"),
+                           ("tokenflow", "kornia"), ("stylegan", "ipython"),
+                           ("diffueraser", "matplotlib"), ("vace", "matplotlib")):
+        check(f"env '{env_name}' installs {dist}", dist in names(env_name), str(names(env_name)))
+
+    # mmcv 2.0 deleted mmcv.runner, which E2FGVI imports; in the 1.x line the distribution
+    # called `mmcv` is the one without compiled ops. It is installed by a hook because its
+    # setup.py imports pkg_resources, which pip's isolated build env no longer provides.
+    hooks = [" ".join(c) for c in envs["videoinpaint"].post_install]
+    joined = " ".join(hooks)
+    check("videoinpaint takes mmcv 1.x, which still has mmcv.runner",
+          "mmcv==1.7.2" in joined, joined[:200])
+    check("and not the 2.x lite build that only has mmcv.cnn", "mmcv-lite" not in joined)
+    check("it builds without isolation, against this env's setuptools",
+          "--no-build-isolation" in joined)
+    check("and that setuptools still ships pkg_resources", "setuptools<81" in joined)
+    check("the pin is installed before the build that needs it",
+          joined.index("setuptools<81") < joined.index("--no-build-isolation"))
+    check("and the headless OpenCV is restored after mmcv drags the full one in",
+          joined.index("mmcv==1.7.2") < joined.index("opencv-python-headless"))
+
+    envs_src = (ROOT / "csf/generation/envs.py").read_text()
+    check("a hook that pip-installs honours the same pins as the requirements step",
+          'hook_env["PIP_CONSTRAINT"]' in envs_src,
+          "mmcv pulls numpy 2 into an env built entirely against numpy<2 otherwise")
+
+    # mediapipe 1.0 ships `modules` and `tasks` only - the Solutions API is gone
+    check("dreamid pins mediapipe below the release that dropped Solutions",
+          any(r.startswith("mediapipe") and ("<1" in r or "==0.10.21" in r)
+              for r in reqs("dreamid")),
+          "which release, and why an exact pin, is checked in test_last_three_findings")
+
+    check("tpsmm turns off the torch.compile path face-alignment 1.4 added",
+          envs["tpsmm"].env_vars.get("TORCHDYNAMO_DISABLE") == "1",
+          "inductor shells out to gcc for a CUDA helper and the link fails on these nodes")
+
+    sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
+    check("SadTalker's ragged alignment array is flattened", "np.squeeze(s)" in sad)
+
+    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke honours accept_noncommercial like the run stage does",
+          "CSF_ACCEPT_NONCOMMERCIAL" in smoke_src,
+          "otherwise REFace reports a licence gate as though it were a broken model")
+
+
+def test_scanned_dependencies() -> None:
+    """Every module-scope import the first full scan reported, answered."""
+    print("scanned dependencies")
+    envs = env_specs()
+    names = lambda name: [r.split("=")[0].split("<")[0].split(">")[0].strip()
+                          for r in envs[name].pip_requirements()]
+
+    for env_name, dist in (("stylegan", "wget"),
+                           ("latentsync", "deepcache"), ("latentsync", "ffmpeg-python"),
+                           ("latentsync", "insightface"),
+                           ("dreamid", "ipython"), ("dreamid", "decord"),
+                           ("sadtalker", "realesrgan"), ("sadtalker", "trimesh"),
+                           ("vace", "scipy"), ("vace", "scikit-image"), ("vace", "timm"),
+                           ("vace", "insightface")):
+        check(f"env '{env_name}' installs {dist}", dist in names(env_name), str(names(env_name)))
+
+    reface = " ".join(envs["reface"].pip_requirements())
+    check("reface gets OpenAI's CLIP, which is not on PyPI", "openai/CLIP.git" in reface)
+    check("and invisible-watermark for imwatermark", "invisible-watermark" in reface)
+
+    # insightface installs the CPU runtime and full OpenCV behind it, in every env
+    for env_name in ("latentsync", "vace", "reface", "dreamid"):
+        hooks = "".join("".join(c) for c in envs[env_name].post_install)
+        check(f"{env_name} puts the GPU runtime and headless OpenCV back",
+              "onnxruntime-gpu" in hooks and "opencv-python-headless" in hooks)
+
+    # what the scan proved we do NOT have to install
+    for env_name, dist in (("sadtalker", "pytorch3d"), ("sadtalker", "lws"),
+                           ("liveportrait", "MultiScaleDeformableAttention"),
+                           ("vace", "xfuser"), ("dreamid", "xfuser")):
+        check(f"{env_name} does not install {dist}", dist.lower() not in
+              " ".join(names(env_name)).lower(),
+              "it is only reached inside a function, and compiling it would cost hours")
+
+
+def test_last_three_findings() -> None:
+    """The three the scan still reported after every environment was rebuilt."""
+    print("last three findings")
+    envs = env_specs()
+
+    # mediapipe dropped Solutions and framework before 1.0, so `<1` did not cover it
+    pin = [r for r in envs["dreamid"].pip_requirements() if r.startswith("mediapipe")]
+    check("dreamid pins mediapipe to an exact release", pin == ["mediapipe==0.10.21"], str(pin))
+
+    tf = "".join("".join(c) for c in envs["tokenflow"].post_install)
+    check("TokenFlow's create_meshgrid import is moved off kornia.utils.grid",
+          "kornia.utils.grid" in tf and "from kornia.geometry import create_meshgrid" in tf,
+          "kornia 0.8 collapsed kornia/utils into a deprecation shim")
+
+    scan_src = (ROOT / "csf/generation/importscan.py").read_text()
+    check("a module reached through a sys.path edit counts as local", "repo_index" in scan_src,
+          "MuseTalk appends its own directory, so face_detection is importable and was "
+          "being reported as missing")
+
+
+def test_runtime_failures() -> None:
+    """The fourteen the first clean-scan sweep still failed on, each for its own reason."""
+    print("runtime failures")
+    envs = env_specs()
+    worker = lambda name: (ROOT / f"csf/generation/adapters/workers/worker_{name}.py").read_text()
+    hooks = lambda name: "".join("".join(c) for c in envs[name].post_install)
+
+    # VACE: the DiT calls flash_attention() directly, and that function asserts
+    wan = hooks("vace")
+    check("Wan's DiT is routed through the attention dispatcher",
+          "from .attention import attention as flash_attention" in wan,
+          "flash_attention() opens with assert FLASH_ATTN_2_AVAILABLE")
+    check("the patch is applied to the installed package, not a repo",
+          "site-packages" in wan or "sysconfig" in wan,
+          "wan is pip-installed; the clone has no copy to edit")
+
+    # E2FGVI: mmcv.ops needs compiled kernels, torchvision already has the operator
+    shim = (ROOT / "csf/generation/adapters/shims/e2fgvi_deform.py").read_text()
+    check("the deformable-conv shim exists", "def modulated_deform_conv2d" in shim)
+    check("it is backed by torchvision", "from torchvision.ops import deform_conv2d" in shim)
+    check("its weight shape matches what the checkpoint holds",
+          "out_channels, in_channels // groups, *self.kernel_size" in shim)
+    check("E2FGVI is repointed at it", "csf_deform_shim" in hooks("videoinpaint"))
+
+    # LivePortrait: tyro switches take no value, and the multipliers never existed
+    lp = worker("liveportrait")
+    check("no boolean flag is passed a value", '", "true"' not in lp and '"true"' not in lp)
+    check("the retargeting multipliers are gone",
+          "eye_retargeting_multiplier" not in lp and "lip_retargeting_multiplier" not in lp)
+    check("magnitude rides a scalar that exists",
+          "--driving_multiplier" in lp and "--animation_region" in lp)
+
+    # TokenFlow and StyleGANEX: what the upstream script actually reads
+    tf = worker("tokenflow")
+    check("TokenFlow's preprocess gets a video file", 'str(clip_mp4)' in tf,
+          "it opens --data_path with torchvision's reader and extracts frames itself")
+    sg = worker("styleganex")
+    check("StyleGANEX is handed a clip that starts on a detectable face",
+          "_first_dlib_frame" in sg)
+    check("and the frame is chosen with dlib, the detector it uses itself",
+          "dlib.get_frontal_face_detector" in sg)
+
+    # DreamID-V: the MediaPipe entry point imports a module that is not in the repository
+    dm = worker("dreamid")
+    check("DreamID-V runs the DWPose entry point", "generate_dreamidv_dwpose.py" in dm)
+    check("and not the one importing express_adaption",
+          '"generate_dreamidv.py"' not in dm)
+    check("its two ONNX models are staged",
+          all(any(w.dest.endswith(n) for w in envs["dreamid"].weights)
+              for n in ("dw-ll_ucoco_384.onnx", "yolox_l.onnx")))
+
+    # REFace: one model load per clip, not per frame
+    rf = hooks("reface")
+    check("REFace's per-frame loop is enabled", "CSF_REFACE_BATCH" in rf)
+    check("its bound is not n_samples, which is also the batch size",
+          "CSF_REFACE_FRAMES" in rf)
+    rfw = worker("reface")
+    check("frames follow upstream's index naming", 'f"{i}.jpg"' in rfw)
+    check("and the reference is offset by one, as its loop reconstructs",
+          'f"{i + 1}.jpg"' in rfw)
+    check("results are ordered numerically", 'int(q.stem.split("_")[0])' in rfw)
+    check("a short return is a failure, not a short video", "did not run to completion" in rfw)
+
+    # weights that upstream expects as whole directories
+    de = hooks("diffueraser")
+    for folder in ("sd-vae-ft-mse", "stable-diffusion-v1-5"):
+        check(f"diffueraser stages {folder}", folder in de)
+    check("and ProPainter, its priori model",
+          any("propainter" in w.dest for w in envs["diffueraser"].weights))
+    mt = hooks("musetalk")
+    check("musetalk stages whisper as a directory", "whisper" in mt and "snapshot" in mt)
+    check("and the VAE as a directory", "sd-vae" in mt)
+
+    ls = hooks("latentsync")
+    check("LatentSync's fixed mask is verified at build time", "mask.png" in ls)
+    check("and re-fetched when it does not decode", "does not decode" in ls)
+
+
+def test_fomm_source_frame() -> None:
+    """A clip qualifies on half its frames; FOMM must not demand a face in the first one."""
+    print("fomm source frame")
+    src = (ROOT / "csf/generation/adapters/workers/worker_fomm.py").read_text()
+    check("the source frame is searched for, not assumed to be frame 0",
+          "_sample(full or target, SOURCE_SCAN)" in src)
+    check("the old single-frame check is gone", "_face_box(state, target[0])" not in src)
+    check("the cascade is loosened towards what SCRFD qualified",
+          "1.05, 3, minSize=(32, 32)" in src)
+    check("and the error says how hard it looked", "frames sampled from the target clip" in src)
+
+    # the planner's own promise: these clips carry a face in at least half their frames
+    from csf.generation.filters import ClipFeatures
+    marginal = ClipFeatures(clip_id="c", label="l", path="p", frames_scanned=20,
+                            face_ratio=0.5, mean_face_size=0.08)
+    check("a clip with a face in half its frames qualifies for the face pool",
+          marginal.qualifies("face"),
+          "so frame 0 having no face is expected, not exceptional")
+
+
+def test_torch_library_ceilings() -> None:
+    """torch 2.4.1 envs must not take a diffusers that registers PEP-604 custom ops."""
+    print("library ceilings")
+    envs = env_specs()
+    torch_241 = [name for name, spec in envs.items() if "torch==2.4.1" in spec.torch]
+    for name in sorted(torch_241):
+        for req in envs[name].pip_requirements():
+            if req.startswith("diffusers"):
+                check(f"{name} caps diffusers below the flash-attn-3 registration",
+                      "<0.33" in req or "<0.36" in req, req)
+            if req.startswith("transformers"):
+                check(f"{name} caps transformers where torch 2.4.1 can still follow",
+                      "<4.50" in req, req)
+
+    sam2 = envs["sam2_diffusers"]
+    check("the env on torch 2.5.1 is left uncapped",
+          "2.5.1" in sam2.torch and any(r == "diffusers>=0.31,<1" for r in sam2.pip_requirements()),
+          "it parses the newer annotations and already reaches the Hub")
+
+
+def test_ffmpeg_shim() -> None:
+    """Repos that shell out to a bare `ffmpeg` must find one on the env's PATH."""
+    print("ffmpeg shim")
+    import tempfile
+    from csf.generation import envs as envs_mod
+
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("the shim is applied where the environment is built, not at install time",
+          "_ffmpeg_shim(venv_bin)" in src,
+          "envs built before it existed must pick it up without a rebuild")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        binaries = root / "lib" / "python3.12" / "site-packages" / "imageio_ffmpeg" / "binaries"
+        binaries.mkdir(parents=True)
+        real = binaries / "ffmpeg-linux-x86_64-v7.0.2"
+        real.write_text("#!/bin/sh\n")
+        real.chmod(0o755)
+        venv_bin = root / "bin"
+        venv_bin.mkdir()
+
+        envs_mod._ffmpeg_shim(venv_bin)
+        link = venv_bin / "ffmpeg"
+        check("the bundled binary is exposed under the name repos call",
+              link.exists() and link.resolve() == real.resolve())
+
+        envs_mod._ffmpeg_shim(venv_bin)
+        check("running it again is a no-op", link.exists())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        venv_bin = Path(tmp) / "bin"
+        venv_bin.mkdir()
+        envs_mod._ffmpeg_shim(venv_bin)
+        check("an env without imageio-ffmpeg is left alone", not (venv_bin / "ffmpeg").exists())
+
+
+def test_smoke_output_location() -> None:
+    """Workers run with cwd set to their env root, so a relative output path goes astray."""
+    print("smoke output location")
+    src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("the smoke output directory is made absolute", "os.path.abspath(out_dir)" in src,
+          "a relative path put eight rendered videos under cache/regen/envs/<env>/ instead")
+    base = (ROOT / "csf/generation/adapters/base.py").read_text()
+    check("workers really do run from their env root", "cwd=str(self.env.root)" in base)
+
+    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    check("STTN is handed a video file, not the frame folder", "video_is_file" in vi,
+          "it opens --video with cv2.VideoCapture, which reads a directory as zero frames")
+    check("the other two still get the folder they expect", vi.count("video_is_file") == 2)
+
+
+def test_quota_probe() -> None:
+    """Free space is not permission to write, and a quota is invisible to disk_usage."""
+    print("quota probe")
+    import errno
+    import tempfile
+    from unittest import mock
+
+    from csf.generation.diskcheck import EDQUOT, require_writable, write_probe
+
+    with tempfile.TemporaryDirectory() as tmp:
+        check("a writable directory passes", write_probe(tmp, mib=2) is None)
+        leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith(".csf_write_probe")]
+        check("the probe file is cleaned up", not leftovers, str(leftovers))
+
+        nested = Path(tmp) / "not" / "there" / "yet"
+        check("a directory that does not exist yet is created and probed",
+              write_probe(nested, mib=1) is None and nested.exists())
+
+        # the failure this exists for: the write is refused although the filesystem is not full
+        quota = OSError(EDQUOT, "Disk quota exceeded")
+        quota.errno = EDQUOT
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=quota):
+            problem = write_probe(tmp, mib=1)
+        check("a quota refusal is reported", problem is not None)
+        check("and named as a quota, not as free space",
+              problem and "quota" in problem.lower())
+        check("with the command that shows the limit", problem and "quota -s" in problem)
+
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=quota):
+            try:
+                require_writable(tmp, mib=1, label="the videos")
+                raised = ""
+            except RuntimeError as exc:
+                raised = str(exc)
+        check("require_writable refuses to continue", raised)
+        check("and says which directory it means", "the videos" in raised)
+
+        full = OSError(errno.ENOSPC, "No space left on device")
+        full.errno = errno.ENOSPC
+        with mock.patch("tempfile.NamedTemporaryFile", side_effect=full):
+            check("a genuinely full filesystem is reported too", write_probe(tmp, mib=1))
+
+    main_src = (ROOT / "main.py").read_text()
+    check("preflight probes before a run starts",
+          "require_writable(cfg.paths.cache_dir" in main_src)
+    sched_src = (ROOT / "csf/generation/scheduler.py").read_text()
+    check("the scheduler re-probes while it runs", "write_probe(self.video_root" in sched_src)
+    check("but not once per job", "probe_interval_s" in sched_src)
+    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke probes before loading a model", "require_writable(out_dir" in smoke_src)
+
+
+def test_env_selection_typos() -> None:
+    """One typo in a list of envs must not silently build nothing."""
+    print("env selection")
+    src = (ROOT / "csf/generation/envs.py").read_text()
+    check("an unknown name raises rather than returning an empty list",
+          "unknown env/adapter {part!r} in {name!r}" in src)
+    for verb in ("built", "burned", "checked"):
+        check(f"--{verb} reports what it did not do", f"Nothing was {verb}" in src)
+
+
+def test_child_process_errors() -> None:
+    """A failed upstream CLI must report the head of its traceback, not only the tail."""
+    print("child process errors")
+    common = ROOT / "csf/generation/adapters/workers/_common.py"
+    src = common.read_text()
+    namespace: dict = {}
+    body = src[src.index("def clip_output"):src.index("def run_cmd")]
+    exec(compile(body, str(common), "exec"), namespace)
+    clip_output = namespace["clip_output"]
+
+    short = "traceback\nline\nerror"
+    check("output that fits is passed through untouched", clip_output(short) == short)
+
+    head, tail = "H" * 4000, "T" * 4000
+    clipped = clip_output(head + "middle" * 500 + tail)
+    check("the first frames survive", clipped.startswith("H" * 1500))
+    check("the last frames survive", clipped.endswith("T" * 1500))
+    check("the elision is stated, not silent", "characters elided" in clipped)
+    check("nothing is smuggled through the middle", "middle" not in clipped)
+
+    check("run_cmd no longer keeps the tail alone", "[-1500:]" not in src,
+          "the import chain that names the broken dependency lives in the head")
+    check("run_cmd reports through clip_output", "clip_output(proc.stderr" in src)
+
+
+def test_smoke_selection() -> None:
+    """The per-model smoke command must refuse what it cannot honestly test."""
+    print("smoke selection")
+    from csf.generation import smoke
+
+    wired = smoke.selectable()
+    check("every selectable model is wired up", all(ADAPTERS[k].implemented for k in wired))
+    check("--all offers every wired model",
+          set(smoke._resolve([], "", True)) == set(wired))
+    check("a comma-separated list is split",
+          smoke._resolve(["inswapper,wav2lip"], "", False) == ["inswapper", "wav2lip"])
+    check("a family selects its wired models",
+          set(smoke._resolve([], "video_inpainting", False))
+          == {k for k in wired if ADAPTERS[k].family == "video_inpainting"})
+
+    for bad, why in ((["no_such_model"], "unknown model"),
+                     ([""], "empty selection")):
+        try:
+            resolved = smoke._resolve(bad, "", False)
+        except SystemExit:
+            resolved = None
+        check(f"{why} is rejected or empty", not resolved)
+
+    scaffolds = [k for k, a in ADAPTERS.items() if not a.implemented]
+    if scaffolds:
+        try:
+            smoke._resolve([scaffolds[0]], "", False)
+            refused = False
+        except SystemExit:
+            refused = True
+        check("a tier-2 scaffold cannot be smoke-tested", refused)
+
+    src = (ROOT / "csf/generation/smoke.py").read_text()
+    check("smoke renders into its own directory, never the dataset tree",
+          "AI Edited" not in src)
+    check("one resident worker, so a full sweep needs one model's VRAM",
+          "max_resident=1" in src)
+    check("a worker that reports success but writes nothing is a failure",
+          "empty file" in src)
+
+
+# These exercise POSIX-only mechanics: venv layouts (bin/python, lib/pythonX.Y/site-packages),
+# symlinks, and "/" as the anchor of an absolute path. The generator itself is Linux-only - its
+# per-model environments clone Linux-only upstream repos - so skipping them on Windows loses no
+# coverage that matters. (Unprivileged Windows refuses symlinks with WinError 1314, which
+# _ffmpeg_shim deliberately treats as best-effort.)
+POSIX_ONLY = {"test_env_paths", "test_env_interpreter", "test_disk_probe", "test_ffmpeg_shim"}
 
 def main() -> int:
     for fn in (test_spec, test_jobs, test_degraded_pool, test_naming, test_adapters,
@@ -1545,7 +2305,16 @@ def main() -> int:
                test_ffmpeg_resolution, test_worker_inputs, test_progress,
                test_env_paths, test_no_job_left_behind, test_retry_policy,
                test_stage_staleness, test_env_interpreter, test_variant_capability,
-               test_disk_probe):
+               test_disk_probe, test_worker_dependencies, test_second_round_dependencies,
+               test_import_scanner, test_envs_cli_root, test_entry_points_declared,
+               test_musetalk_dwpose_patch,
+               test_third_round_dependencies, test_scanned_dependencies,
+               test_last_three_findings, test_runtime_failures,
+               test_fomm_source_frame,
+               test_torch_library_ceilings, test_ffmpeg_shim, test_quota_probe,
+               test_env_selection_typos, test_smoke_output_location,
+               test_child_process_errors,
+               test_smoke_selection):
         if os.name == "nt" and fn.__name__ in POSIX_ONLY:
             print(f"{fn.__name__} (skipped on Windows: POSIX-only generator internals)")
             continue

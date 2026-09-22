@@ -34,6 +34,15 @@ TORCH_CU121 = "torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1"
 #: pull the newest torch from PyPI on top of the pinned build - the env then flip-flops between
 #: the two on every rebuild. Meet upstream's floor instead of fighting it.
 TORCH_SAM2 = "torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
+#: Why every torch-2.4.1 env caps diffusers and transformers rather than taking the newest:
+#: diffusers 0.36 added `models/attention_dispatch.py`, which registers a flash-attention-3
+#: custom op at import time under `from __future__ import annotations`, so its `float | None`
+#: defaults reach torch as strings. torch 2.4.1's infer_schema cannot parse those, and the
+#: import raises before any model loads - with no flash-attention package installed anywhere,
+#: which is what made it so hard to place. Its own guard only checks that custom_op exists
+#: (torch 2.4), not that the annotation syntax is supported (torch 2.5+). 0.35.2 is the last
+#: release without it; the repos here were written against 0.30-0.32 anyway. sam2_diffusers is
+#: on torch 2.5.1 and takes the newest of both.
 TORCH_LEGACY = "torch==1.13.1 torchvision==0.14.1"
 LEGACY_INDEX = "https://download.pytorch.org/whl/cu117"
 
@@ -68,6 +77,373 @@ print('basicsr imports cleanly')
 """
 
 
+#: Wav2Lip's audio.py calls `librosa.filters.mel(sample_rate, n_fft, ...)` positionally.
+#: librosa 0.10 made every argument of that function keyword-only, so the call raises
+#: `TypeError: mel() takes 0 positional arguments` before a single frame is rendered. Pinning
+#: librosa back below 0.10 would drag numba and llvmlite down with it - and those are what
+#: decide whether this env builds at all on a given Python - so the call site is rewritten
+#: instead. The keyword form means the same thing on every librosa that has ever shipped it.
+WAV2LIP_LIBROSA_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'Wav2Lip' / 'audio.py'
+text = path.read_text(encoding='utf-8')
+old = 'librosa.filters.mel(hp.sample_rate, hp.n_fft,'
+new = 'librosa.filters.mel(sr=hp.sample_rate, n_fft=hp.n_fft,'
+if old in text:
+    path.write_text(text.replace(old, new), encoding='utf-8')
+    print('wav2lip: rewrote the positional librosa.filters.mel call in audio.py')
+elif new in text:
+    print('wav2lip: audio.py already uses the keyword form')
+else:
+    raise SystemExit('wav2lip: audio.py has no recognisable librosa.filters.mel call; the '
+                     'upstream file changed and this patch needs revisiting')
+"""
+
+#: SadTalker still uses `np.float`, removed in numpy 1.24 while these envs resolve to 1.26 under
+#: the `numpy<2` pin - `src/face3d/util/my_awing_arch.py` raises on it mid-render, after the
+#: model has loaded. Pinning numpy below 1.24 instead would put this env alone on a numpy older
+#: than basicsr, facexlib and gfpgan build against, so the aliases are rewritten to the builtins
+#: they were aliases *for*. numpy's own removal note prescribes exactly this substitution.
+SADTALKER_NUMPY_PATCH = r"""
+import os, pathlib, re
+root = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'SadTalker'
+# \b...(?!\w) so np.float32 / np.int64 and friends are left alone - only the bare aliases go
+pattern = re.compile(r'\bnp\.(float|int|bool|object|str)\b(?!\w)')
+patched = 0
+for path in sorted(root.rglob('*.py')):
+    text = path.read_text(encoding='utf-8', errors='ignore')
+    fixed = pattern.sub(lambda m: m.group(1), text)
+    if fixed != text:
+        path.write_text(fixed, encoding='utf-8')
+        patched += 1
+print('sadtalker: replaced removed numpy scalar aliases in %d file(s)' % patched)
+
+# align_img packs its scale and translation straight into np.array([...]), but they arrive as
+# length-1 arrays, not scalars. numpy used to broadcast that; since 1.24 it is an error
+# ("inhomogeneous shape"), raised after the 3DMM step has already run.
+ragged = root / 'src' / 'face3d' / 'util' / 'preprocess.py'
+old = 'trans_params = np.array([w0, h0, s, t[0], t[1]])'
+new = ('trans_params = np.array([w0, h0, float(np.squeeze(s)), '
+       'float(np.squeeze(t[0])), float(np.squeeze(t[1]))])')
+text = ragged.read_text(encoding='utf-8')
+if old in text:
+    ragged.write_text(text.replace(old, new), encoding='utf-8')
+    print('sadtalker: flattened the alignment parameters align_img packs')
+elif new in text:
+    print('sadtalker: alignment parameters already flattened')
+else:
+    print('sadtalker: WARNING - align_img no longer matches the expected line')
+"""
+
+
+#: VACE's `vace_wan_inference.py` opens with `import wan`: the Wan2.1 package is a separate
+#: install that upstream leaves commented out in requirements/framework.txt for you to add.
+#: `--no-deps` is deliberate - Wan2.1's dependency list pins `flash_attn`, which compiles from
+#: source against nvcc and takes hours, and `wan/modules/attention.py` guards both
+#: flash-attention imports and falls back to torch's scaled_dot_product_attention when neither
+#: is importable. Everything else it imports is already in this env's requirements.
+WAN2_1_PACKAGE = "git+https://github.com/Wan-Video/Wan2.1.git"
+
+
+#: Wan2.1's DiT calls `flash_attention()` directly (wan/modules/model.py), not the
+#: `attention()` dispatcher beside it - and `flash_attention()` opens with
+#: `assert FLASH_ATTN_2_AVAILABLE`. Installing Wan with --no-deps keeps flash-attn out of
+#: an env where it would have to be compiled, so every VACE render asserted its way out.
+#:
+#: The dispatcher is upstream's own fallback: when no flash-attention build is importable
+#: it runs torch's scaled_dot_product_attention instead. Both call sites pass only q, k, v,
+#: k_lens and window_size, and the two signatures differ in nothing else that is used, so
+#: importing the dispatcher under the old name is enough. Slower than flash-attn, and
+#: correct, which the assert was not.
+WAN_SDPA_PATCH = r"""
+import glob, sysconfig
+roots = {sysconfig.get_paths()[k] for k in ('purelib', 'platlib')}
+files = sorted({p for r in roots for p in glob.glob(r + '/wan/modules/model.py')})
+if not files:
+    raise SystemExit('wan is not installed in this environment')
+old = 'from .attention import flash_attention'
+new = ('from .attention import attention as flash_attention  '
+       '# csf: dispatcher, which falls back to torch SDPA')
+patched = 0
+for path in files:
+    with open(path, encoding='utf-8') as fh:
+        text = fh.read()
+    if new in text:
+        continue
+    if old not in text:
+        raise SystemExit('wan/modules/model.py does not import flash_attention as expected; '
+                         'upstream changed and this patch needs revisiting')
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(text.replace(old, new))
+    patched += 1
+print('wan: routed %d module(s) through the attention dispatcher' % patched)
+import importlib
+m = importlib.import_module('wan.modules.model')
+assert hasattr(m, 'flash_attention'), 'the alias did not survive the rewrite'
+print('wan.modules.model imports cleanly')
+"""
+
+
+#: E2FGVI-HQ's feature propagation imports ModulatedDeformConv2d from mmcv.ops, which is
+#: the half of mmcv that ships compiled CUDA kernels - mmcv 1.x lite has mmcv.cnn and
+#: mmcv.runner but no mmcv._ext, and building mmcv-full takes nvcc and hours.
+#:
+#: torchvision already ships the operator: deform_conv2d with a mask argument IS DCNv2,
+#: with the same offset and mask layouts and the same weight shape, so the released
+#: checkpoint loads unchanged. The shim is written into the repo and the import repointed.
+E2FGVI_MMCV_SHIM = r"""
+import os, pathlib, shutil
+repo = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'E2FGVI'
+source = pathlib.Path(os.environ['CSF_SHIM_DIR']) / 'e2fgvi_deform.py'
+dest = repo / 'model' / 'modules' / 'csf_deform_shim.py'
+shutil.copyfile(source, dest)
+
+target = repo / 'model' / 'modules' / 'feat_prop.py'
+text = target.read_text(encoding='utf-8')
+old = 'from mmcv.ops import ModulatedDeformConv2d, modulated_deform_conv2d'
+new = ('from model.modules.csf_deform_shim import ModulatedDeformConv2d, '
+       'modulated_deform_conv2d')
+if new in text:
+    print('e2fgvi: feat_prop.py already uses the torchvision deformable-conv shim')
+elif old in text:
+    target.write_text(text.replace(old, new), encoding='utf-8')
+    print('e2fgvi: feat_prop.py now uses the torchvision deformable-conv shim')
+else:
+    raise SystemExit('e2fgvi: feat_prop.py does not import mmcv.ops as expected; upstream '
+                     'changed and this patch needs revisiting')
+"""
+
+
+#: LatentSync's fixed mouth mask is a 1.8 KB PNG in the repo, and the clone made during
+#: the disk-quota exhaustion got a truncated copy: cv2.imread returned None and the
+#: pipeline died on an empty array, several minutes into a render. Decode it at build
+#: time and re-fetch it if it does not decode, so a bad checkout cannot reach a job.
+LATENTSYNC_MASK_FIX = r"""
+import os, pathlib, urllib.request
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'LatentSync' / 'latentsync' /
+        'utils' / 'mask.png')
+URL = 'https://raw.githubusercontent.com/bytedance/LatentSync/main/latentsync/utils/mask.png'
+
+
+def readable(p):
+    try:
+        import cv2
+        return p.is_file() and cv2.imread(str(p)) is not None
+    except Exception:
+        return False
+
+
+if readable(path):
+    print('latentsync: the fixed mask decodes cleanly')
+else:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = urllib.request.urlopen(URL, timeout=120).read()
+    path.write_bytes(data)
+    if not readable(path):
+        raise SystemExit('latentsync: mask.png still does not decode after re-downloading')
+    print('latentsync: replaced an unreadable mask.png (%d bytes)' % len(data))
+"""
+
+
+
+
+#: MuseTalk's preprocessing.py loads DWPose through mmpose, and mmpose needs mmcv 2.x
+#: *with* compiled CUDA ops - an nvcc build measured in hours, on nodes whose inductor
+#: cannot even link libcuda. It uses that pose model for one thing: 133 wholebody
+#: keypoints, of which it keeps the 68 face landmarks, to raise the top edge of each crop
+#: from the detector's box to a line level with the nose.
+#:
+#: The box itself comes from the S3FD detector MuseTalk vendors, which needs no mmpose -
+#: and upstream already falls back to that raw box whenever the landmark-derived one comes
+#: out degenerate. This takes that supported path for every frame. The crop is then the
+#: detector's box rather than a landmark-refined one, so the framing sits a little higher
+#: than upstream's default; MuseTalk exposes bbox_shift precisely to trim that, and the
+#: mouth region the model conditions on is well inside either box.
+MUSETALK_DWPOSE_PATCH = r"""
+import os, pathlib
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'MuseTalk' / 'musetalk' /
+        'utils' / 'preprocessing.py')
+text = path.read_text(encoding='utf-8')
+swaps = [
+    ("from mmpose.apis import inference_topdown, init_model",
+     "inference_topdown = init_model = None  # csf: mmpose needs compiled mmcv ops"),
+    ("from mmpose.structures import merge_data_samples",
+     "merge_data_samples = None  # csf: see above"),
+    ("model = init_model(config_file, checkpoint_file, device=device)",
+     "model = None  # csf: the S3FD detector below supplies the bounding boxes"),
+    # the pose model is still *called* at the top of each batch loop, in both functions that
+    # use it - patching the import alone leaves inference_topdown(None, ...) to raise
+    ("        results = inference_topdown(model, np.asarray(fb)[0])\n"
+     "        results = merge_data_samples(results)\n"
+     "        keypoints = results.pred_instances.keypoints\n"
+     "        face_land_mark= keypoints[0][23:91]\n"
+     "        face_land_mark = face_land_mark.astype(np.int32)\n",
+     "        face_land_mark = None  # csf: no pose model; the detector box is used below\n"),
+    # take upstream's own fallback - the detector's own box - for every frame
+    ("            if f is None: # no face in the image\n"
+     "                coords_list += [coord_placeholder]\n"
+     "                continue",
+     "            if f is None: # no face in the image\n"
+     "                coords_list += [coord_placeholder]\n"
+     "                continue\n"
+     "            coords_list += [f]  # csf: detector box, upstream's own fallback\n"
+     "            continue"),
+    # with no landmarks those ranges stay empty, and upstream's summary divides by their length
+    ("sum(average_range_minus) / len(average_range_minus)",
+     "sum(average_range_minus) / max(1, len(average_range_minus))"),
+    ("sum(average_range_plus) / len(average_range_plus)",
+     "sum(average_range_plus) / max(1, len(average_range_plus))"),
+]
+applied, already = 0, 0
+for old, new in swaps:
+    # the replacement is tested first: one of these rewrites keeps the original lines and adds
+    # to them, so `old in text` stays true afterwards and a second build would append again
+    if new in text:
+        already += 1
+    elif old in text:
+        text = text.replace(old, new)
+        applied += 1
+    else:
+        raise SystemExit('musetalk: preprocessing.py has no %r - upstream changed and this '
+                         'patch needs revisiting' % old[:60])
+path.write_text(text, encoding='utf-8')
+print('musetalk: took the mmpose-free path (%d rewritten, %d already done)' % (applied, already))
+"""
+
+
+#: kornia 0.8 collapsed `kornia/utils/` into a single deprecation shim, so the module
+#: `kornia.utils.grid` no longer exists - TokenFlow's util.py imports create_meshgrid from it.
+#: The function moved to `kornia.geometry`, which is where kornia's own shim now re-exports it
+#: from, and where it has lived for years: the import works on old and new kornia alike.
+TOKENFLOW_KORNIA_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'TokenFlow' / 'util.py'
+text = path.read_text(encoding='utf-8')
+old = 'from kornia.utils.grid import create_meshgrid'
+new = 'from kornia.geometry import create_meshgrid'
+if new in text:
+    print('tokenflow: util.py already imports create_meshgrid from kornia.geometry')
+elif old in text:
+    path.write_text(text.replace(old, new), encoding='utf-8')
+    print('tokenflow: moved the create_meshgrid import to kornia.geometry')
+else:
+    raise SystemExit('tokenflow: util.py has no recognisable create_meshgrid import; '
+                     'upstream changed and this patch needs revisiting')
+"""
+
+
+#: REFace's inference script renders ONE image per process: it has a per-index loop for
+#: whole benchmark folders, but ships with `USE_HARD_CODED=False`, which makes every
+#: iteration fall back to the single `--image_path`. A hundred-frame clip would therefore
+#: mean a hundred model loads.
+#:
+#: The loop is enabled through an environment variable rather than by flipping the
+#: constant, and its bound comes from a second variable rather than from `--n_samples` -
+#: which is also the batch size, so raising it to the frame count would change what is
+#: sent to the GPU in one go. The result is one model load per clip and one frame per
+#: iteration, which is what upstream's own naming convention was written for.
+REFACE_BATCH_PATCH = r"""
+import os, pathlib
+path = (pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'REFace' / 'scripts' /
+        'inference.py')
+text = path.read_text(encoding='utf-8')
+swaps = [
+    # upstream disables its own per-index loop, so one process renders one image; the loop
+    # is what lets a whole clip share a single model load
+    ("    USE_HARD_CODED=False",
+     "    USE_HARD_CODED = os.environ.get('CSF_REFACE_BATCH') == '1'  # csf"),
+    # and the loop count comes from us, not from n_samples, which is also the batch size
+    ("        GEN_NUMS=opt.n_samples",
+     "        GEN_NUMS = int(os.environ.get('CSF_REFACE_FRAMES', opt.n_samples))  # csf"),
+]
+applied, already = 0, 0
+for old, new in swaps:
+    if new in text:
+        already += 1
+    elif old in text:
+        text = text.replace(old, new)
+        applied += 1
+    else:
+        raise SystemExit('reface: inference.py has no %r - upstream changed and this patch '
+                         'needs revisiting' % old.strip())
+if 'import os' not in text:
+    text = 'import os\n' + text
+path.write_text(text, encoding='utf-8')
+print('reface: enabled the per-frame loop (%d rewritten, %d already done)' % (applied, already))
+"""
+
+
+#: STTN's test.py opens `torch.device("cuda:1")` - hard-coded, not from a flag. Workers run with
+#: CUDA_VISIBLE_DEVICES pinned to one card, so the only ordinal that exists is 0 and every job
+#: dies with "invalid device ordinal" whichever GPU it was scheduled on.
+STTN_DEVICE_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'STTN' / 'test.py'
+text = path.read_text(encoding='utf-8')
+if 'cuda:1' in text:
+    path.write_text(text.replace('cuda:1', 'cuda:0'), encoding='utf-8')
+    print('sttn: repointed the hard-coded cuda:1 at the only visible device')
+else:
+    print('sttn: test.py already targets cuda:0')
+"""
+
+#: TPSMM's demo.py asks for `face_alignment.LandmarksType._2D`. face-alignment 1.4 renamed that
+#: enum member to TWO_D. Pinning back to 1.3.5 instead would pull `opencv-python` into this env,
+#: which installs the same import name as the headless build already there - the exact swap that
+#: has emptied `cv2` before - so the call site moves instead.
+TPSMM_FACE_ALIGNMENT_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'TPSMM' / 'demo.py'
+text = path.read_text(encoding='utf-8')
+if 'LandmarksType._2D' in text:
+    path.write_text(text.replace('LandmarksType._2D', 'LandmarksType.TWO_D'), encoding='utf-8')
+    print('tpsmm: renamed the face-alignment enum member demo.py asks for')
+else:
+    print('tpsmm: demo.py already uses the current enum name')
+"""
+
+#: Wav2Lip writes three intermediates - temp/temp.wav, temp/result.avi, and the ffmpeg mux that
+#: reads them - under whatever directory it is run from, with fixed names. Every Wav2Lip worker
+#: runs from the same cloned repo, so two jobs in flight at once overwrite each other's audio
+#: and frames, and a video can be muxed from another job's material. The names become per-job.
+WAV2LIP_TEMP_PATCH = """
+import os, pathlib
+path = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'Wav2Lip' / 'inference.py'
+text = path.read_text(encoding='utf-8')
+job_tmp = "os.path.join(os.environ.get('CSF_JOB_TMP', 'temp'), %s)"
+swaps = [("'temp/temp.wav'", job_tmp % "'temp.wav'"),
+         ("'temp/result.avi'", job_tmp % "'result.avi'")]
+done = 0
+for old, new in swaps:
+    if old in text:
+        done += text.count(old)
+        text = text.replace(old, new)
+if done:
+    if 'import os' not in text:
+        text = 'import os\\n' + text
+    path.write_text(text, encoding='utf-8')
+print('wav2lip: gave %d shared intermediate(s) a per-job home' % done)
+"""
+
+#: SadTalker's own downloader is not safe to run twice: it opens with `mkdir ./checkpoints`
+#: (no -p), so on an env that already has its weights it prints "File exists", skips every
+#: download and exits non-zero - failing a build that had nothing wrong with it. Run it only
+#: when the checkpoints are actually absent, and judge it by what is on disk afterwards.
+SADTALKER_DOWNLOAD = """
+import os, pathlib, subprocess
+repo = pathlib.Path(os.environ['CSF_ENV_ROOT']) / 'repos' / 'SadTalker'
+wanted = repo / 'checkpoints' / 'SadTalker_V0.0.2_512.safetensors'
+if wanted.exists():
+    print('sadtalker: checkpoints already present, skipping the downloader')
+else:
+    (repo / 'checkpoints').mkdir(parents=True, exist_ok=True)
+    subprocess.run(['bash', 'scripts/download_models.sh'], cwd=repo, check=False)
+    if not wanted.exists():
+        raise SystemExit('sadtalker: download_models.sh did not produce %s' % wanted)
+    print('sadtalker: checkpoints downloaded')
+"""
+
+
 #: `onnxruntime` / `onnxruntime-gpu` and `opencv-python` / `opencv-python-headless` are pairs of
 #: distributions that install the SAME import name. Uninstalling one deletes the shared files
 #: even when the other is still recorded as installed - and pip then answers the reinstall with
@@ -92,6 +468,28 @@ print('runtime swap ok: onnxruntime-gpu + headless OpenCV are importable')
 """
 
 
+OPENCV_HEADLESS_SWAP = """
+import subprocess, sys, importlib
+run = lambda *a: subprocess.run([sys.executable, '-m', 'pip', *a], check=False)
+run('uninstall', '-y', 'opencv-python', 'opencv-python-headless', 'opencv-contrib-python')
+subprocess.run([sys.executable, '-m', 'pip', 'install',
+                'opencv-python-headless', 'numpy<2'], check=True)
+importlib.import_module('cv2')
+print('opencv swap ok: the headless build is the one installed')
+"""
+
+
+def opencv_headless_swap() -> tuple:
+    """Put the headless OpenCV back after a dependency drags the full build in.
+
+    `opencv-python` and `opencv-python-headless` install the same import name, so whichever
+    lands last wins and uninstalling either deletes the shared files - pip then answers the
+    reinstall with "Requirement already satisfied" and does nothing. Every variant is removed
+    first and the headless build installed into the vacuum, same as the insightface envs do.
+    """
+    return ("-c", OPENCV_HEADLESS_SWAP)
+
+
 def onnxruntime_gpu_swap() -> tuple:
     """Replace the CPU runtime and full OpenCV that InsightFace 2.0 pulls in.
 
@@ -103,7 +501,29 @@ def onnxruntime_gpu_swap() -> tuple:
     return ("-c", RUNTIME_SWAP)
 
 
-def hub_snapshot(repo_id: str, *dest: str) -> tuple:
+def pip_install(*args: str) -> tuple:
+    """A post-install step that runs `pip install` inside the env's own interpreter."""
+    return ("-m", "pip", "install", *args)
+
+
+#: E2FGVI's flow_comp.py wants both `mmcv.cnn.ConvModule` and `mmcv.runner.load_checkpoint`,
+#: and mmcv 2.0 deleted mmcv.runner - so the 1.x line is the one that works. In 1.x the
+#: distribution named `mmcv` is the ops-free build (MMCV_WITH_OPS defaults to 0; `mmcv-full`
+#: is the one that compiles), so it needs no nvcc.
+#:
+#: It does need its own build, though, and mmcv 1.7.2's setup.py opens with `import
+#: pkg_resources`, which setuptools 81 removed - so pip's isolated build environment, which
+#: always takes the newest setuptools, cannot run it. Installing without isolation lets the
+#: build use this env's own setuptools, pinned below that removal. Both steps run as hooks
+#: because the requirements step always builds in isolation.
+MMCV_1X_INSTALL = (
+    pip_install("setuptools<81", "wheel"),
+    pip_install("--no-build-isolation", "mmcv==1.7.2"),
+)
+
+
+def hub_snapshot(repo_id: str, *dest: str, allow: Sequence[str] = (),
+                 ignore: Sequence[str] = ()) -> tuple:
     """A post-install step that downloads a Hub repo into `<env root>/<dest...>`.
 
     Through `huggingface_hub.snapshot_download`, not a CLI: `huggingface-cli` was removed in
@@ -114,11 +534,18 @@ def hub_snapshot(repo_id: str, *dest: str) -> tuple:
     from the shared Hub cache instead of re-downloading.
     """
     joined = ", ".join(repr(part) for part in dest)
+    # Whole repos are often mostly duplicates - Stable Diffusion 1.5 ships the same weights
+    # as .ckpt, .safetensors and fp16 variants, three times the download for one usable copy
+    filters = ""
+    if allow:
+        filters += f", allow_patterns={list(allow)!r}"
+    if ignore:
+        filters += f", ignore_patterns={list(ignore)!r}"
     return ("-c",
             "import os;from huggingface_hub import snapshot_download;"
             f"p=os.path.join(os.environ['CSF_ENV_ROOT'], {joined});"
             f"print('downloading {repo_id} ->', p);"
-            f"snapshot_download({repo_id!r}, local_dir=p, max_workers=8);"
+            f"snapshot_download({repo_id!r}, local_dir=p, max_workers=8{filters});"
             "print('done')")
 
 
@@ -161,9 +588,15 @@ ENVS: Dict[str, EnvSpec] = {
     # --- ProPainter: flow-guided video inpainting ---------------------------------------
     "propainter": EnvSpec(
         name="propainter",
+        entry_points=(
+                       "repos/ProPainter/inference_propainter.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
-                      "av", "einops", "timm", "tqdm", "matplotlib", "scikit-image"),
+                      "av", "einops", "timm", "tqdm", "matplotlib", "scikit-image",
+                      # ProPainter/utils/download_util.py imports requests at module scope,
+                      # so inference_propainter.py cannot even be imported without it
+                      "requests"),
         repos=(GitRepo("https://github.com/sczhou/ProPainter.git", name="ProPainter"),),
         weights=(
             WeightFile(dest="repos/ProPainter/weights/ProPainter.pth",
@@ -178,9 +611,19 @@ ENVS: Dict[str, EnvSpec] = {
     # --- E2FGVI / STTN / FuseFormer: transformer video inpainting -----------------------
     "videoinpaint": EnvSpec(
         name="videoinpaint",
+        entry_points=(
+                       "repos/E2FGVI/test.py",
+                       "repos/STTN/test.py",
+                       "repos/FuseFormer/test.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "pillow", "scipy", "imageio[ffmpeg]",
-                      "av", "einops", "tqdm", "scikit-image"),
+                      "av", "einops", "tqdm", "scikit-image",
+                      # all three test.py entry points import matplotlib for their colour maps
+                      "matplotlib",
+                      # mmcv is installed by a post-install hook, not from here - see
+                      # MMCV_1X_INSTALL
+                      ),
         repos=(GitRepo("https://github.com/MCG-NKU/E2FGVI.git", name="E2FGVI"),
                GitRepo("https://github.com/researchmm/STTN.git", name="STTN"),
                GitRepo("https://github.com/ruiliu-ai/FuseFormer.git", name="FuseFormer")),
@@ -195,6 +638,9 @@ ENVS: Dict[str, EnvSpec] = {
                        staged_name="fuseformer.pth",
                        where="https://github.com/ruiliu-ai/FuseFormer (Drive link in README)"),
         ),
+        # mmcv first, then the OpenCV it drags in behind it is swapped back for headless
+        post_install=(*MMCV_1X_INSTALL, opencv_headless_swap(),
+                      ("-c", E2FGVI_MMCV_SHIM), ("-c", STTN_DEVICE_PATCH)),
         note="All three checkpoints are Drive-hosted upstream, so they are staged by hand into "
              "generation.staged_weights_dir and copied into place by the build.",
     ),
@@ -202,6 +648,9 @@ ENVS: Dict[str, EnvSpec] = {
     # --- Wav2Lip ------------------------------------------------------------------------
     "wav2lip": EnvSpec(
         name="wav2lip",
+        entry_points=(
+                       "repos/Wav2Lip/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "numba",
                       "imageio[ffmpeg]", "tqdm", "scipy"),
@@ -213,11 +662,16 @@ ENVS: Dict[str, EnvSpec] = {
                  WeightFile(dest="repos/Wav2Lip/face_detection/detection/sfd/s3fd.pth",
                             hf_repo="camenduru/Wav2Lip",
                             hf_file="checkpoints/s3fd-619a316812.pth")),
+        post_install=(("-c", WAV2LIP_LIBROSA_PATCH), ("-c", WAV2LIP_TEMP_PATCH)),
     ),
 
     # --- First Order Motion Model (reenactment) ------------------------------------------
     "fomm": EnvSpec(
         name="fomm",
+        entry_points=(
+                       "repos/fomm/modules/generator.py",
+                       "repos/fomm/modules/keypoint_detector.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
                       "pyyaml", "tqdm", "scipy", "cffi", "matplotlib"),
@@ -233,22 +687,43 @@ ENVS: Dict[str, EnvSpec] = {
     # --- TokenFlow / InsV2V: diffusion video editing -------------------------------------
     "tokenflow": EnvSpec(
         name="tokenflow",
+        entry_points=(
+                       "repos/TokenFlow/preprocess.py",
+                       "repos/TokenFlow/run_tokenflow_pnp.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "tqdm",
+                      # TokenFlow's util.py imports kornia.geometry.transform, and
+                      # torchvision's video reader still references av.AVError, which PyAV 14
+                      # removed - it surfaces only on the error path, but that is exactly
+                      # where a useful message would otherwise be
+                      "kornia", "av<14",
                       "av", "pillow"),
         repos=(GitRepo("https://github.com/omerbt/TokenFlow.git", name="TokenFlow"),),
+        post_install=(("-c", TOKENFLOW_KORNIA_PATCH),),
     ),
 
     # --- LatentSync 1.6: audio-conditioned latent diffusion lip-sync ---------------------
     "latentsync": EnvSpec(
         name="latentsync",
+        entry_points=(
+                       "repos/LatentSync/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.32,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.32,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
+                      # kornia for affine_transform, DeepCache for the UNet cache its
+                      # inference script imports, ffmpeg-python for the bundled whisper, and
+                      # insightface for its face detector
+                      "kornia", "deepcache", "ffmpeg-python", "insightface==2.0",
                       "omegaconf", "librosa==0.10.2", "face-alignment", "python-speech-features",
                       "decord", "mediapipe", "tqdm"),
         repos=(GitRepo("https://github.com/bytedance/LatentSync.git", name="LatentSync"),),
+        # insightface pulls the CPU onnxruntime and full OpenCV behind it
+        post_install=(onnxruntime_gpu_swap(), ("-c", LATENTSYNC_MASK_FIX)),
         weights=(WeightFile(dest="repos/LatentSync/checkpoints/latentsync_unet.pt",
                             hf_repo="ByteDance/LatentSync-1.6", hf_file="latentsync_unet.pt"),
                  WeightFile(dest="repos/LatentSync/checkpoints/whisper/tiny.pt",
@@ -259,37 +734,50 @@ ENVS: Dict[str, EnvSpec] = {
     # --- MuseTalk 1.5: latent-space audio-conditioned inpainting -------------------------
     "musetalk": EnvSpec(
         name="musetalk",
+        entry_points=(
+                       "repos/MuseTalk/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.30,<1", "transformers>=4.44,<5", "accelerate",
+        requirements=("diffusers>=0.30,<0.33", "transformers>=4.44,<4.50", "accelerate",
                       "opencv-python-headless", "numpy<2", "librosa==0.10.2",
                       "imageio[ffmpeg]", "einops", "omegaconf", "soundfile", "tqdm"),
         repos=(GitRepo("https://github.com/TMElyralab/MuseTalk.git", name="MuseTalk"),),
+        # MuseTalk loads both of these as directories - diffusers wants the VAE's
+        # safetensors beside its config, and transformers' AutoFeatureExtractor wants
+        # whisper's preprocessor_config.json. Single files left both looking half-present.
+        post_install=(hub_snapshot("stabilityai/sd-vae-ft-mse", "repos", "MuseTalk", "models",
+                                   "sd-vae", ignore=("*.ckpt", "*.bin")),
+                      hub_snapshot("openai/whisper-tiny", "repos", "MuseTalk", "models",
+                                   "whisper", ignore=("*.msgpack", "*.h5", "*.ot")),
+                      ("-c", MUSETALK_DWPOSE_PATCH)),
         weights=(
             WeightFile(dest="repos/MuseTalk/models/musetalkV15/unet.pth",
                        hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/unet.pth"),
             WeightFile(dest="repos/MuseTalk/models/musetalkV15/musetalk.json",
                        hf_repo="TMElyralab/MuseTalk", hf_file="musetalkV15/musetalk.json"),
-            WeightFile(dest="repos/MuseTalk/models/sd-vae/diffusion_pytorch_model.bin",
-                       hf_repo="stabilityai/sd-vae-ft-mse",
-                       hf_file="diffusion_pytorch_model.bin"),
-            WeightFile(dest="repos/MuseTalk/models/sd-vae/config.json",
-                       hf_repo="stabilityai/sd-vae-ft-mse", hf_file="config.json"),
-            WeightFile(dest="repos/MuseTalk/models/whisper/tiny.pt",
-                       hf_repo="openai/whisper-tiny", hf_file="pytorch_model.bin"),
             WeightFile(dest="repos/MuseTalk/models/dwpose/dw-ll_ucoco_384.pth",
                        hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.pth"),
         ),
+        hub_repos=("TMElyralab/MuseTalk", "stabilityai/sd-vae-ft-mse",
+                   "openai/whisper-tiny", "yzd-v/DWPose"),
         note="MIT, commercial use allowed. face-parse-bisent is Drive-hosted upstream; the "
-             "worker degrades to MuseTalk's own bbox path when it is absent.",
+             "worker degrades to MuseTalk's own bbox path when it is absent. DWPose is "
+             "patched out - MUSETALK_DWPOSE_PATCH says what that costs.",
     ),
 
     # --- SadTalker: audio -> 3DMM coefficients -> neural rendering -----------------------
     "sadtalker": EnvSpec(
         name="sadtalker",
+        entry_points=(
+                       "repos/SadTalker/inference.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "librosa==0.10.2", "imageio[ffmpeg]",
                       "scipy", "yacs", "pydub", "kornia", "face-alignment", "safetensors",
-                      "basicsr", "facexlib", "gfpgan", "tqdm"),
+                      # face_enhancer.py imports realesrgan and facerecon_model trimesh,
+                      # both at module scope - pytorch3d is only reached inside nvdiffrast's
+                      # functions, and it would have to be compiled, so it stays out
+                      "basicsr", "facexlib", "gfpgan", "realesrgan", "trimesh", "tqdm"),
         repos=(GitRepo("https://github.com/OpenTalker/SadTalker.git", name="SadTalker"),),
         post_install=(
             # basicsr 1.4.2 imports torchvision.transforms.functional_tensor, deprecated in
@@ -299,8 +787,8 @@ ENVS: Dict[str, EnvSpec] = {
             # the fix is to rewrite the import in the installed copy. Upstream basicsr is
             # unmaintained, so there is no release to upgrade to.
             ("-c", BASICSR_PATCH),
-            ("-c", "import subprocess,os;subprocess.run(['bash','scripts/download_models.sh'],"
-                   "cwd=os.path.join(os.environ['CSF_ENV_ROOT'],'repos','SadTalker'),check=True)"),
+            ("-c", SADTALKER_DOWNLOAD),
+            ("-c", SADTALKER_NUMPY_PATCH),
         ),
         hub_repos=(),   # its downloader pulls from GitHub Releases, not the Hub
         note="Apache-2.0 (non-commercial restriction was removed upstream). Its own "
@@ -310,9 +798,18 @@ ENVS: Dict[str, EnvSpec] = {
     # --- LivePortrait: implicit-keypoint animation + stitching/retargeting ---------------
     "liveportrait": EnvSpec(
         name="liveportrait",
+        entry_points=(
+                       "repos/LivePortrait/inference.py",
+        ),
         torch=TORCH_CU121,
+        # LivePortrait vendors its own copy of insightface under src/utils/dependencies,
+        # and that copy's arcface_onnx.py imports `onnx` itself - onnxruntime is a different
+        # distribution and does not provide it
         requirements=("opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "scipy", "tyro",
-                      "onnxruntime-gpu==1.18.1", "rich", "pyyaml", "albumentations", "tqdm"),
+                      "onnxruntime-gpu==1.18.1", "onnx", "requests", "rich", "pyyaml",
+                      # the vendored insightface's face_align imports skimage; src/utils/filter
+                      # smooths its keypoint tracks with pykalman
+                      "scikit-image", "pykalman", "albumentations", "tqdm"),
         repos=(GitRepo("https://github.com/KwaiVGI/LivePortrait.git", name="LivePortrait"),),
         post_install=(hub_snapshot("KlingTeam/LivePortrait",
                                    "repos", "LivePortrait", "pretrained_weights"),),
@@ -323,12 +820,33 @@ ENVS: Dict[str, EnvSpec] = {
     # --- VACE (Wan2.1): all-in-one masked video editing ---------------------------------
     "vace": EnvSpec(
         name="vace",
+        entry_points=(
+                       "repos/VACE/vace/vace_wan_inference.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops",
-                      "easydict", "ftfy", "regex", "omegaconf", "decord", "tqdm"),
+                      # VACE's annotators package is imported by vace_wan_inference.py and
+                      # opens with pycocotools, from upstream's annotator requirements
+                      # vace_wan_inference.py imports the annotators package, whose
+                      # __init__ imports every annotator - so depth (timm), mask (scipy,
+                      # skimage), dwpose (matplotlib, onnxruntime) and face (insightface) are
+                      # all reached at import time, not only when one is used
+                      "easydict", "ftfy", "regex", "omegaconf", "decord", "pycocotools",
+                      "matplotlib", "scipy", "scikit-image", "timm", "insightface==2.0",
+                      "tqdm"),
+        # `wan` is not derivable from the requirements, and neither is the fact that VACE
+        # dies on it at job time rather than build time - name it so a broken install fails
+        # here, where the error says which env and can be retried
+        verify_imports=("torch", "diffusers", "transformers", "cv2", "numpy", "einops",
+                        "decord", "wan", "onnxruntime", "insightface", "timm", "skimage"),
         repos=(GitRepo("https://github.com/ali-vilab/VACE.git", name="VACE"),),
-        post_install=(hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),),
+        post_install=(pip_install("--no-deps", WAN2_1_PACKAGE),
+                      ("-c", WAN_SDPA_PATCH),
+                      hub_snapshot("Wan-AI/Wan2.1-VACE-1.3B", "weights", "Wan2.1-VACE-1.3B"),
+                      # last: insightface drags the CPU runtime and full OpenCV in behind it
+                      onnxruntime_gpu_swap()),
         hub_repos=("Wan-AI/Wan2.1-VACE-1.3B",),
         note="Apache-2.0, ICCV 2025. One model covers masked object insertion/removal and "
              "prompt-driven V2V, so it fills several slots the document's models cannot.",
@@ -337,14 +855,45 @@ ENVS: Dict[str, EnvSpec] = {
     # --- DiffuEraser: diffusion video object removal --------------------------------------
     "diffueraser": EnvSpec(
         name="diffueraser",
+        entry_points=(
+                       "repos/DiffuEraser/run_diffueraser.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "opencv-python-headless", "numpy<2", "imageio[ffmpeg]", "einops", "av",
-                      "scipy", "tqdm"),
+                      # DiffuEraser bundles a copy of ProPainter, whose core/utils.py imports
+                      # matplotlib
+                      "scipy", "matplotlib", "tqdm"),
         repos=(GitRepo("https://github.com/lixiaowen-xw/DiffuEraser.git", name="DiffuEraser"),),
+        # its defaults are weights/{stable-diffusion-v1-5,sd-vae-ft-mse,diffuEraser,
+        # propainter}, and only the third was ever staged - the others resolved as Hub repo
+        # ids, which is why it 404'd on "weights/sd-vae-ft-mse"
         post_install=(hub_snapshot("lixiaowen/diffuEraser",
-                                   "repos", "DiffuEraser", "weights", "diffuEraser"),),
-        hub_repos=("lixiaowen/diffuEraser",),
+                                   "repos", "DiffuEraser", "weights", "diffuEraser"),
+                      hub_snapshot("stabilityai/sd-vae-ft-mse",
+                                   "repos", "DiffuEraser", "weights", "sd-vae-ft-mse",
+                                   ignore=("*.ckpt", "*.bin")),
+                      hub_snapshot("stable-diffusion-v1-5/stable-diffusion-v1-5",
+                                   "repos", "DiffuEraser", "weights",
+                                   "stable-diffusion-v1-5",
+                                   allow=("*.json", "*.txt", "*/*.safetensors"),
+                                   ignore=("*.ckpt", "*.bin", "*.pt"))),
+        weights=(
+            # the priori model is ProPainter, whose released weights we already fetch by URL
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/ProPainter.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/ProPainter.pth"),
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/raft-things.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/raft-things.pth"),
+            WeightFile(dest="repos/DiffuEraser/weights/propainter/"
+                            "recurrent_flow_completion.pth",
+                       url="https://github.com/sczhou/ProPainter/releases/download/"
+                           "v0.1.0/recurrent_flow_completion.pth"),
+        ),
+        hub_repos=("lixiaowen/diffuEraser", "stabilityai/sd-vae-ft-mse",
+                   "stable-diffusion-v1-5/stable-diffusion-v1-5"),
         note="Apache-2.0. Diffusion removal - a different artifact class from ProPainter's "
              "flow propagation, which is why it is worth a slot of its own.",
     ),
@@ -352,18 +901,42 @@ ENVS: Dict[str, EnvSpec] = {
     # --- DreamID-V: DiT video face swapping ----------------------------------------------
     "dreamid": EnvSpec(
         name="dreamid",
+        entry_points=(
+                       "repos/DreamID-V/generate_dreamidv.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.49,<5", "accelerate", "safetensors",
+        # generate_dreamidv.py is the MediaPipe entry point (the alternative, _faster, wants
+        # DWPose ONNX models placed by hand), and it reaches mediapipe through the repo's own
+        # express_adaption package. dashscope is imported by the vendored prompt-extend module
+        # that the entry point loads at import time, whether or not prompt extension is used.
+        requirements=("diffusers>=0.31,<0.36", "transformers>=4.49,<4.50", "accelerate",
+                      "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
-                      "insightface==2.0", "easydict", "ftfy", "tqdm"),
+                      "insightface==2.0", "easydict", "ftfy", "tqdm",
+                      # `mediapipe<1` was not enough: 0.10.35 already ships only `modules`
+                      # and `tasks`, with neither the Solutions API mp_utils.py imports nor
+                      # the framework.formats draw_util.py needs. 0.10.21 is the newest
+                      # release whose cp312 wheel still carries both.
+                      # get_video_npy.py imports IPython.display; the vendored wan utils
+                      # read video with decord
+                      "mediapipe==0.10.21", "dashscope", "ipython", "decord"),
         # onnxruntime and cv2 arrive through the swap hook, not the requirements, so name them
         # explicitly - a swap that silently failed would otherwise pass the import check
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
-                        "cv2", "numpy", "huggingface_hub"),
+                        "cv2", "numpy", "mediapipe", "huggingface_hub"),
         repos=(GitRepo("https://github.com/bytedance/DreamID-V.git", name="DreamID-V"),),
+        # Two checkpoints, not one: DreamID-V ships only its own DiT weights and borrows the
+        # VAE and T5 text encoder from the Wan2.1 1.3B release, which --ckpt_dir points at.
         post_install=(onnxruntime_gpu_swap(),
-                      hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V")),
-        hub_repos=("XuGuo699/DreamID-V",),
+                      hub_snapshot("XuGuo699/DreamID-V", "weights", "DreamID-V"),
+                      hub_snapshot("Wan-AI/Wan2.1-T2V-1.3B", "weights", "Wan2.1-T2V-1.3B")),
+        # the DWPose entry point reads these two from pose/models/ - upstream tells you to
+        # place them by hand, which is exactly the kind of step a build should not leave out
+        weights=(WeightFile(dest="repos/DreamID-V/pose/models/dw-ll_ucoco_384.onnx",
+                            hf_repo="yzd-v/DWPose", hf_file="dw-ll_ucoco_384.onnx"),
+                 WeightFile(dest="repos/DreamID-V/pose/models/yolox_l.onnx",
+                            hf_repo="yzd-v/DWPose", hf_file="yolox_l.onnx")),
+        hub_repos=("XuGuo699/DreamID-V", "Wan-AI/Wan2.1-T2V-1.3B", "yzd-v/DWPose"),
         note="Apache-2.0, Wan2.1-1.3B DiT. Reported 99.9% ID retrieval vs SimSwap's 95.24%, but "
              "it is a diffusion transformer, so roughly 20x SimSwap's cost per video.",
     ),
@@ -371,15 +944,22 @@ ENVS: Dict[str, EnvSpec] = {
     # --- REFace: diffusion face swapping --------------------------------------------------
     "reface": EnvSpec(
         name="reface",
+        entry_points=(
+                       "repos/REFace/scripts/inference.py",
+        ),
         torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "safetensors",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "safetensors",
                       "numpy<2", "imageio[ffmpeg]", "einops",
+                      # scripts/inference.py carries the Stable Diffusion scaffolding:
+                      # OpenAI's CLIP package (not on PyPI) and invisible-watermark
                       "omegaconf", "pytorch-lightning", "kornia", "insightface==2.0",
+                      "git+https://github.com/openai/CLIP.git", "invisible-watermark",
                       "tqdm"),
         verify_imports=("torch", "diffusers", "transformers", "insightface", "onnxruntime",
                         "cv2", "numpy", "omegaconf", "huggingface_hub"),
         repos=(GitRepo("https://github.com/Sanoojan/REFace.git", name="REFace"),),
-        post_install=(onnxruntime_gpu_swap(),),
+        post_install=(onnxruntime_gpu_swap(), ("-c", REFACE_BATCH_PATCH)),
         weights=(WeightFile(dest="repos/REFace/checkpoints/last.ckpt",
                             hf_repo="Sanoojan/REFace", hf_file="last.ckpt"),),
         note="LICENCE WARNING: MIT code, but trained on CelebAMask-HQ, which restricts use to "
@@ -390,15 +970,28 @@ ENVS: Dict[str, EnvSpec] = {
     # --- Thin-Plate-Spline Motion Model: reenactment ---------------------------------------
     "tpsmm": EnvSpec(
         name="tpsmm",
+        entry_points=(
+                       "repos/TPSMM/demo.py",
+        ),
         torch=TORCH_CU121,
         requirements=("opencv-python-headless", "numpy<2", "scikit-image", "imageio[ffmpeg]",
-                      "pyyaml", "scipy", "matplotlib", "tqdm"),
+                      "pyyaml", "scipy", "matplotlib", "tqdm",
+                      # demo.py imports face_alignment inside find_best_frame(), which the
+                      # worker asks for - the alignment it picks is what keeps the driving
+                      # pose from jumping on the first frame
+                      "face-alignment"),
         repos=(GitRepo("https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model.git",
                        name="TPSMM"),),
+        post_install=(("-c", TPSMM_FACE_ALIGNMENT_PATCH),),
         weights=(WeightFile(dest="repos/TPSMM/checkpoints/vox.pth.tar",
                             staged_name="vox.pth.tar",
                             where="https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model "
                                   "(Tsinghua Cloud / Google Drive link in the README)"),),
+        # face-alignment 1.4 puts its detector through torch.compile, and inductor then
+        # shells out to gcc to build a CUDA helper - which fails on a node with no libcuda to
+        # link against, taking the whole render with it. This model gains nothing from
+        # compilation; eager is both correct and available.
+        env_vars={"TORCHDYNAMO_DISABLE": "1"},
         note="MIT. The vox checkpoint is Tsinghua-Cloud/Drive hosted, so it is staged by hand.",
     ),
 
@@ -410,13 +1003,21 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/neuralchen/SimSwap.git", name="SimSwap"),),
         note="Weights (arcface + 512 checkpoint) are hosted on Google Drive / OneDrive upstream."),
     "stylegan": EnvSpec(
-        name="stylegan", torch=TORCH_CU121,
+        name="stylegan",
+        entry_points=(
+                       "repos/StyleGANEX/video_editing.py",
+        ), torch=TORCH_CU121,
         # `dlib` builds through cmake against Python.h. dlib-bin is the same library shipped
         # as manylinux wheels, so the env needs no compiler, no cmake and no python3-devel -
         # it installs `dlib` under the same import name.
         requirements=("opencv-python-headless", "numpy<2", "scipy", "ninja", "imageio[ffmpeg]",
-                      "dlib-bin", "tqdm"),
-        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib"),
+                      # psp.py imports matplotlib, the vendored lpips imports skimage, and
+                      # its base_model.py still has a debugging `from IPython import embed`
+                      # video_editing.py imports wget at module scope, whether or not it
+                      # needs to fetch anything (the build already places the predictor)
+                      "dlib-bin", "matplotlib", "scikit-image", "ipython", "wget", "tqdm"),
+        verify_imports=("torch", "cv2", "numpy", "scipy", "imageio", "dlib", "matplotlib",
+                        "skimage"),
         repos=(GitRepo("https://github.com/williamyang1991/StyleGANEX.git", name="StyleGANEX"),),
         weights=(
             # Upstream releases one checkpoint PER EDITING DIRECTION, not one "editing" model:
@@ -464,7 +1065,8 @@ ENVS: Dict[str, EnvSpec] = {
         repos=(GitRepo("https://github.com/RenYurui/PIRender.git", name="PIRender"),)),
     "anyv2v": EnvSpec(
         name="anyv2v", torch=TORCH_CU121,
-        requirements=("diffusers>=0.31,<1", "transformers>=4.44,<5", "accelerate", "opencv-python-headless",
+        requirements=("diffusers>=0.31,<0.33", "transformers>=4.44,<4.50", "accelerate",
+                      "opencv-python-headless",
                       "numpy<2", "imageio[ffmpeg]", "einops"),
         repos=(GitRepo("https://github.com/TIGER-AI-Lab/AnyV2V.git", name="AnyV2V"),)),
     "videocomposer": EnvSpec(
