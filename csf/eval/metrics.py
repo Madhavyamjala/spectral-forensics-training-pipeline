@@ -61,36 +61,57 @@ def latency_stats(latency_s: np.ndarray) -> Dict[str, float]:
 def classification_report_dict(y: np.ndarray, probs: np.ndarray, latency_s: Optional[np.ndarray] = None,
                                methods: Optional[Sequence[str]] = None, actions: Optional[np.ndarray] = None,
                                action_names: Optional[List[str]] = None, tool_cost_s: Optional[np.ndarray] = None,
-                               ece_bins: int = 15) -> Dict:
+                               ece_bins: int = 15, active_label_ids: Optional[Sequence[int]] = None) -> Dict:
+    """Compute quality, forensic, and efficiency metrics over the active label set.
+
+    Note:
+        Probability arrays remain canonical [Real, AI-Generated, AI-Edited], while macro metrics
+        can be restricted to the classes actually trained/evaluated in a subset run.
+
+    TODO:
+        Add a binary-only reporting helper for published two-class bundles.
+    """
     y = np.asarray(y).astype(int)
     probs = np.clip(np.asarray(probs, dtype=np.float64), 1e-9, 1.0)
-    probs = probs / probs.sum(1, keepdims=True)
-    pred = probs.argmax(1)
-    labels = list(range(len(LABELS)))
+    active = list(active_label_ids) if active_label_ids is not None else list(range(len(LABELS)))
+    if not active:
+        raise ValueError("active_label_ids must contain at least one class")
+    missing = sorted(set(np.unique(y).tolist()) - set(active))
+    if missing:
+        raise ValueError(f"Observed labels {missing} are outside active_label_ids={active}")
+    probs_active = probs[:, active]
+    probs_active = probs_active / probs_active.sum(1, keepdims=True)
+    local = {label_id: i for i, label_id in enumerate(active)}
+    y_local = np.asarray([local[int(v)] for v in y], dtype=int)
+    pred_local = probs_active.argmax(1)
+    pred = np.asarray([active[int(v)] for v in pred_local], dtype=int)
+    labels = list(range(len(active)))
 
-    p, r, f, s = precision_recall_fscore_support(y, pred, labels=labels, zero_division=0)
-    cm = confusion_matrix(y, pred, labels=labels)
-    onehot = np.eye(len(LABELS))[y]
+    p, r, f, s = precision_recall_fscore_support(y_local, pred_local, labels=labels, zero_division=0)
+    cm = confusion_matrix(y_local, pred_local, labels=labels)
+    onehot = np.eye(len(active))[y_local]
     out: Dict = {
         "n": int(len(y)),
-        "accuracy": float(accuracy_score(y, pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        "accuracy": float(accuracy_score(y_local, pred_local)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_local, pred_local)),
         "macro_precision": float(p.mean()), "macro_recall": float(r.mean()), "macro_f1": float(f.mean()),
-        "weighted_f1": float(f1_score(y, pred, average="weighted", zero_division=0)),
-        "mcc": float(matthews_corrcoef(y, pred)),
-        "cohen_kappa": float(cohen_kappa_score(y, pred)),
-        "roc_auc_ovr_macro": _safe(roc_auc_score, onehot, probs, average="macro", multi_class="ovr"),
-        "pr_auc_macro": _safe(average_precision_score, onehot, probs, average="macro"),
-        "log_loss": _safe(log_loss, y, probs, labels=labels),
-        "brier": float(np.mean([brier_score_loss(onehot[:, k], probs[:, k]) for k in labels])),
-        "ece": expected_calibration_error(y, probs, ece_bins),
-        "per_class": {LABELS[k]: {"precision": float(p[k]), "recall": float(r[k]), "f1": float(f[k]),
+        "weighted_f1": float(f1_score(y_local, pred_local, average="weighted", zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_local, pred_local)),
+        "cohen_kappa": float(cohen_kappa_score(y_local, pred_local)),
+        "roc_auc_ovr_macro": _safe(roc_auc_score, onehot, probs_active, average="macro", multi_class="ovr"),
+        "pr_auc_macro": _safe(average_precision_score, onehot, probs_active, average="macro"),
+        "log_loss": _safe(log_loss, y_local, probs_active, labels=labels),
+        "brier": float(np.mean([brier_score_loss(onehot[:, k], probs_active[:, k]) for k in labels])),
+        "ece": expected_calibration_error(y_local, probs_active, ece_bins),
+        "per_class": {LABELS[active[k]]: {"precision": float(p[k]), "recall": float(r[k]), "f1": float(f[k]),
                                   "support": int(s[k]),
-                                  "roc_auc": _safe(roc_auc_score, onehot[:, k], probs[:, k]),
-                                  "pr_auc": _safe(average_precision_score, onehot[:, k], probs[:, k])}
+                                  "roc_auc": _safe(roc_auc_score, onehot[:, k], probs_active[:, k]),
+                                  "pr_auc": _safe(average_precision_score, onehot[:, k], probs_active[:, k])}
                       for k in labels},
         "confusion_matrix": cm.tolist(),
         "confusion_matrix_normalized": (cm / np.maximum(cm.sum(1, keepdims=True), 1)).round(4).tolist(),
+        "active_label_ids": active,
+        "active_labels": [LABELS[i] for i in active],
     }
 
     fake_true = y != REAL
@@ -109,7 +130,7 @@ def classification_report_dict(y: np.ndarray, probs: np.ndarray, latency_s: Opti
         "generated_as_edited_rate": float(((y == generated) & (pred == edited)).sum() / max((y == generated).sum(), 1)),
     }
 
-    if methods is not None:
+    if methods is not None and edited in active:
         methods = np.asarray(methods).astype(str)
         per_method = {}
         for m in sorted(set(methods[y == edited])):
