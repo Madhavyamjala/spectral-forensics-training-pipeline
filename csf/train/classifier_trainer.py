@@ -43,9 +43,13 @@ log = get_logger("train.classifier")
 
 def make_collator(kind: str, processor, cfg: Config, train: bool):
     if kind == "qwen":
-        return QwenCollator(processor)
+        labels = [cfg.data.active_label_ids()[i] for i in range(len(cfg.data.active_label_ids()))]
+        from csf import PRETTY_LABELS
+        return QwenCollator(processor, [PRETTY_LABELS[list(PRETTY_LABELS)[i]] if False else PRETTY_LABELS[cfg.data.classes[j]] for j, i in enumerate(cfg.data.active_label_ids())] if cfg.data.classes else [PRETTY_LABELS[x] for x in LABELS])
     tool_dropout = cfg.train.llama.tool_dropout if train else 0.0
-    return LlamaCollator(processor, cfg.data.mosaic_frames, cfg.data.mosaic_size, tool_dropout=tool_dropout)
+    class_names = [PRETTY_LABELS[c] for c in (cfg.data.classes or ["real", "ai_generated", "ai_edited"])]
+    return LlamaCollator(processor, cfg.data.mosaic_frames, cfg.data.mosaic_size, tool_dropout=tool_dropout,
+                         class_names=class_names)
 
 
 def _move(batch: Dict[str, Any], device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
