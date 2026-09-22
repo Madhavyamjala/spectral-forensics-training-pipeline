@@ -126,7 +126,14 @@ def all_assets(cfg, stage: str = "all") -> List[HubAsset]:
     rather than downloading them twice.
     """
     merged: Dict[str, HubAsset] = {}
-    for a in training_assets(cfg) + generation_assets() + dataset_assets(cfg):
+    candidates = training_assets(cfg) + generation_assets() + dataset_assets(cfg)
+    # Filter by stage BEFORE merging. The merge widens a shared repo's download to the union of
+    # what each side wants, and the SVD video generator wants the whole repo - so a train-only
+    # prefetch that merged first inherited it and pulled ~20 GB of UNet and image encoder, when the
+    # DIRE tool needs only the VAE subfolder.
+    if stage != "all":
+        candidates = [a for a in candidates if a.stage == stage]
+    for a in candidates:
         prior = merged.get(a.repo_id)
         if prior is None:
             merged[a.repo_id] = a
