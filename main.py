@@ -299,7 +299,7 @@ def main() -> int:
         if args.latencynum < 1:
             raise SystemExit("--latencynum must be >= 1")
         cfg.eval.latency_samples = args.latencynum
-        if "latency" not in selected and not args.tooldependency:
+        if "latency" not in selected and "tooldependency" not in selected:
             selected.append("latency")
     if args.tooldependency and "tooldependency" not in selected:
         selected.append("tooldependency")
@@ -342,7 +342,7 @@ def main() -> int:
     with stage("preflight", work_dir, dist_info.rank):
         if dist_info.is_main:
             preflight(cfg, dist_info, log, selected)
-            if any(s in selected for s in ("train_llama", "outcomes", "latency")):
+            if any(s in selected for s in ("train_llama", "outcomes", "latency", "tooldependency")):
                 check_gated_access(cfg.models.llama_id, log)
         barrier()
 
