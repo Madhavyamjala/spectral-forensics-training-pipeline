@@ -440,6 +440,24 @@ prepare -> features -> train_qwen -> train_llama -> predict_scanner -> outcomes
 - **Re-running the same command resumes.** Completed stages are skipped, and feature extraction skips videos
   already cached. Training resumes from `checkpoints/<model>/last` with its optimiser and scheduler state.
 - Run specific stages with `--stage train_llama,outcomes`. Redo a finished stage with `--force train_llama`.
+
+### Raw-video latency and tool-dependency benchmarks
+
+The live benchmarks operate on the held-out **test split** after training and use the exported bundle. They do not rebuild the feature cache. Use `--latencynum N` to request exactly N raw test videos; the latency stage checks `paths.video_dir` and downloads only missing test videos from the dataset Hub. Existing files are reused, so raising a previous 100-video run to 1,000 fetches only the additional files.
+
+```bash
+# benchmark 1,000 held-out videos
+python full_2class.py --stage latency --latencynum 1000
+
+# same latency benchmark plus the paired tool-dependency experiment
+python full_2class.py --stage latency --latencynum 1000 --tooldependency
+```
+
+`--latencynum` also forces the latency stage to rerun. `--tooldependency` runs every subset of the three forensic domains on the same videos: no tools, spatial, spectral, latent, each pair, and all three. It records the full classification/calibration/latency metrics in `metrics/tool_dependency_benchmark.json`. A `static_reference` row is also included for the all-tool Llama pass without cached vision-state reuse.
+
+Because there are three forensic tool domains (`spatial`, `spectral`, `latent`), **all three = all forensic tools**; the benchmark therefore reports both the fixed three-tool condition (`all_tools`) and the full static reference as separate conditions. Patch-proposal time is reported separately as common toolpool overhead.
+
+The regular live benchmark remains in `metrics/latency_benchmark.json` and reports scanner, static arbiter, and each learned CSF profile. Re-run `export` after latency/dependency benchmarking if you want the updated metric files copied into the publishable export bundle.
 - Override any config value with `--set section.key=value`, for example `--set data.max_rows=2000`.
 - **Generation resumes at job level.** `generate` keeps an append-only ledger (`generation.ledger`).
   A job that succeeded is never re-run; a job that *failed* is retried on the next run, up to
