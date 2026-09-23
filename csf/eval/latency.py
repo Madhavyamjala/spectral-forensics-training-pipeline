@@ -273,7 +273,6 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
     from csf.distributed import all_gather_objects
     from csf.eval.metrics import classification_report_dict
     from csf.graph import normalize_features
-    from csf.models.dispatcher import action_mask_array
     from csf.inference import CSFDetector
 
     if not videos:
@@ -335,7 +334,10 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
             else "spectral_latent" if set(groups) == {"spectral", "latent"}
             else groups[0]
         )
-        mask = action_mask_array(action) & res.mask
+        # The dependency benchmark supports every subset, including spatial+latent and
+        # spectral+latent, which are intentionally not dispatcher actions. Build the mask directly
+        # from the requested groups instead of routing through ACTION_GROUPS.
+        mask = np.array([g in groups for g in ("spatial", "spectral", "latent")], dtype=bool) & res.mask
         z = normalize_features(res.features, det.stats)
         p, arbiter_s = det.runner.cached_pass(
             [{"frames": vlm, "z": z, "mask": mask, "label": 0, "key": "video"}],
