@@ -271,6 +271,31 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
     """
     from csf import LABEL2ID, PRETTY_LABELS
     from csf.distributed import all_gather_objects
+
+    label_aliases = {
+        "Real": "real",
+        "AI-Generated": "ai_generated",
+        "AI-Edited": "ai_edited",
+        "real": "real",
+        "ai_generated": "ai_generated",
+        "ai_edited": "ai_edited",
+    }
+
+    def canonical_label(label: str) -> str:
+        """Normalize canonical and pretty labels before metric computation.
+
+        Note:
+            The main pipeline passes display labels into live benchmarks, while the metric
+            functions use canonical dataset labels. Accepting both forms prevents a formatting
+            layer from breaking the benchmark.
+
+        TODO:
+            Replace string aliases with a shared label-normalization helper in csf.labels.
+        """
+        try:
+            return label_aliases[label]
+        except KeyError as exc:
+            raise ValueError(f"Unknown benchmark label {label!r}; expected {sorted(label_aliases)}") from exc
     from csf.eval.metrics import classification_report_dict
     from csf.graph import normalize_features
     from csf.inference import CSFDetector
@@ -373,8 +398,8 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
             )
             rows[name].append({
                 "video": str(video_path),
-                "label": label,
-                "label_id": LABEL2ID[label],
+                "label": canonical_label(label),
+                "label_id": LABEL2ID[canonical_label(label)],
                 "probs": probs.tolist(),
                 "predicted": PRETTY_LABELS[int(np.argmax(probs))],
                 "total_latency_ms": total_s * 1000.0,
@@ -394,8 +419,8 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
         )
         static_rows.append({
             "video": str(video_path),
-            "label": label,
-            "label_id": LABEL2ID[label],
+            "label": canonical_label(label),
+            "label_id": LABEL2ID[canonical_label(label)],
             "probs": p[0].tolist(),
             "predicted": PRETTY_LABELS[int(np.argmax(p[0]))],
             "total_latency_ms": (decode_s + tool_total_s + arbiter_s) * 1000.0,
