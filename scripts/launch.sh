@@ -30,7 +30,7 @@ for arg in "$@"; do
   fi
 done
 TOOLDEP_ONLY=0
-if [[ "$STAGE_ARG" == "tooldependency" && "$*" != *"latency"* ]]; then
+if [[ "$STAGE_ARG" == "tooldependency" ]]; then
   TOOLDEP_ONLY=1
 fi
 
