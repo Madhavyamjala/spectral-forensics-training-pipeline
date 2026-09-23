@@ -508,34 +508,48 @@ def main() -> int:
 
     if should_run("latency"):
         with stage("latency", work_dir, dist_info.rank):
+            from csf import PRETTY_LABELS
+            from csf.eval.latency import ensure_latency_videos, live_latency_benchmark
+
             if dist_info.is_main:
-                from csf import PRETTY_LABELS
-                from csf.eval.latency import ensure_latency_videos, live_latency_benchmark, tool_dependency_benchmark
+                ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            barrier()
 
-                rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
-                vids = [Path(p) for p in rows["video_path"]]
-                labs = [PRETTY_LABELS[c] for c in rows["class"]]
+            rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            vids = [Path(p) for p in rows["video_path"]]
+            labs = [PRETTY_LABELS[c] for c in rows["class"]]
 
-                live_latency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
+            live_latency_benchmark(
+                cfg, export_dir, vids, labs, resident=cfg.mode == "full", dist_info=dist_info
+            )
+            if dist_info.is_main:
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
+            barrier()
             mark("latency", latency_samples=int(cfg.eval.latency_samples))
 
     if should_run("tooldependency"):
         with stage("tooldependency", work_dir, dist_info.rank):
+            from csf import PRETTY_LABELS
+            from csf.eval.latency import ensure_latency_videos, tool_dependency_benchmark
+
+            if not export_dir.exists():
+                raise RuntimeError(
+                    "Export bundle is missing. Run python full_2class.py --stage export first."
+                )
             if dist_info.is_main:
-                from csf import PRETTY_LABELS
-                from csf.eval.latency import ensure_latency_videos, tool_dependency_benchmark
+                ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            barrier()
 
-                if not export_dir.exists():
-                    raise RuntimeError(
-                        "Export bundle is missing. Run python full_2class.py --stage export first."
-                    )
-                rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
-                vids = [Path(p) for p in rows["video_path"]]
-                labs = [PRETTY_LABELS[c] for c in rows["class"]]
+            rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            vids = [Path(p) for p in rows["video_path"]]
+            labs = [PRETTY_LABELS[c] for c in rows["class"]]
 
-                tool_dependency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
+            tool_dependency_benchmark(
+                cfg, export_dir, vids, labs, resident=cfg.mode == "full", dist_info=dist_info
+            )
+            if dist_info.is_main:
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
+            barrier()
             mark("tooldependency", latency_samples=int(cfg.eval.latency_samples))
 
     if should_run("report"):
