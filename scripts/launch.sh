@@ -17,6 +17,28 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 GPUS=$("$PY" -c "import torch; print(torch.cuda.device_count())")
 echo "==> Config $CONFIG | GPUs detected: $GPUS"
+
+# The tool-dependency benchmark is intentionally single-GPU: it is an exhaustive fixed-subset
+# ablation, not a training job. Avoid starting unused distributed workers when it is requested
+# as the only stage. Latency remains multi-GPU when launched normally.
+STAGE_ARG=""
+for arg in "$@"; do
+  if [[ "$arg" == "--stage" ]]; then
+    STAGE_ARG="__NEXT__"
+  elif [[ "$STAGE_ARG" == "__NEXT__" ]]; then
+    STAGE_ARG="$arg"
+  fi
+done
+TOOLDEP_ONLY=0
+if [[ "$STAGE_ARG" == "tooldependency" && "$*" != *"latency"* ]]; then
+  TOOLDEP_ONLY=1
+fi
+
+if [[ "$TOOLDEP_ONLY" -eq 1 ]]; then
+  echo "==> tooldependency stage: single-GPU mode"
+  exec "$PY" main.py --config "$CONFIG" "$@"
+fi
+
 if [[ "$GPUS" -gt 1 ]]; then
   mkdir -p runs/torchrun_logs
   exec "$PY" -m torch.distributed.run --standalone --nproc_per_node="$GPUS" \
