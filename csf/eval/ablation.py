@@ -335,6 +335,16 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
 
 def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray,
                  extra: Dict[str, Any]) -> Path:
+    """Write the subset-aware ablation report and its tabular summary.
+
+    Note:
+        active_ids must be derived here as well as in evaluation because this function owns
+        the report tables and is called directly by the pipeline.
+
+    TODO:
+        Add a focused report-generation regression test.
+    """
+    active_ids = cfg.data.active_label_ids()
     mdir = cfg.work_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
     (mdir / "ablation_metrics.json").write_text(json.dumps({"models": results, **extra}, indent=2, default=float),
