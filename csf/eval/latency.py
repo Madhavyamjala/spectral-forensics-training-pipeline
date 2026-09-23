@@ -146,22 +146,44 @@ def _free():
         torch.cuda.empty_cache()
 
 
+
 def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], labels: List[str],
-                           resident: bool) -> Dict[str, Any]:
+                           resident: bool, dist_info=None) -> Dict[str, Any]:
+    """Run live latency benchmarking, optionally sharded across all distributed ranks.
+
+    Note:
+        With multiple ranks, every GPU loads the exported components and benchmarks a disjoint
+        subset of the same held-out videos. Rank 0 gathers per-video records and writes the single
+        consolidated JSON. A progress bar is shown independently for each GPU.
+
+    TODO:
+        Add a rank-0 aggregate progress monitor that reports one global bar instead of per-rank bars.
+    """
     from csf.inference import CSFDetector
+    from csf.distributed import all_gather_objects
+
     if not videos:
-        log.warning("No kept raw videos found for the live latency benchmark - skipped.")
+        log.warning("No raw videos supplied for the live latency benchmark - skipped.")
         return {}
-    warm = min(cfg.eval.latency_warmup, len(videos))
+
+    rank = getattr(dist_info, "rank", 0)
+    world_size = getattr(dist_info, "world_size", 1)
+    local_videos = videos[rank::world_size]
+    local_labels = labels[rank::world_size]
+    warm = min(cfg.eval.latency_warmup, len(local_videos))
     records: Dict[str, List[Dict[str, Any]]] = {}
+
+    from tqdm import tqdm
 
     def run(det, mode, profile=None, scanner=None):
         key = mode if mode != "agentic" else f"agentic_{profile}"
         for w in range(warm):
-            det.predict(str(videos[w]), mode, profile or "balanced",
+            det.predict(str(local_videos[w]), mode, profile or "balanced",
                         scanner_probs=None if scanner is None else scanner[w]["probs_arr"])
         recs = []
-        for i, v in enumerate(videos):
+        bar = tqdm(local_videos, desc=f"latency r{rank} {key}", unit="video",
+                   position=rank, leave=True, disable=False, dynamic_ncols=True)
+        for i, v in enumerate(bar):
             set_context(latency_mode=key, video=str(v))
             r = det.predict(str(v), mode, profile or "balanced",
                             scanner_probs=None if scanner is None else scanner[i]["probs_arr"])
@@ -170,9 +192,10 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
                 r["total_latency_ms"] = round(sum(r["latency_ms"].values()), 2)
             r.pop("evidence_graph", None)
             recs.append(r)
+        bar.close()
         records[key] = recs
-        log.info("live latency %-22s p50 %.1f ms over %d videos", key,
-                 float(np.median([r["total_latency_ms"] for r in recs])), len(recs))
+        log.info("live latency %-22s r%d p50 %.1f ms over %d local videos",
+                 key, rank, float(np.median([r["total_latency_ms"] for r in recs])), len(recs))
 
     if resident:
         det = CSFDetector(str(export_dir), components=("qwen", "llama", "vae"),
@@ -199,16 +222,29 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
         del det
     _free()
 
+    if world_size > 1:
+        gathered = all_gather_objects(records)
+        merged: Dict[str, List[Dict[str, Any]]] = {}
+        for part in gathered:
+            for key, recs in part.items():
+                merged.setdefault(key, []).extend(recs)
+        records = merged
+
+    if rank != 0 and world_size > 1:
+        return {}
+
     summary: Dict[str, Any] = {"n_videos": len(videos), "resident_models": resident}
     for key, recs in records.items():
-        totals = np.array([r["total_latency_ms"] for r in recs]) / 1000.0
+        totals = np.array([r["total_latency_ms"] for r in recs], dtype=np.float64) / 1000.0
         comp = {}
         for r in recs:
             for k, v in r["latency_ms"].items():
                 comp.setdefault(k, []).append(v)
         summary[key] = {**latency_stats(totals),
                         "component_ms_mean": {k: float(np.mean(v)) for k, v in comp.items()},
-                        "accuracy_on_benchmark_videos": float(np.mean([r["label"] == l for r, l in zip(recs, labels)])),
+                        "accuracy_on_benchmark_videos": float(
+                            np.mean([r["label"] == l for r, l in zip(recs, labels)])
+                        ),
                         "actions": [r["action"] for r in recs]}
     path = cfg.work_dir / "metrics" / "latency_benchmark.json"
     path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -219,23 +255,23 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
 
 
 def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], labels: List[str],
-                              resident: bool) -> Dict[str, Any]:
-    """Benchmark predictions and latency for fixed forensic-tool subsets on the same videos.
+                              resident: bool, dist_info=None) -> Dict[str, Any]:
+    """Benchmark every fixed subset of the three forensic tool domains across all available GPUs.
 
     Note:
-        Each measured video is decoded once and passed through Qwen plus the Llama no-tool state
-        once. Those common computations are reused conceptually across every tool condition; only
-        the requested tool groups and cached arbiter pass are changed. This isolates tool dependence
-        without multiplying the expensive VLM work by the number of subsets.
+        Each GPU receives a disjoint subset of the same held-out videos, so the expensive Qwen,
+        Llama, and VAE work is parallelized. The benchmark remains paired because every condition
+        is evaluated on the same video set. Progress is shown per GPU.
 
     TODO:
         Add bootstrap confidence intervals and paired per-video significance tests.
     """
     from csf import LABEL2ID, PRETTY_LABELS
-    from csf.inference import CSFDetector
+    from csf.distributed import all_gather_objects
     from csf.eval.metrics import classification_report_dict
     from csf.graph import normalize_features
     from csf.models.dispatcher import action_mask_array
+    from csf.inference import CSFDetector
 
     if not videos:
         log.warning("No videos supplied for the tool dependency benchmark - skipped.")
@@ -243,7 +279,6 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
     if len(videos) != len(labels):
         raise ValueError(f"videos/labels length mismatch: {len(videos)} vs {len(labels)}")
 
-    # Every subset of the three forensic domains, plus a static full-tool reference.
     conditions: Dict[str, Tuple[str, ...]] = {
         "no_tools": (),
         "spatial": ("spatial",),
@@ -254,7 +289,13 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
         "spectral_latent": ("spectral", "latent"),
         "all_tools": ("spatial", "spectral", "latent"),
     }
-    warm = min(cfg.eval.latency_warmup, len(videos))
+
+    rank = getattr(dist_info, "rank", 0)
+    world_size = getattr(dist_info, "world_size", 1)
+    local_indices = list(range(rank, len(videos), world_size))
+    local_videos = [videos[i] for i in local_indices]
+    local_labels = [labels[i] for i in local_indices]
+    warm = min(cfg.eval.latency_warmup, len(local_videos))
 
     det = CSFDetector(
         str(export_dir),
@@ -304,15 +345,20 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
             "proposal": proposal_s, "tools": tool_s, "arbiter": arbiter_s,
         }
 
-    # Warm the shared pipeline once; the measured pass below reuses one common decode/scanner/state
-    # per video and therefore does not repeat those costs across the subset conditions.
     for i in range(warm):
-        native, vlm, scanner_probs, p0, decode_s, scanner_s, state_s, cache = prepare(videos[i])
+        native, vlm, scanner_probs, p0, decode_s, scanner_s, state_s, cache = prepare(local_videos[i])
         for groups in conditions.values():
             subset_result(native, vlm, scanner_probs, p0, decode_s, scanner_s, state_s, cache, groups)
 
+    measured_units = len(conditions) + 1
+    total_local_units = len(local_videos) * measured_units
+    done_units = 0
+    from tqdm import tqdm
+    bar = tqdm(total=total_local_units, desc=f"tooldep r{rank}", unit="eval",
+               position=rank, leave=True, disable=False, dynamic_ncols=True)
+
     rows: Dict[str, List[Dict[str, Any]]] = {name: [] for name in conditions}
-    for video_path, label in zip(videos, labels):
+    for video_path, label in zip(local_videos, local_labels):
         native, vlm, scanner_probs, p0, decode_s, scanner_s, state_s, cache = prepare(video_path)
         for name, groups in conditions.items():
             set_context(tool_dependency=name, video=str(video_path))
@@ -328,19 +374,11 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
                 "total_latency_ms": total_s * 1000.0,
                 "components_s": components,
             })
+            bar.update(1)
+        bar.set_postfix(videos_done=len(rows["no_tools"]), refresh=False)
 
-    # Static reference: full toolpool + a fresh Llama vision pass, matching model type B.
     static_rows: List[Dict[str, Any]] = []
-    for i in range(warm):
-        native, vlm, _ = det.load_video(str(videos[i]))
-        res, _ = det.tools(native, conditions["all_tools"])
-        z = normalize_features(res.features, det.stats)
-        det.runner.pixel_pass(
-            [{"frames": vlm, "z": z, "mask": np.ones(3, dtype=bool),
-              "label": 0, "key": "video"}],
-            np.ones(3, dtype=bool),
-        )
-    for video_path, label in zip(videos, labels):
+    for video_path, label in zip(local_videos, local_labels):
         native, vlm, decode_s = det.load_video(str(video_path))
         res, tool_total_s = det.tools(native, conditions["all_tools"])
         z = normalize_features(res.features, det.stats)
@@ -348,23 +386,42 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
         p, _, arbiter_s, _ = det.runner.pixel_pass(
             [{"frames": vlm, "z": z, "mask": mask, "label": 0, "key": "video"}], mask
         )
-        proposal_s = float(res.times.get("proposal", 0.0))
-        tool_s = max(0.0, tool_total_s - proposal_s)
         static_rows.append({
             "video": str(video_path),
             "label": label,
             "label_id": LABEL2ID[label],
             "probs": p[0].tolist(),
             "predicted": PRETTY_LABELS[int(np.argmax(p[0]))],
-            "total_latency_ms": (decode_s + proposal_s + tool_s + arbiter_s) * 1000.0,
+            "total_latency_ms": (decode_s + tool_total_s + arbiter_s) * 1000.0,
             "components_s": {
-                "decode": decode_s, "proposal": proposal_s, "tools": tool_s, "arbiter": arbiter_s,
+                "decode": decode_s,
+                "proposal": float(res.times.get("proposal", 0.0)),
+                "tools": max(0.0, tool_total_s - float(res.times.get("proposal", 0.0))),
+                "arbiter": arbiter_s,
             },
         })
+        bar.update(1)
+    bar.close()
 
-    rows["static_reference"] = static_rows
+    local = {"rows": rows, "static_rows": static_rows}
+    if world_size > 1:
+        gathered = all_gather_objects(local)
+        all_rows: Dict[str, List[Dict[str, Any]]] = {name: [] for name in conditions}
+        all_static: List[Dict[str, Any]] = []
+        for part in gathered:
+            for name, recs in part["rows"].items():
+                all_rows[name].extend(recs)
+            all_static.extend(part["static_rows"])
+        rows = all_rows
+        rows["static_reference"] = all_static
+    else:
+        rows["static_reference"] = static_rows
+
     del det
     _free()
+
+    if rank != 0 and world_size > 1:
+        return {}
 
     summary: Dict[str, Any] = {
         "n_videos": len(videos),
@@ -381,10 +438,10 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
             for key, value in r["components_s"].items():
                 comp.setdefault(key, []).append(value)
 
-        active = conditions.get(name, conditions["all_tools"] if name == "static_reference" else ())
         metrics = classification_report_dict(
             y, probs, latency_s=lat_s, active_label_ids=cfg.data.active_label_ids()
         )
+        active = conditions.get(name, conditions["all_tools"] if name == "static_reference" else ())
         summary["conditions"][name] = {
             "tool_groups": list(active),
             "tool_count": len(active),
