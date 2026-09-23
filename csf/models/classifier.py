@@ -96,16 +96,34 @@ def load_backbone(model_id: str, quantization: str, skip_modules, device: torch.
     qc = _quant_config(quantization, dtype, skip_modules)
     if qc is not None:
         kwargs["quantization_config"] = qc
-    if device.type == "cuda":
-        kwargs["device_map"] = {"": device.index or 0}
+    if device.type == "cuda" and quantization != "none":
+        # Quantized bitsandbytes modules must be placed directly by Transformers/Accelerate.
+        # Use an explicit torch.device rather than a bare integer so CUDA_VISIBLE_DEVICES and
+        # torchrun local ranks cannot silently collapse every rank onto cuda:0.
+        kwargs["device_map"] = {"": device}
     log.info("Loading backbone %s | quantization=%s | dtype=%s | attn=%s | device=%s",
              model_id, quantization, dtype, attn_implementation, device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     try:
         model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=dtype, **kwargs)
     except TypeError:
         model = AutoModelForImageTextToText.from_pretrained(model_id, torch_dtype=dtype, **kwargs)
-    if device.type != "cuda":
+    if device.type == "cuda" and quantization == "none":
+        # Avoid device-map placement ambiguity for full-precision/bf16 models: load normally,
+        # then explicitly move the complete backbone to this rank's CUDA device.
         model.to(device)
+    elif device.type != "cuda":
+        model.to(device)
+
+    if device.type == "cuda":
+        # Fail immediately if a distributed inference worker did not receive a single-device model.
+        param_devices = {str(p.device) for p in model.parameters() if p.device.type != "meta"}
+        if param_devices and param_devices != {str(device)}:
+            raise RuntimeError(
+                f"Backbone {model_id} loaded on {sorted(param_devices)}, expected only {device}. "
+                "This usually means the model load ignored the local rank; check device_map/CUDA_VISIBLE_DEVICES."
+            )
     model.config.use_cache = False
     return model
 
