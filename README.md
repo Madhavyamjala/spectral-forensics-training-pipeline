@@ -449,11 +449,11 @@ The live benchmarks operate on the held-out **test split** after training and us
 # benchmark 1,000 held-out videos
 python full_2class.py --stage latency --latencynum 1000
 
-# same latency benchmark plus the paired tool-dependency experiment
-python full_2class.py --stage latency --latencynum 1000 --tooldependency
+# tool-dependency benchmark only
+python full_2class.py --stage tooldependency --latencynum 1000
 ```
 
-`--latencynum` also forces the latency stage to rerun. `--tooldependency` runs every subset of the three forensic domains on the same videos: no tools, spatial, spectral, latent, each pair, and all three. It records the full classification/calibration/latency metrics in `metrics/tool_dependency_benchmark.json`. A `static_reference` row is also included for the all-tool Llama pass without cached vision-state reuse.
+`--latencynum` also forces the latency stage to rerun. `tooldependency` is a standalone stage and runs every subset of the three forensic domains on the same videos: no tools, spatial, spectral, latent, each pair, and all three. It records the full classification/calibration/latency metrics in `metrics/tool_dependency_benchmark.json`. A `static_reference` row is also included for the all-tool Llama pass without cached vision-state reuse.
 
 Because there are three forensic tool domains (`spatial`, `spectral`, `latent`), **all three = all forensic tools**; the benchmark therefore reports both the fixed three-tool condition (`all_tools`) and the full static reference as separate conditions. Patch-proposal time is reported separately as common toolpool overhead.
 
