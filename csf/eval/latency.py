@@ -216,20 +216,22 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
     return summary
 
 
+
 def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], labels: List[str],
                               resident: bool) -> Dict[str, Any]:
-    """Benchmark the marginal cost and classification effect of every forensic-tool subset.
+    """Benchmark the causal-inference-style dependency of predictions on each tool subset.
 
     Note:
-        Every condition uses the same decoded video and the same Llama no-tool vision state.
-        Non-empty conditions then execute only their requested forensic groups and reuse those
-        cached vision states for the final arbiter pass. The benchmark reports all seven non-empty
-        subsets plus the no-tool condition.
+        This is a fixed-subset ablation, not a causal identification claim. Every condition uses
+        the same videos, Qwen scanner output, Llama no-tool dispatcher-state pass, and vision-state
+        cache. Only the requested forensic tool groups change. The static reference additionally
+        runs the all-tool Llama pass without cached vision states.
 
     TODO:
-        Add bootstrap confidence intervals for latency and accuracy in a later analysis pass.
+        Add bootstrap confidence intervals and paired per-video significance tests.
     """
-    from csf.inference import CSFDetector
+    from csf import LABELS, LABEL2ID
+    from csf.eval.metrics import classification_report_dict
     from csf.graph import normalize_features
     from csf.models.dispatcher import action_mask_array
 
@@ -237,28 +239,43 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
         log.warning("No videos supplied for the tool dependency benchmark - skipped.")
         return {}
 
+    if len(videos) != len(labels):
+        raise ValueError(f"videos/labels length mismatch: {len(videos)} vs {len(labels)}")
+
     warm = min(cfg.eval.latency_warmup, len(videos))
-    records = {name: [] for name in TOOL_DEPENDENCY_GROUPS}
+    conditions: Dict[str, Tuple[str, ...]] = {
+        "no_tools": (),
+        "spatial": ("spatial",),
+        "spectral": ("spectral",),
+        "latent": ("latent",),
+        "spatial_spectral": ("spatial", "spectral"),
+        "spatial_latent": ("spatial", "latent"),
+        "spectral_latent": ("spectral", "latent"),
+        "all_tools": ("spatial", "spectral", "latent"),
+    }
 
-    det = CSFDetector(str(export_dir), components=("llama", "vae"),
-                      attn_implementation=cfg.models.attn_implementation)
+    det = CSFDetector(
+        str(export_dir),
+        components=("qwen", "llama", "vae"),
+        attn_implementation=cfg.models.attn_implementation,
+    )
 
-    def run_video(video_path: Path, groups: Sequence[str]):
+    def evaluate_one(video_path: Path, groups: Sequence[str]) -> Tuple[np.ndarray, float, Dict[str, float]]:
         native, vlm, decode_s = det.load_video(str(video_path))
+
+        scanner_probs, scanner_s = det.scan(vlm)
         empty_mask = np.zeros(3, dtype=bool)
-        _, _, base_s, cache = det.runner.pixel_pass(
+        p0, _, state_s, cache = det.runner.pixel_pass(
             [{"frames": vlm, "z": np.zeros(len(det.stats["mean"]), np.float32),
               "mask": empty_mask, "label": 0, "key": "video"}],
             empty_mask,
         )
+
         if not groups:
-            probs = det.runner.pixel_pass(
-                [{"frames": vlm, "z": np.zeros(len(det.stats["mean"]), np.float32),
-                  "mask": empty_mask, "label": 0, "key": "video"}],
-                empty_mask,
-            )[0][0]
-            return probs, decode_s + base_s, {
-                "decode": decode_s, "base_vision": base_s, "tools": 0.0, "arbiter": 0.0
+            probs = (scanner_probs + p0[0]) / 2.0
+            return probs, decode_s + scanner_s + state_s, {
+                "decode": decode_s, "scanner": scanner_s, "dispatcher_state": state_s,
+                "proposal": 0.0, "tools": 0.0, "arbiter": 0.0,
             }
 
         res, tool_s = det.tools(native, groups)
@@ -275,50 +292,94 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
             [{"frames": vlm, "z": z, "mask": mask, "label": 0, "key": "video"}],
             mask, cache,
         )
-        total = decode_s + base_s + tool_s + arbiter_s
+        total = decode_s + scanner_s + state_s + tool_s + arbiter_s
         return p[0], total, {
-            "decode": decode_s, "base_vision": base_s, "tools": tool_s, "arbiter": arbiter_s
+            "decode": decode_s, "scanner": scanner_s, "dispatcher_state": state_s,
+            "proposal": float(res.times.get("proposal", 0.0)),
+            "tools": tool_s - float(res.times.get("proposal", 0.0)),
+            "arbiter": arbiter_s,
         }
 
-    # Warm every condition once so the first measured sample does not include initial GPU setup.
-    for name, groups in TOOL_DEPENDENCY_GROUPS.items():
+    # Warmup each condition with the same first few videos.
+    for groups in conditions.values():
         for i in range(warm):
-            run_video(videos[i], groups)
+            evaluate_one(videos[i], groups)
 
-    for name, groups in TOOL_DEPENDENCY_GROUPS.items():
+    rows: Dict[str, List[Dict[str, Any]]] = {name: [] for name in conditions}
+    for name, groups in conditions.items():
         set_context(tool_dependency=name)
         for video_path, label in zip(videos, labels):
-            probs, total_s, components = run_video(video_path, groups)
-            records[name].append({
-                "video": str(video_path), "label": label,
+            probs, total_s, components = evaluate_one(video_path, groups)
+            rows[name].append({
+                "video": str(video_path),
+                "label": label,
+                "label_id": LABEL2ID[label],
+                "probs": probs.tolist(),
                 "predicted": PRETTY_LABELS[int(np.argmax(probs))],
                 "total_latency_ms": total_s * 1000.0,
                 "components_s": components,
             })
 
+    # Static full-tool reference: same raw videos, all tools, but no cached vision-state reuse.
+    static_rows: List[Dict[str, Any]] = []
+    static_groups = ("spatial", "spectral", "latent")
+    for i in range(warm):
+        native, vlm, _ = det.load_video(str(videos[i]))
+        res, _ = det.tools(native, static_groups)
+        mask = np.ones(3, dtype=bool)
+        z = normalize_features(res.features, det.stats)
+        det.runner.pixel_pass(
+            [{"frames": vlm, "z": z, "mask": mask, "label": 0, "key": "video"}], mask
+        )
+    for video_path, label in zip(videos, labels):
+        native, vlm, decode_s = det.load_video(str(video_path))
+        res, tool_s = det.tools(native, static_groups)
+        z = normalize_features(res.features, det.stats)
+        mask = np.ones(3, dtype=bool)
+        p, _, arbiter_s, _ = det.runner.pixel_pass(
+            [{"frames": vlm, "z": z, "mask": mask, "label": 0, "key": "video"}], mask
+        )
+        static_rows.append({
+            "video": str(video_path), "label": label, "label_id": LABEL2ID[label],
+            "probs": p[0].tolist(),
+            "predicted": PRETTY_LABELS[int(np.argmax(p[0]))],
+            "total_latency_ms": (decode_s + tool_s + arbiter_s) * 1000.0,
+            "components_s": {
+                "decode": decode_s,
+                "proposal": float(res.times.get("proposal", 0.0)),
+                "tools": tool_s - float(res.times.get("proposal", 0.0)),
+                "arbiter": arbiter_s,
+            },
+        })
+
+    rows["static_reference"] = static_rows
     del det
     _free()
 
     summary: Dict[str, Any] = {
         "n_videos": len(videos),
         "resident_models": bool(resident),
-        "design": "same held-out videos; Llama no-tool vision state reused across requested tool subsets",
+        "design": "paired fixed-tool-subset benchmark on the same held-out raw videos",
         "conditions": {},
     }
-    for name, recs in records.items():
-        totals = np.array([r["total_latency_ms"] for r in recs], dtype=np.float64) / 1000.0
-        comp = {}
+
+    for name, recs in rows.items():
+        probs = np.stack([np.asarray(r["probs"], dtype=np.float64) for r in recs])
+        y = np.asarray([r["label_id"] for r in recs], dtype=int)
+        lat_s = np.asarray([r["total_latency_ms"] for r in recs], dtype=np.float64) / 1000.0
+        comp: Dict[str, List[float]] = {}
         for r in recs:
             for k, v in r["components_s"].items():
                 comp.setdefault(k, []).append(v)
+
+        metrics = classification_report_dict(
+            y, probs, latency_s=lat_s, active_label_ids=cfg.data.active_label_ids()
+        )
         summary["conditions"][name] = {
-            "tool_groups": list(TOOL_DEPENDENCY_GROUPS[name]),
-            "tool_count": len(TOOL_DEPENDENCY_GROUPS[name]),
-            **latency_stats(totals),
+            "tool_groups": list(conditions.get(name, static_groups if name == "static_reference" else ())),
+            "tool_count": len(conditions.get(name, static_groups if name == "static_reference" else ())),
+            **metrics,
             "component_ms_mean": {k: float(np.mean(v) * 1000.0) for k, v in comp.items()},
-            "accuracy_on_benchmark_videos": float(
-                np.mean([r["predicted"] == r["label"] for r in recs])
-            ),
         }
 
     path = cfg.work_dir / "metrics" / "tool_dependency_benchmark.json"
