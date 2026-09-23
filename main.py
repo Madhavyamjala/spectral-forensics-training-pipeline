@@ -33,6 +33,8 @@ Multi-GPU:
 Options:
     --stage all | <stage>[,<stage>...]   run a subset (default all)
     --force <stage>[,<stage>...]         re-run stages even if marked complete in <work_dir>/state.json
+    --latencynum N                       benchmark exactly N held-out test videos; missing raw files are fetched
+    --tooldependency                     run the paired forensic-tool subset benchmark with the latency stage
     --set section.key=value              override any config value (repeatable)
 
 Input : YAML config (configs/*.yaml).
@@ -70,6 +72,10 @@ def parse_args():
     ap.add_argument("--config", required=True)
     ap.add_argument("--stage", default="all")
     ap.add_argument("--force", default="")
+    ap.add_argument("--latencynum", type=int, default=None,
+                    help="number of held-out test videos for the live latency/tool benchmarks")
+    ap.add_argument("--tooldependency", action="store_true",
+                    help="run the paired forensic-tool dependency benchmark during the latency stage")
     ap.add_argument("--set", action="append", default=[], dest="overrides")
     return ap.parse_args()
 
@@ -292,10 +298,20 @@ def main() -> int:
     seed_everything(cfg.seed + dist_info.rank)
 
     selected = STAGES if args.stage == "all" else [s.strip() for s in args.stage.split(",")]
+    if args.latencynum is not None:
+        if args.latencynum < 1:
+            raise SystemExit("--latencynum must be >= 1")
+        cfg.eval.latency_samples = args.latencynum
+        if "latency" not in selected:
+            selected.append("latency")
+    if args.tooldependency and "latency" not in selected:
+        selected.append("latency")
     unknown = [s for s in selected if s not in STAGES]
     if unknown:
         raise SystemExit(f"Unknown stage(s) {unknown}; choose from {STAGES}")
     forced = {s.strip() for s in args.force.split(",") if s.strip()}
+    if args.latencynum is not None or args.tooldependency:
+        forced.add("latency")
     state = RunState(work_dir)
 
     def should_run(name: str) -> bool:
@@ -492,16 +508,15 @@ def main() -> int:
         with stage("latency", work_dir, dist_info.rank):
             if dist_info.is_main:
                 from csf import PRETTY_LABELS
-                from csf.eval.latency import live_latency_benchmark
-                test = index[index["split"] == "test"].sort_values("video_id")
-                vids, labs = [], []
-                for cls, repo_path in zip(test["class"], test["repo_path"]):
-                    p = Path(cfg.paths.video_dir) / repo_path
-                    if p.exists():
-                        vids.append(p)
-                        labs.append(PRETTY_LABELS[cls])
-                vids, labs = vids[:cfg.eval.latency_samples], labs[:cfg.eval.latency_samples]
+                from csf.eval.latency import ensure_latency_videos, live_latency_benchmark, tool_dependency_benchmark
+
+                rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+                vids = [Path(p) for p in rows["video_path"]]
+                labs = [PRETTY_LABELS[c] for c in rows["class"]]
+
                 live_latency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
+                if args.tooldependency:
+                    tool_dependency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
             mark("latency")
 
