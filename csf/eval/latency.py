@@ -198,7 +198,8 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
                  key, rank, float(np.median([r["total_latency_ms"] for r in recs])), len(recs))
 
     if resident:
-        det = CSFDetector(str(export_dir), components=("qwen", "llama", "vae"),
+        det = CSFDetector(str(export_dir), device=str(getattr(dist_info, "device", "cuda:0")),
+                          components=("qwen", "llama", "vae"),
                           attn_implementation=cfg.models.attn_implementation)
         run(det, "scanner")
         run(det, "static")
@@ -206,14 +207,16 @@ def live_latency_benchmark(cfg: Config, export_dir: Path, videos: List[Path], la
             run(det, "agentic", p)
         del det
     else:
-        det = CSFDetector(str(export_dir), components=("qwen",), attn_implementation=cfg.models.attn_implementation)
+        det = CSFDetector(str(export_dir), device=str(getattr(dist_info, "device", "cuda:0")),
+                          components=("qwen",), attn_implementation=cfg.models.attn_implementation)
         run(det, "scanner")
         for r in records["scanner"]:
             r["probs_arr"] = np.array(list(r["probs"].values()), dtype=np.float32)
         scanner = records["scanner"]
         del det
         _free()
-        det = CSFDetector(str(export_dir), components=("llama", "vae"), attn_implementation=cfg.models.attn_implementation)
+        det = CSFDetector(str(export_dir), device=str(getattr(dist_info, "device", "cuda:0")),
+                          components=("llama", "vae"), attn_implementation=cfg.models.attn_implementation)
         run(det, "static")
         for p in cfg.eval.profiles:
             run(det, "agentic", p, scanner=scanner)
@@ -299,6 +302,7 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
 
     det = CSFDetector(
         str(export_dir),
+        device=str(getattr(dist_info, "device", "cuda:0")),
         components=("qwen", "llama", "vae"),
         attn_implementation=cfg.models.attn_implementation,
     )
