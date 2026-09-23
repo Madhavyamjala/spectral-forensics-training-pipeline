@@ -62,7 +62,7 @@ else:
 GENERATION_STAGES = ["prefetch", "kinetics", "generate", "regen_manifest", "push_dataset"]
 TRAINING_STAGES = [
     "prepare", "features", "train_qwen", "train_llama", "predict_scanner", "outcomes",
-    "train_dispatcher", "evaluate", "export", "latency", "report", "push"]
+    "train_dispatcher", "evaluate", "export", "latency", "tooldependency", "report", "push"]
 STAGES = GENERATION_STAGES + TRAINING_STAGES
 
 
@@ -75,7 +75,7 @@ def parse_args():
     ap.add_argument("--latencynum", type=int, default=None,
                     help="number of held-out test videos for the live latency/tool benchmarks")
     ap.add_argument("--tooldependency", action="store_true",
-                    help="run the paired forensic-tool dependency benchmark during the latency stage")
+                    help="run the separate forensic-tool dependency benchmark stage")
     ap.add_argument("--set", action="append", default=[], dest="overrides")
     return ap.parse_args()
 
@@ -299,16 +299,18 @@ def main() -> int:
         if args.latencynum < 1:
             raise SystemExit("--latencynum must be >= 1")
         cfg.eval.latency_samples = args.latencynum
-        if "latency" not in selected:
+        if "latency" not in selected and not args.tooldependency:
             selected.append("latency")
-    if args.tooldependency and "latency" not in selected:
-        selected.append("latency")
+    if args.tooldependency and "tooldependency" not in selected:
+        selected.append("tooldependency")
     unknown = [s for s in selected if s not in STAGES]
     if unknown:
         raise SystemExit(f"Unknown stage(s) {unknown}; choose from {STAGES}")
     forced = {s.strip() for s in args.force.split(",") if s.strip()}
-    if args.latencynum is not None or args.tooldependency:
+    if args.latencynum is not None and "latency" in selected:
         forced.add("latency")
+    if args.tooldependency:
+        forced.add("tooldependency")
     if dist_info.is_main:
         cfg.save(work_dir / "resolved_config.json")
 
@@ -515,11 +517,26 @@ def main() -> int:
                 labs = [PRETTY_LABELS[c] for c in rows["class"]]
 
                 live_latency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
-                if args.tooldependency:
-                    tool_dependency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
-            mark("latency", latency_samples=int(cfg.eval.latency_samples),
-                 tool_dependency=bool(args.tooldependency))
+            mark("latency", latency_samples=int(cfg.eval.latency_samples))
+
+    if should_run("tooldependency"):
+        with stage("tooldependency", work_dir, dist_info.rank):
+            if dist_info.is_main:
+                from csf import PRETTY_LABELS
+                from csf.eval.latency import ensure_latency_videos, tool_dependency_benchmark
+
+                if not export_dir.exists():
+                    raise RuntimeError(
+                        "Export bundle is missing. Run python full_2class.py --stage export first."
+                    )
+                rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+                vids = [Path(p) for p in rows["video_path"]]
+                labs = [PRETTY_LABELS[c] for c in rows["class"]]
+
+                tool_dependency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
+                shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
+            mark("tooldependency", latency_samples=int(cfg.eval.latency_samples))
 
     if should_run("report"):
         with stage("report", work_dir, dist_info.rank):
