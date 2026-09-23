@@ -77,7 +77,10 @@ class CSFDetector:
         if "qwen" in components:
             self.qwen, self.qwen_proc, _ = load_classifier(self.dir / "qwen_scanner", self.device, quantization,
                                                            attn_implementation=attn_implementation)
-            self.qwen_collate = QwenCollator(self.qwen_proc)
+            self.qwen_collate = QwenCollator(
+                self.qwen_proc,
+                [PRETTY_LABELS[LABELS[i]] for i in self.active_ids],
+            )
         if "llama" in components:
             from csf.pipeline import ArbiterRunner
             self.llama, proc, _ = load_classifier(self.dir / "llama_arbiter", self.device, quantization,
@@ -115,7 +118,8 @@ class CSFDetector:
         t = time.perf_counter()
         with torch.no_grad(), torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == "cuda"):
             logits, _ = self.qwen(**{k: v for k, v in batch.items() if k not in ("labels", "keys")})
-        probs = torch.softmax(logits.float(), -1)[0].cpu().numpy()
+        from csf.pipeline import _active_probs_from_logits
+        probs = _active_probs_from_logits(logits, self.active_ids)[0].cpu().numpy()
         self._sync()
         return probs, time.perf_counter() - t
 
