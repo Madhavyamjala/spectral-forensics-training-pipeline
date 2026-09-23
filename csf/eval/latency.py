@@ -232,6 +232,7 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
         Add bootstrap confidence intervals and paired per-video significance tests.
     """
     from csf import LABEL2ID, PRETTY_LABELS
+    from csf.inference import CSFDetector
     from csf.eval.metrics import classification_report_dict
     from csf.graph import normalize_features
     from csf.models.dispatcher import action_mask_array
