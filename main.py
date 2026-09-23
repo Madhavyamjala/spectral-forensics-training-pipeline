@@ -287,9 +287,6 @@ def main() -> int:
                     "into that list, not physical ids. generation.gpus=%s will be interpreted "
                     "that way too. Unset it if you meant physical ids.",
                     os.environ["CUDA_VISIBLE_DEVICES"], cfg.generation.gpus)
-    if dist_info.is_main:
-        cfg.save(work_dir / "resolved_config.json")
-
     import pandas as pd
     import torch
     if cfg.train.tf32 and torch.cuda.is_available():
@@ -312,6 +309,9 @@ def main() -> int:
     forced = {s.strip() for s in args.force.split(",") if s.strip()}
     if args.latencynum is not None or args.tooldependency:
         forced.add("latency")
+    if dist_info.is_main:
+        cfg.save(work_dir / "resolved_config.json")
+
     state = RunState(work_dir)
 
     def should_run(name: str) -> bool:
@@ -518,7 +518,8 @@ def main() -> int:
                 if args.tooldependency:
                     tool_dependency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
-            mark("latency")
+            mark("latency", latency_samples=int(cfg.eval.latency_samples),
+                 tool_dependency=bool(args.tooldependency))
 
     cleanup()
     if dist_info.is_main and "push" in selected:
