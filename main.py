@@ -62,7 +62,7 @@ else:
 GENERATION_STAGES = ["prefetch", "kinetics", "generate", "regen_manifest", "push_dataset"]
 TRAINING_STAGES = [
     "prepare", "features", "train_qwen", "train_llama", "predict_scanner", "outcomes",
-    "train_dispatcher", "evaluate", "export", "latency", "push"]
+    "train_dispatcher", "evaluate", "export", "latency", "report", "push"]
 STAGES = GENERATION_STAGES + TRAINING_STAGES
 
 
@@ -520,6 +520,13 @@ def main() -> int:
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
             mark("latency", latency_samples=int(cfg.eval.latency_samples),
                  tool_dependency=bool(args.tooldependency))
+
+    if should_run("report"):
+        with stage("report", work_dir, dist_info.rank):
+            if dist_info.is_main:
+                from csf.eval.report import write_full_results_report
+                write_full_results_report(cfg, index)
+            mark("report")
 
     cleanup()
     if dist_info.is_main and "push" in selected:
