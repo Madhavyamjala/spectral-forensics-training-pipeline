@@ -345,8 +345,10 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
     def subset_result(native, vlm, scanner_probs, p0, decode_s, scanner_s, state_s, cache,
                       groups: Sequence[str]):
         if not groups:
-            probs = (scanner_probs + p0) / 2.0
-            return probs, decode_s + scanner_s + state_s, {
+            # Controlled zero-tool condition: use the same Llama no-tool arbiter state that the
+            # one-/two-/three-tool conditions start from. This keeps the classifier path fixed and
+            # isolates the effect of adding forensic evidence domains.
+            return p0, decode_s + scanner_s + state_s, {
                 "decode": decode_s, "scanner": scanner_s, "dispatcher_state": state_s,
                 "proposal": 0.0, "tools": 0.0, "arbiter": 0.0,
             }
