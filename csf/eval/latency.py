@@ -269,7 +269,7 @@ def tool_dependency_benchmark(cfg: Config, export_dir: Path, videos: List[Path],
     TODO:
         Add bootstrap confidence intervals and paired per-video significance tests.
     """
-    from csf import LABEL2ID, PRETTY_LABELS
+    from csf import LABEL2ID, LABELS, PRETTY_LABELS
     from csf.distributed import all_gather_objects
 
     label_aliases = {
