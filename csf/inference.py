@@ -61,7 +61,12 @@ class CSFDetector:
     def __init__(self, model_dir: str, device: Optional[str] = None, quantization: Optional[str] = None,
                  components: Iterable[str] = ("qwen", "llama", "vae"), attn_implementation: str = "sdpa"):
         self.dir = _resolve_dir(model_dir)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if device is not None:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            self.device = torch.device("cpu")
         self.dtype = compute_dtype_for(self.device)
         self.cfg = json.loads((self.dir / "csf_config.json").read_text(encoding="utf-8"))
         self.stats = json.loads((self.dir / "feature_stats.json").read_text(encoding="utf-8"))
