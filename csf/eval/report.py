@@ -239,6 +239,9 @@ def _dependency(lines: list[str], metrics_dir: Path) -> None:
             f"| {_ms(m.get('latency_ms_p50'))} | {_ms(m.get('latency_ms_p95'))} "
             f"| {_fmt(m.get('throughput_videos_per_s'), 2)} |"
         )
+        comps = m.get("component_ms_mean", {})
+        if comps:
+            lines.append("Component means (ms): " + ", ".join(f"{k}={_ms(v)}" for k, v in comps.items()))
     lines += [
         "",
         "The all_tools row contains spatial + spectral + latent. static_reference is the separate "
