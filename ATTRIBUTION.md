@@ -30,11 +30,26 @@ source. `csf/generation/upload.py` writes this attribution into the dataset card
 
 ## Model weights
 
-The manipulation models carry their own licences, which are not all the same. Two need attention:
+The manipulation models carry their own licences, which are not all the same. Three need
+attention:
 
 - **REFace** — code is MIT, but its checkpoint is trained on CelebAMask-HQ and is restricted to
   **non-commercial research**. Videos it generates inherit that restriction. Disabled unless
   `generation.accept_noncommercial: true`.
+- **InsightFace** — the library is MIT, but upstream states that *the pretrained models provided
+  with this library are for non-commercial research only, whether downloaded automatically or
+  manually*. That covers `buffalo_l` and `inswapper_128`, so it reaches further than one model:
+  the face-swap videos produced with INSwapper **and** the face / mouth qualification scores the
+  `kinetics` stage computes with `buffalo_l` both rest on non-commercial weights.
+- **Stable Diffusion 2.1 base (TokenFlow)** — `stabilityai/stable-diffusion-2-1-base` no longer
+  resolves on the Hub, so the pipeline pulls a community mirror
+  (`Manojb/stable-diffusion-2-1-base`) of the same checkpoint. It carries CreativeML Open RAIL++-M
+  like the original. Point `CSF_SD_ID` at a different source if you have one you trust more;
+  whatever renders is what the manifest records.
+- **Stable Diffusion 2.1 base (TokenFlow)** — `stabilityai/stable-diffusion-2-1-base` no longer
+  resolves on the Hub, so the pipeline pulls a community mirror of the same checkpoint
+  (`Manojb/stable-diffusion-2-1-base`), under the same CreativeML Open RAIL++-M licence. Point
+  `CSF_SD_ID` at another source if you prefer one; whatever renders is what the manifest records.
 - **Llama-3.2-11B-Vision-Instruct** — gated; accept the licence on its model page before use.
 
 `python -m csf.generation.adapters` lists every model with its environment and notes.

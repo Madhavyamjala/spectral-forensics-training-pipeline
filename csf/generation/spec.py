@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 # --------------------------------------------------------------------------------------
@@ -167,7 +168,7 @@ BACKGROUND = Family(
         SourceGroup("human_portrait", "Human / portrait / interaction", 600, (
             "answering questions", "applauding", "applying cream", "baby waking up", "crawling baby",
             "brushing hair", "brushing teeth", "getting a haircut", "laughing", "reading book",
-            "sign language interpreting", "singing", "sitting up")),
+            "sign language interpreting", "singing", "situp")),
         SourceGroup("sports_motion", "Sports / high-motion", 700, (
             "playing basketball", "catching or throwing baseball", "playing tennis", "playing volleyball",
             "playing kickball", "shooting goal (soccer)", "skateboarding", "skiing slalom",
@@ -231,7 +232,7 @@ FACE_SWAP = Family(
             "robot dancing", "krumping", "zumba")),
         SourceGroup("sports_motion", "Sports / high motion", 650, (
             "playing basketball", "playing tennis", "playing volleyball", "catching or throwing baseball",
-            "punching bag", "boxing", "skateboarding", "surfing water")),
+            "punching bag", "punching person (boxing)", "skateboarding", "surfing water")),
         SourceGroup("multi_person", "Multi-person / interaction", 400, (
             "hugging", "kissing", "celebrating", "shaking hands", "tickling", "arm wrestling",
             "shaking head", "applauding")),
@@ -392,23 +393,23 @@ OBJECT_EDIT = Family(
     source_groups=(
         SourceGroup("hand_object", "Hand / object interaction", 700, (
             "playing guitar", "playing piano", "playing violin", "playing drums", "playing cards",
-            "drawing", "painting", "knitting", "making jewelry", "folding paper")),
+            "drawing", "brush painting", "knitting", "making jewelry", "folding paper")),
         SourceGroup("cooking", "Cooking / food objects", 550, (
             "cooking chicken", "cooking egg", "cooking on campfire", "baking cookies", "cutting watermelon",
             "cutting pineapple", "eating burger", "eating cake", "eating hotdog", "eating ice cream",
             "eating spaghetti")),
         SourceGroup("tools", "Tools / mechanical objects", 450, (
             "welding", "assembling computer", "using computer", "pushing car", "pushing cart",
-            "repairing puncture", "changing oil", "changing wheel")),
+            "checking tires", "changing oil", "changing wheel")),
         SourceGroup("sports_equipment", "Sports equipment", 600, (
-            "playing basketball", "playing tennis", "playing golf", "playing volleyball", "punching bag",
+            "playing basketball", "playing tennis", "golf driving", "playing volleyball", "punching bag",
             "catching or throwing baseball", "skateboarding", "surfing water")),
         SourceGroup("animals_objects", "Animals / objects", 450, (
             "feeding birds", "feeding fish", "feeding goats", "grooming horse", "milking cow",
             "petting cat", "walking the dog", "training dog")),
         SourceGroup("vehicles", "Vehicles / transportation", 400, (
             "driving car", "riding a bike", "motorcycling", "riding scooter", "riding mountain bike",
-            "riding a segway", "sailing", "canoeing or kayaking")),
+            "using segway", "sailing", "canoeing or kayaking")),
         SourceGroup("general_objects", "General indoor/outdoor objects", 350, (
             "cleaning floor", "cleaning windows", "making bed", "moving furniture", "setting table",
             "washing dishes", "unboxing")),
@@ -448,11 +449,11 @@ VIDEO_INPAINTING = Family(
     source_filter="object",
     source_groups=(
         SourceGroup("people", "People / human activity", 600, (
-            "walking the dog", "jogging", "running on treadmill", "dancing ballet", "hiking",
+            "walking the dog", "jogging", "running on treadmill", "dancing ballet", "marching",
             "rock climbing", "reading book", "using computer", "cooking chicken", "cleaning floor")),
         SourceGroup("sports", "Sports", 500, (
             "playing basketball", "playing tennis", "shooting goal (soccer)", "playing volleyball",
-            "catching or throwing baseball", "playing golf", "skiing slalom", "snowboarding",
+            "catching or throwing baseball", "golf putting", "skiing slalom", "snowboarding",
             "surfing water")),
         SourceGroup("animals", "Animals", 400, (
             "walking the dog", "training dog", "petting cat", "feeding birds", "grooming horse",
@@ -464,7 +465,7 @@ VIDEO_INPAINTING = Family(
             "cleaning windows", "making bed", "moving furniture", "setting table", "washing dishes",
             "bartending", "news anchoring")),
         SourceGroup("object_activity", "Object / activity scenes", 400, (
-            "playing guitar", "playing piano", "painting", "drawing", "welding", "knitting",
+            "playing guitar", "playing piano", "spray painting", "drawing", "welding", "knitting",
             "making jewelry", "baking cookies")),
         SourceGroup("complex_outdoor", "Complex outdoor scenes", 350, (
             "rock climbing", "riding mountain bike", "skydiving", "paragliding", "scuba diving",
@@ -504,7 +505,7 @@ VIDEO_TO_VIDEO = Family(
     source_filter="any",
     source_groups=(
         SourceGroup("human_activities", "Human activities", 450, (
-            "walking the dog", "jogging", "hiking", "reading book", "using computer", "cooking chicken",
+            "walking the dog", "jogging", "marching", "reading book", "using computer", "cooking chicken",
             "cleaning floor", "dancing ballet")),
         SourceGroup("sports", "Sports", 400, (
             "playing basketball", "playing tennis", "shooting goal (soccer)", "playing volleyball",
@@ -519,7 +520,7 @@ VIDEO_TO_VIDEO = Family(
             "playing guitar", "playing piano", "playing violin", "playing drums", "singing",
             "dancing ballet", "breakdancing")),
         SourceGroup("indoor_object", "Indoor / object activities", 283, (
-            "painting", "drawing", "welding", "knitting", "making jewelry", "baking cookies",
+            "brush painting", "drawing", "welding", "knitting", "making jewelry", "baking cookies",
             "assembling computer")),
         SourceGroup("outdoor_env", "Outdoor / environmental", 250, (
             "rock climbing", "skydiving", "paragliding", "scuba diving", "snorkeling", "snowmobiling")),
@@ -601,16 +602,63 @@ def family_pipelines(family: Family, allowed: Optional[Set[str]] = None) -> List
     return kept
 
 
-def family_matrix(family: Family, target: int, allowed: Optional[Set[str]] = None
+def capability_weights(family: Family, pipelines: Sequence[Pipeline],
+                       capabilities: Optional[Dict[str, Sequence[str]]]
+                       ) -> Optional[List[float]]:
+    """Column weights derived from which pipeline can render which variant, or None.
+
+    The document assigns each family's videos to its models by a fixed weight, and separately
+    assigns manipulation types (variants) by another. That works only while every model can
+    perform every variant. In the expression family it cannot: StyleGANEX publishes one
+    checkpoint per editing direction and only age and hair colour exist for video, while
+    LivePortrait retargets an existing face and can do none of those. Splitting 50/50 by model
+    therefore forces roughly half the family's videos into two of its nine variants.
+
+    So when the runnable pipelines differ in what they support, the split follows variant demand
+    instead: each variant's weight is shared among the pipelines that can render it, and a
+    pipeline's column weight is the sum of its shares. The family total and its source-group mix
+    are untouched - only the per-model split moves - and the realised variant distribution then
+    matches the document's, renormalised over the variants some model can actually produce.
+
+    Returns None when the rule does not apply (no variants, no declarations, or every pipeline
+    supports the same set), leaving the document's own weights in force.
+    """
+    if not family.variants or not capabilities:
+        return None
+    every = tuple(name for name, _ in family.variants)
+    supported = {p.key: tuple(capabilities.get(p.key) or every) for p in pipelines}
+    if len({frozenset(v) for v in supported.values()}) <= 1:
+        return None                     # uniform capability: the document's weights still hold
+
+    weights = dict(family.variants)
+    out = []
+    for pipe in pipelines:
+        share = 0.0
+        for variant in every:
+            capable = [p for p in pipelines if variant in supported[p.key]]
+            if capable and variant in supported[pipe.key]:
+                share += weights[variant] / len(capable)
+        out.append(share)
+    return out if sum(out) > 0 else None
+
+
+def family_matrix(family: Family, target: int, allowed: Optional[Set[str]] = None,
+                  capabilities: Optional[Dict[str, Sequence[str]]] = None
                   ) -> Tuple[List[int], List[int], List[List[int]]]:
     """(row totals, column totals, cells) for one family scaled to `target` videos.
 
     With `allowed`, the target is redistributed across only those pipelines, so the family still
     produces `target` videos even though some of its models cannot be run.
+
+    With `capabilities` (pipeline key -> the variants it can render), the per-model split follows
+    variant demand wherever the pipelines differ in what they support; see `capability_weights`.
+    Without it the document's own pipeline weights are used, so every existing caller - and the
+    document plan itself - is unaffected.
     """
     pipelines = family_pipelines(family, allowed)
     rows = apportion(target, [g.weight for g in family.source_groups])
-    cols = apportion(target, [p.weight for p in pipelines])
+    derived = capability_weights(family, pipelines, capabilities)
+    cols = apportion(target, derived if derived else [p.weight for p in pipelines])
     return rows, cols, cross_split(rows, cols)
 
 
@@ -659,6 +707,21 @@ def label_demand(targets: Dict[str, int] | None = None) -> Dict[str, int]:
     return {k: int(math.ceil(v)) for k, v in sorted(demand.items())}
 
 
+CLASS_LIST_PATH = Path(__file__).with_name("kinetics400_classes.txt")
+
+
+def known_classes() -> Set[str]:
+    """The 400 Kinetics-400 class names, as the HF mirror spells its label folders.
+
+    Checked into the repo so the spec can be validated without touching the network. A label
+    the spec invents (say "playing golf", which upstream splits into golf chipping / driving /
+    putting) is not caught by the download - it just silently yields zero clips and starves
+    every pipeline that needed that source group. `validate()` turns that into an import-time
+    assertion instead.
+    """
+    return {line.strip() for line in CLASS_LIST_PATH.read_text().splitlines() if line.strip()}
+
+
 def all_labels() -> List[str]:
     """Every distinct Kinetics-400 class name referenced by the spec."""
     seen: Dict[str, None] = {}
@@ -692,6 +755,11 @@ def validate() -> None:
     assert total == sum(FAMILY_TARGETS.values()), "family targets do not add up"
     assert sum(BASE_TARGETS.values()) == 28333, "base spec total drifted from the document"
     assert sum(c.videos for c in build_plan()) == total, "plan does not cover the target"
+
+    classes = known_classes()
+    assert len(classes) == 400, f"class list holds {len(classes)} names, want 400"
+    unknown = [lbl for lbl in all_labels() if lbl not in classes]
+    assert not unknown, f"labels absent from Kinetics-400: {unknown}"
 
 
 def _print_plan() -> None:

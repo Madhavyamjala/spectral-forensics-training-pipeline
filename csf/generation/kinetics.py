@@ -1,7 +1,7 @@
 """
 Kinetics-400 acquisition and source-clip pooling.
 
-The regeneration spec draws every source clip from Kinetics-400, but only references 147 of
+The regeneration spec draws every source clip from Kinetics-400, but only references 149 of
 its 400 classes. Downloading the full ~450 GB release to keep ~37% of it is wasteful and slow,
 so this module streams the CVDF mirror shard by shard:
 
@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from csf.generation import progress
 from csf.logging_utils import get_logger
 
 log = get_logger("generation.kinetics")
@@ -150,23 +151,24 @@ def probe_video(path: Path) -> Optional[Dict[str, object]]:
     """
     global _FFPROBE_WARNED
 
-    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
-           str(path)]
+    from csf.generation.ffmpeg_tools import INSTALL_HINT, ffprobe_exe, probe_with_ffmpeg
+
+    exe = ffprobe_exe()
     info = None
-    try:
-        out = subprocess.run(cmd, capture_output=True, timeout=60, check=True).stdout
-        info = json.loads(out)
-    except FileNotFoundError:
+    if exe is None:
         if not _FFPROBE_WARNED:
             _FFPROBE_WARNED = True
-            log.warning("ffprobe is not on PATH - falling back to OpenCV for container metadata. "
-                        "Codec, bitrate and audio presence will be recorded as unknown, and the "
-                        "generation workers need ffmpeg to encode, so install it before running "
-                        "the 'generate' stage:\n"
-                        "    Linux:  sudo apt install ffmpeg   (or: conda install -c conda-forge ffmpeg)\n"
-                        "    Windows: winget install Gyan.FFmpeg")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        info = None
+            log.warning("ffprobe was not found - container metadata will come from ffmpeg or "
+                        "OpenCV instead, so codec/bitrate/audio may be recorded as unknown. The "
+                        "generation workers still need ffmpeg to encode.\n%s", INSTALL_HINT)
+    else:
+        try:
+            out = subprocess.run([exe, "-v", "error", "-print_format", "json", "-show_format",
+                                  "-show_streams", str(path)],
+                                 capture_output=True, timeout=60, check=True).stdout
+            info = json.loads(out)
+        except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+            info = None
 
     if info is not None:
         video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
@@ -188,6 +190,10 @@ def probe_video(path: Path) -> Optional[Dict[str, object]]:
                     "bitrate": int(info.get("format", {}).get("bit_rate") or 0),
                     "has_audio": audio, "probe": "ffprobe"}
 
+    # ffmpeg carries the same stream details on stderr; imageio-ffmpeg ships it without ffprobe
+    via_ffmpeg = probe_with_ffmpeg(path)
+    if via_ffmpeg is not None:
+        return via_ffmpeg
     return _probe_with_opencv(path)
 
 
@@ -474,6 +480,9 @@ class SourcePool:
             shards.extend((split, f"{mirror_base}/{split}/part_{i}.tar.gz") for i in range(n))
 
         pulled = 0
+        remaining_shards = [u for u in shards if u[1] not in done]
+        shard_bar = progress.bar(len(remaining_shards), "shards", "shard", log_every=1)
+        bar_handle = shard_bar.__enter__()
         for split, url in shards:
             if all(counts.get(k, 0) >= v for k, v in wanted.items()):
                 log.info("All label quotas satisfied -> stopping shard download")
@@ -501,8 +510,11 @@ class SourcePool:
             self.ledger["counts"] = counts
             self._save_ledger()
             remaining = sum(max(0, v - counts.get(k, 0)) for k, v in wanted.items())
+            bar_handle.update(1)
+            bar_handle.set_postfix_str(f"pool {sum(counts.values())}, need {remaining}")
             log.info("Shard %s: kept %d clips | pool %d | still needed %d",
                      Path(url).name, kept, sum(counts.values()), remaining)
+        shard_bar.__exit__(None, None, None)
         return counts
 
     def _consume_shard(self, shard: Path, wanted: Dict[str, int], counts: Dict[str, int],
@@ -620,6 +632,15 @@ class SourcePool:
                 f"and adjust csf/generation/spec.py, or use a different mirror.")
 
         counts = {label: self._count_on_disk(label) for label in wanted}
+        outstanding = sum(max(0, wanted[l] - counts.get(l, 0)) for l in by_label)
+        log.info("Downloading %d clip(s) from %s", outstanding, repo_id)
+        with progress.bar(outstanding, "fetching clips", "clip", log_every=100) as pbar:
+            counts = self._download_individual(repo_id, by_label, wanted, counts, revision, pbar)
+        return counts
+
+    def _download_individual(self, repo_id, by_label, wanted, counts, revision, pbar):
+        from huggingface_hub import hf_hub_download
+
         for label, repo_paths in sorted(by_label.items()):
             need = wanted[label] - counts.get(label, 0)
             if need <= 0:
@@ -627,6 +648,7 @@ class SourcePool:
             dest_dir = self.clips_dir / label.replace("/", "_")
             dest_dir.mkdir(parents=True, exist_ok=True)
             taken = 0
+            pbar.set_postfix_str(label[:28])
             for repo_path in sorted(repo_paths):
                 if taken >= need:
                     break
@@ -639,11 +661,12 @@ class SourcePool:
                     shutil.copy2(got, dest)
                     counts[label] = counts.get(label, 0) + 1
                     taken += 1
+                    pbar.update(1)
                 except Exception as exc:                      # noqa: BLE001 - keep going
                     log.warning("HF fetch failed for %s: %s", repo_path, str(exc)[:160])
             self.ledger["counts"] = counts
             self._save_ledger()
-            log.info("  %-34s %4d/%-4d clips", label, counts.get(label, 0), wanted[label])
+            log.debug("  %-34s %4d/%-4d clips", label, counts.get(label, 0), wanted[label])
         return counts
 
     # -- layout: tar / zip shards -------------------------------------------------------
@@ -751,8 +774,11 @@ class SourcePool:
         log.info("Streaming dataset %s (split=%s) for %d label(s)", repo_id, split, len(wanted))
         ds = load_dataset(repo_id, split=split, streaming=True, revision=revision)
 
+        target = sum(max(0, v - counts.get(k, 0)) for k, v in wanted.items())
         scanned = written = unlabelled = 0
         logged_keys = False
+        ds_bar = progress.bar(target, "materialising clips", "clip", log_every=100)
+        pbar = ds_bar.__enter__()
         for row in ds:
             scanned += 1
             if not logged_keys:
@@ -784,6 +810,8 @@ class SourcePool:
                     counts[label] = counts.get(label, 0) + 1
                     written += 1
                     need -= 1
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"{label[:24]} | scanned {scanned:,}")
 
             if written and written % 200 == 0:
                 self.ledger["counts"] = counts
@@ -793,6 +821,7 @@ class SourcePool:
                 log.info("All label quotas satisfied after %d row(s)", scanned)
                 break
 
+        ds_bar.__exit__(None, None, None)
         self.ledger["counts"] = counts
         self._save_ledger()
         log.info("Dataset ingest done: scanned %d row(s), wrote %d clip(s), %d row(s) had no "
@@ -852,11 +881,16 @@ class SourcePool:
         on_disk = 0
         empty_files = 0
         unreadable: List[Path] = []
+        all_clips = []
         for label in sorted(set(labels)):
             d = self.clips_dir / label.replace("/", "_")
-            if not d.exists():
-                continue
-            for clip in sorted(d.glob("*.mp4")):
+            if d.exists():
+                all_clips.extend((label, c) for c in sorted(d.glob("*.mp4")))
+        log.info("Probing %d clip(s)%s", len(all_clips),
+                 " (ffprobe + sha256 per file)" if probe else "")
+        with progress.bar(len(all_clips), "probing clips", "clip", log_every=250) as pbar:
+            for label, clip in all_clips:
+                pbar.update(1)
                 on_disk += 1
                 if clip.stat().st_size == 0:
                     empty_files += 1

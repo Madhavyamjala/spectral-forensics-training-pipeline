@@ -26,34 +26,42 @@ import numpy as np
 from _common import (has_audio, note, read_video, repo_path, require, run_cmd, scratch, serve,
                      write_video)
 
+#: generate_dreamidv.py requires 4n+1 frames, and --size must be one of its SIZE_CONFIGS
+#: keys. 832*480 is the 480p preset the README uses for single-GPU inference.
 N_FRAMES = 49
 MAX_SIDE = 640
+SIZE = "832*480"
+SAMPLE_STEPS = 20          # the README's single-GPU setting
 
 
 class State:
-    def __init__(self, repo: Path, ckpt_dir: Path, script: Path):
+    def __init__(self, repo: Path, ckpt_dir: Path, dreamid_ckpt: Path, script: Path):
         """Store the reusable components required by this model worker."""
-        self.repo, self.ckpt_dir, self.script = repo, ckpt_dir, script
+        self.repo, self.ckpt_dir = repo, ckpt_dir
+        self.dreamid_ckpt, self.script = dreamid_ckpt, script
 
 
 def load() -> State:
     """Load the model and return its reusable worker state."""
     repo = repo_path("DreamID-V")
-    ckpt_dir = Path(os.environ.get("CSF_ENV_ROOT", ".")) / "weights" / "DreamID-V"
+    weights = Path(os.environ.get("CSF_ENV_ROOT", ".")) / "weights"
+    # --ckpt_dir is the Wan2.1 1.3B release (VAE + T5 text encoder), --dreamidv_ckpt is the
+    # DreamID-V DiT checkpoint itself. Upstream keeps them in separate Hub repos.
+    ckpt_dir = weights / "Wan2.1-T2V-1.3B"
     if not ckpt_dir.exists() or not any(ckpt_dir.iterdir()):
         raise RuntimeError(
-            f"DreamID-V weights missing at {ckpt_dir}. Fetch them with:\n"
-            f"    huggingface-cli download XuGuo699/DreamID-V --local-dir {ckpt_dir}")
-    candidates = [repo / "inference.py", repo / "infer.py", repo / "scripts" / "inference.py"]
-    script = next((c for c in candidates if c.exists()), None)
-    if script is None:
-        raise RuntimeError(
-            f"DreamID-V inference entry point not found under {repo}. Looked for "
-            f"{[str(c.relative_to(repo)) for c in candidates]}; the repo contains "
-            f"{[p.name for p in repo.glob('*.py')][:8]}. Point the worker at the right script "
-            f"before enabling this adapter.")
-    note(f"dreamid: repo {repo}, script {script.name}")
-    return State(repo, ckpt_dir, script)
+            f"The Wan2.1 backbone DreamID-V builds on is missing at {ckpt_dir}. Fetch it "
+            f"with:\n    hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir {ckpt_dir}")
+    dreamid_ckpt = require(weights / "DreamID-V" / "dreamidv.pth", "dreamidv.pth")
+    # Not generate_dreamidv.py: that one imports express_adaption.media_pipe, whose mp_utils
+    # does `from . import face_landmark` - a module that is not in the repository at all
+    # (404 upstream), so the import can never succeed. The DWPose entry point is the same
+    # model with a different landmark front end, and it does not touch express_adaption.
+    script = require(repo / "generate_dreamidv_dwpose.py", "generate_dreamidv_dwpose.py")
+    require(repo / "pose" / "models" / "dw-ll_ucoco_384.onnx", "DWPose keypoint model")
+    require(repo / "pose" / "models" / "yolox_l.onnx", "DWPose detector")
+    note(f"dreamid: repo {repo}, script {script.name} (DWPose), backbone {ckpt_dir.name}")
+    return State(repo, ckpt_dir, dreamid_ckpt, script)
 
 
 def _best_face_frame(frames):
@@ -81,26 +89,31 @@ def render(state: State, payload: dict) -> dict:
 
     with scratch(payload["job_id"]) as tmp:
         tmp = Path(tmp)
-        target_mp4, id_png, out_dir = tmp / "target.mp4", tmp / "identity.png", tmp / "out"
+        target_mp4, id_png, produced = tmp / "target.mp4", tmp / "identity.png", tmp / "out.mp4"
         write_video(frames, str(target_mp4), fps=fps)
         cv2.imwrite(str(id_png), cv2.cvtColor(_best_face_frame(donor_frames), cv2.COLOR_RGB2BGR))
 
+        # --ref_video is the clip being manipulated and --ref_image the identity pasted onto
+        # it; the swapface task takes no prompt.
         run_cmd([sys.executable, str(state.script),
+                 "--task", "swapface", "--size", SIZE,
                  "--ckpt_dir", str(state.ckpt_dir),
-                 "--target_video", str(target_mp4), "--source_image", str(id_png),
-                 "--output_dir", str(out_dir),
+                 "--dreamidv_ckpt", str(state.dreamid_ckpt),
+                 "--ref_video", str(target_mp4), "--ref_image", str(id_png),
+                 "--save_file", str(produced),
                  "--frame_num", str(N_FRAMES),
+                 "--sample_steps", str(SAMPLE_STEPS),
                  "--base_seed", str(int(payload.get("seed") or 0) % (2 ** 31))],
                 cwd=str(state.repo), timeout=3600)
 
-        produced = sorted(out_dir.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not produced:
+        if not produced.exists():
             raise RuntimeError(f"DreamID-V produced no output for {payload['job_id']}")
-        result, out_fps = read_video(str(produced[0]), max_side=0)
+        result, out_fps = read_video(str(produced), max_side=0)
 
     write_video(result, payload["output_path"], fps=out_fps or fps,
                 audio_from=src if has_audio(src) else None)
     return {"face_swap_model": "dreamid_v", "backbone": "Wan2.1-1.3B-DiT",
+            "landmark_frontend": "dwpose",
             "substitutes_for": payload.get("spec_model", "simswap"),
             "source_identity_id": Path(donor).stem, "target_identity_id": Path(src).stem,
             "frames": len(result)}

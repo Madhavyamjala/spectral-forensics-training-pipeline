@@ -127,7 +127,11 @@ def load_run_manifest(cfg: DataConfig, cache_dir: Path, seed: int) -> pd.DataFra
     if missing:
         raise ValueError(f"Manifest {path} is missing required columns {missing}; has {df.columns.tolist()}")
     df["video_id"] = df["video_id"].astype(str)
-    df = df[df["class"].isin(LABEL2ID)].copy()
+    selected = {c: LABEL2ID[c] for c in (cfg.classes or LABEL2ID)}
+    if cfg.classes:
+        log.warning("data.classes restricts this run to %s - the other class(es) are excluded from "
+                    "train, valid and test.", sorted(selected))
+    df = df[df["class"].isin(selected)].copy()
     df = df[df["split"].isin(["train", "valid", "test"])].copy()
     log.info("Manifest rows: %d | per class: %s | per split: %s", len(df),
              df["class"].value_counts().to_dict(), df["split"].value_counts().to_dict())
@@ -154,9 +158,9 @@ def load_run_manifest(cfg: DataConfig, cache_dir: Path, seed: int) -> pd.DataFra
     log.info("Run subset: %d rows\n%s", len(df), table.to_string())
     for split in ("train", "valid", "test"):
         present = set(df.loc[df["split"] == split, "class"])
-        if present != set(LABEL2ID):
-            raise ValueError(f"Split '{split}' is missing classes {set(LABEL2ID) - present}; "
-                             f"increase data.max_rows.")
+        if present != set(selected):
+            raise ValueError(f"Split '{split}' is missing classes {set(selected) - present}; "
+                             f"increase data.max_rows, or narrow data.classes.")
     return df.reset_index(drop=True)
 
 

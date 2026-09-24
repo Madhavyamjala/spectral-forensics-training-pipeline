@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from csf.generation import progress
 from csf.logging_utils import get_logger
 
 log = get_logger("generation.filters")
@@ -284,28 +285,44 @@ def score_pool(pool_csv: Path, out_csv: Path, workers: int = 8, num_frames: int 
             for r in rows if r["clip_id"] not in done]
     log.info("Scoring %d clip(s) with %d worker(s) (%d cached)", len(todo), workers, len(done))
 
-    results: List[Dict[str, object]] = list(done.values())
-    if todo:
-        if workers <= 1:
-            for i, args in enumerate(todo, 1):
-                results.append(_score_one(args))
-                if i % 500 == 0:
-                    log.info("  scored %d/%d", i, len(todo))
-        else:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(_score_one, a) for a in todo]
-                for i, fut in enumerate(as_completed(futures), 1):
-                    results.append(fut.result())
-                    if i % 500 == 0:
-                        log.info("  scored %d/%d", i, len(todo))
-
     fields = [f for f in ClipFeatures.__dataclass_fields__]
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        for r in results:
-            writer.writerow({k: r.get(k, "") for k in fields})
+    results: List[Dict[str, object]] = list(done.values())
+
+    def checkpoint() -> None:
+        """Write what has been scored so far.
+
+        Scoring 53,000 clips takes a long while, and only writing at the end meant an interrupted
+        run lost every bit of it. Saving periodically makes the stage genuinely resumable: the
+        rows already on disk are reused on the next run.
+        """
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_csv.with_suffix(".tmp")
+        with open(tmp, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            for r in results:
+                writer.writerow({k: r.get(k, "") for k in fields})
+        tmp.replace(out_csv)
+
+    if todo:
+        with progress.bar(len(todo), "scoring clips", "clip", log_every=250) as pbar:
+            if workers <= 1:
+                for i, args in enumerate(todo, 1):
+                    results.append(_score_one(args))
+                    pbar.update(1)
+                    if i % 500 == 0:
+                        checkpoint()
+            else:
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_score_one, a) for a in todo]
+                    for i, fut in enumerate(as_completed(futures), 1):
+                        results.append(fut.result())
+                        pbar.update(1)
+                        if i % 500 == 0:
+                            checkpoint()
+        checkpoint()
+
+    checkpoint()
 
     counts = {name: sum(1 for r in results if _row_qualifies(r, name)) for name in FILTER_NAMES}
     detectors = {}

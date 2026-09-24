@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import shutil
 import threading
 import time
@@ -40,7 +41,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from csf.generation.adapters import ADAPTERS, WorkerPool, adapter_for, env_specs
 from csf.generation.adapters.base import AdapterError
+from csf.generation.diskcheck import write_probe
 from csf.generation.envs import EnvBuildError
+from csf.generation import progress as progress_ui
 from csf.generation.jobs import Job
 from csf.logging_utils import get_logger
 
@@ -80,6 +83,11 @@ class Outcome:
     error: str = ""
     seconds: float = 0.0
     metadata: dict = field(default_factory=dict)
+    #: The job never ran - its environment could not be built, or the group ended early. It is
+    #: recorded so the failure is visible, but it does not count against the job's attempts:
+    #: nothing about *this job* failed, and burning its retries on a broken env (or an offline
+    #: node) strands work that would succeed the moment the env is fixed.
+    env_error: bool = False
 
 
 class Ledger:
@@ -91,6 +99,8 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.done: Dict[str, bool] = {}
+        self.attempts: Dict[str, int] = {}
+        self.errors: Dict[str, str] = {}
         if self.path.exists():
             with open(self.path, encoding="utf-8") as fh:
                 for line in fh:
@@ -101,19 +111,42 @@ class Ledger:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    self.done[rec["job_id"]] = bool(rec.get("ok"))
-            log.info("Ledger %s: %d job(s) already recorded (%d ok)", self.path, len(self.done),
-                     sum(1 for v in self.done.values() if v))
+                    job_id = rec["job_id"]
+                    ok = bool(rec.get("ok"))
+                    self.done[job_id] = ok
+                    # ledgers written before env_error existed: a "worker unavailable"
+                    # error is an env failure by any other name, so do not charge it as an
+                    # attempt now that the distinction exists.
+                    env_error = bool(rec.get("env_error")) or \
+                        str(rec.get("error") or "").startswith("worker unavailable:")
+                    if not env_error:
+                        self.attempts[job_id] = self.attempts.get(job_id, 0) + 1
+                    self.attempts.setdefault(job_id, 0)
+                    if ok:
+                        self.errors.pop(job_id, None)
+                    else:
+                        self.errors[job_id] = str(rec.get("error") or "")
+            log.info("Ledger %s: %d job(s) already recorded (%d ok, %d failed)", self.path,
+                     len(self.done), sum(1 for v in self.done.values() if v),
+                     sum(1 for v in self.done.values() if not v))
 
     def record(self, outcome: Outcome) -> None:
         """Append an outcome unless its job has already been recorded."""
         with self._lock:
             self.done[outcome.job_id] = outcome.ok
+            if not outcome.env_error:
+                self.attempts[outcome.job_id] = self.attempts.get(outcome.job_id, 0) + 1
+            self.attempts.setdefault(outcome.job_id, 0)
+            if outcome.ok:
+                self.errors.pop(outcome.job_id, None)
+            else:
+                self.errors[outcome.job_id] = outcome.error[:400]
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"job_id": outcome.job_id, "ok": outcome.ok,
                                      "output_path": outcome.output_path,
                                      "error": outcome.error[:400],
                                      "seconds": round(outcome.seconds, 2),
+                                     "env_error": outcome.env_error,
                                      "metadata": outcome.metadata}) + "\n")
 
     def succeeded(self, job_id: str) -> bool:
@@ -124,22 +157,69 @@ class Ledger:
         """Return whether a job has any recorded outcome."""
         return job_id in self.done
 
+    def attempt_count(self, job_id: str) -> int:
+        """How many outcomes - successful or not - this job has recorded."""
+        return self.attempts.get(job_id, 0)
+
+    def failure_reasons(self, limit: int = 5) -> List[Tuple[str, int]]:
+        """The most common failure messages, for diagnosing a run that produced nothing."""
+        tally: Dict[str, int] = {}
+        for job_id, ok in self.done.items():
+            if ok:
+                continue
+            reason = (self.errors.get(job_id) or "unknown error").strip().splitlines()
+            key = reason[-1][:160] if reason else "unknown error"
+            tally[key] = tally.get(key, 0) + 1
+        return sorted(tally.items(), key=lambda kv: -kv[1])[:limit]
+
 
 # --------------------------------------------------------------------------------------
 # planning
 # --------------------------------------------------------------------------------------
 
 
-def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = False
-               ) -> Dict[str, List[Job]]:
-    """Pending jobs, grouped by model. Already-succeeded jobs are dropped."""
+def group_jobs(jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
+               max_attempts: int = 3, output_for=None) -> Dict[str, List[Job]]:
+    """Pending jobs, grouped by model.
+
+    A job is dropped once it has succeeded - that is the whole point of the ledger. A job that
+    *failed* is retried on the next run until it has used up `max_attempts`, because most
+    failures here are environmental rather than intrinsic to the job: an adapter environment
+    that had not finished building, a checkpoint that had not been staged, a GPU that was busy.
+    Treating the first failure as final turned those into a permanently dead run whose only
+    symptom was "nothing to do" followed by "produced no videos at all".
+
+    `retry_failed=False` restores the old behaviour (one attempt, ever); `max_attempts` caps how
+    many times a genuinely broken job is allowed to burn a worker slot.
+    """
     groups: Dict[str, List[Job]] = defaultdict(list)
+    exhausted = 0
+    orphaned = 0
     for job in jobs:
         if ledger.succeeded(job.job_id):
+            # "succeeded" is only true while the video is still there. A recorded success whose
+            # file is gone (deleted, or written somewhere the driver could not see) would
+            # otherwise be skipped forever, leaving a hole nothing ever fills.
+            if output_for is not None:
+                out = Path(output_for(job))
+                if not (out.exists() and out.stat().st_size > 0):
+                    orphaned += 1
+                    groups[job.model].append(job)
             continue
-        if ledger.seen(job.job_id) and not retry_failed:
-            continue
+        if ledger.seen(job.job_id):
+            if not retry_failed:
+                continue
+            if ledger.attempt_count(job.job_id) >= max(1, max_attempts):
+                exhausted += 1
+                continue
         groups[job.model].append(job)
+    if orphaned:
+        log.warning("%d job(s) are recorded as successful but their video is missing from the "
+                    "video root -> re-generating them", orphaned)
+    if exhausted:
+        log.warning("%d job(s) have failed %d time(s) and will not be retried again. Fix the "
+                    "underlying error and re-run with generation.max_attempts raised, or delete "
+                    "their rows from the ledger.", exhausted, max_attempts)
     return dict(groups)
 
 
@@ -164,14 +244,30 @@ def balance(groups: Dict[str, List[Job]], gpus: Sequence[int]) -> Dict[int, List
 
 
 class Progress:
+    """Live progress across every GPU, as a bar when attached to a terminal.
+
+    All GPU threads share one counter, so the bar reflects the whole run rather than any single
+    worker - which is what matters when the ETA is measured in days.
+    """
+
     def __init__(self, total: int):
-        """Initialize thread-safe counters for a generation run."""
+        """Initialize thread-safe counters and the shared progress bar."""
         self.total = total
         self.ok = 0
         self.failed = 0
         self.started = time.monotonic()
         self._lock = threading.Lock()
         self._last_log = 0.0
+        self._bar_cm = progress_ui.bar(total, "generating", "video", log_every=50,
+                                       log_seconds=300)
+        self._bar = self._bar_cm.__enter__()
+
+    def close(self) -> None:
+        """Tear the bar down; never let display trouble mask a run's result."""
+        try:
+            self._bar_cm.__exit__(None, None, None)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     def update(self, ok: bool) -> None:
         """Record one outcome and periodically report progress."""
@@ -181,8 +277,10 @@ class Progress:
             else:
                 self.failed += 1
             done = self.ok + self.failed
+            self._bar.update(1)
+            self._bar.set_postfix_str(f"ok {self.ok:,} failed {self.failed:,}")
             now = time.monotonic()
-            if done % 50 == 0 or now - self._last_log > 300:
+            if done % 200 == 0 or now - self._last_log > 900:
                 self._last_log = now
                 elapsed = now - self.started
                 rate = done / max(1e-6, elapsed)
@@ -196,10 +294,15 @@ class GenerationScheduler:
     def __init__(self, video_root: Path, envs_root: Path, log_dir: Path, gpus: Sequence[int],
                  job_timeout: int = 1800, fail_fast: int = 8, min_free_gb: float = 50.0,
                  offline: bool = False, deadline_hours: Optional[float] = None,
-                 gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1):
+                 gpu_vram_gb: float = 143.0, max_workers_per_gpu: int = 1,
+                 staged_dir: Optional[Path] = None):
         """Configure generation paths, limits, GPUs, and worker concurrency."""
-        self.video_root = Path(video_root)
+        # Absolute, always. Workers are launched with cwd set to their env root, so a relative
+        # output path would land under cache/.../envs/<env>/ instead of the video root - the
+        # driver then records "ok" for a file it cannot find. Same reasoning as the interpreter.
+        self.video_root = Path(os.path.abspath(video_root))
         self.envs_root = Path(envs_root)
+        self.staged_dir = Path(os.path.abspath(staged_dir)) if staged_dir else None
         self.log_dir = Path(log_dir)
         self.gpus = list(gpus)
         self.job_timeout = job_timeout
@@ -211,13 +314,17 @@ class GenerationScheduler:
         self.max_workers_per_gpu = max(1, max_workers_per_gpu)
         self.failures: List[Tuple[str, str, str]] = []
         self._fail_lock = threading.Lock()
+        self._probe_lock = threading.Lock()
+        self._probed_at = 0.0
+        self._probe_error: Optional[str] = None
+        self.probe_interval_s = 60.0
 
     def output_path(self, job: Job) -> Path:
         """Return the destination video path for a job."""
         return self.video_root / "AI Edited" / job.family / f"{job.video_id}.mp4"
 
     def _disk_ok(self) -> bool:
-        """Return whether enough free disk space remains for generation."""
+        """Return whether generation can still write videos: free space *and* quota."""
         try:
             free_gb = shutil.disk_usage(self.video_root).free / 2 ** 30
         except OSError:
@@ -226,14 +333,39 @@ class GenerationScheduler:
             log.error("Only %.1f GiB free under %s (min_free_gb=%.1f) - pausing generation",
                       free_gb, self.video_root, self.min_free_gb)
             return False
+        # A quota refuses writes while disk_usage still reports the filesystem's free blocks,
+        # so the space check above cannot see it. Probe rather than trust, but throttled: this
+        # runs before every job and the answer does not change by the second.
+        now = time.monotonic()
+        with self._probe_lock:
+            due = now - self._probed_at >= self.probe_interval_s
+            if due:
+                self._probed_at = now
+        if due:
+            problem = write_probe(self.video_root, mib=8)
+            self._probe_error = problem
+        if self._probe_error:
+            log.error("Cannot write under %s - pausing generation. %s",
+                      self.video_root, self._probe_error)
+            return False
         return True
 
-    def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = False) -> Dict[str, object]:
+    def run(self, jobs: Sequence[Job], ledger: Ledger, retry_failed: bool = True,
+            max_attempts: int = 3) -> Dict[str, object]:
         """Schedule all pending jobs and return an execution summary."""
-        groups = group_jobs(jobs, ledger, retry_failed)
+        groups = group_jobs(jobs, ledger, retry_failed, max_attempts, self.output_path)
         if not groups:
-            log.info("Nothing to do: every job is already recorded in the ledger")
-            return {"generated": 0, "failed": 0, "skipped": len(jobs)}
+            ok = sum(1 for j in jobs if ledger.succeeded(j.job_id)
+                      and self.output_path(j).exists())
+            if ok == len(jobs):
+                log.info("Nothing to do: all %d job(s) already succeeded", len(jobs))
+            else:
+                log.error("Nothing to do: %d of %d job(s) failed previously and have no retries "
+                          "left. Most common failures:", len(jobs) - ok, len(jobs))
+                for reason, count in ledger.failure_reasons():
+                    log.error("  %4dx %s", count, reason)
+            return {"generated": 0, "failed": 0, "skipped": len(jobs),
+                    "exhausted": len(jobs) - ok}
 
         unknown = [m for m in groups if m not in ADAPTERS]
         if unknown:
@@ -255,6 +387,7 @@ class GenerationScheduler:
             threads.append(t)
         for t in threads:
             t.join()
+        progress.close()
 
         summary = {"generated": progress.ok, "failed": progress.failed,
                    "pending_at_start": pending,
@@ -266,7 +399,8 @@ class GenerationScheduler:
                   ledger: Ledger, progress: Progress, specs) -> None:
         """Run assigned model groups sequentially on one GPU."""
         pool = WorkerPool(self.envs_root, self.log_dir, max_resident=self.max_workers_per_gpu,
-                          job_timeout=self.job_timeout, offline=self.offline)
+                          job_timeout=self.job_timeout, offline=self.offline,
+                          staged_dir=self.staged_dir)
         try:
             for model in models:
                 if self.deadline and time.monotonic() > self.deadline:
@@ -282,7 +416,9 @@ class GenerationScheduler:
         """Run one model group across the allowed concurrent workers."""
         adapter = adapter_for(model)
         spec = specs[adapter.env_name]
-        slots = concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu)
+        # never start more workers than there is work; six videos do not need four processes
+        slots = min(len(jobs),
+                    concurrency_for(model, self.gpu_vram_gb, self.max_workers_per_gpu))
         log.info("GPU %d: starting model '%s' (%d videos, env %s, %d worker(s) x %.0f GB)",
                  gpu, model, len(jobs), adapter.env_name, slots, adapter.vram_gb)
 
@@ -305,10 +441,26 @@ class GenerationScheduler:
         streak_lock = threading.Lock()
 
         def slot_loop(slot: int) -> None:
-            """Consume jobs on one worker slot until completion or group abandonment."""
+            """Consume jobs on one worker slot, recording every job whatever goes wrong.
+
+            The wrapper matters: an unexpected exception used to kill the thread outright, and
+            the videos still queued were then neither generated nor written to the ledger. They
+            simply vanished, and the run reported a clean finish for a group that produced
+            nothing.
+            """
+            try:
+                _slot_loop(slot)
+            except Exception as exc:                          # noqa: BLE001 - never lose jobs
+                log.exception("GPU %d slot %d: '%s' failed unexpectedly", gpu, slot, model)
+                if not abandon.is_set():
+                    abandon.set()
+                    self._drain(queue, ledger, progress,
+                                f"worker slot crashed: {type(exc).__name__}: {exc}"[:500])
+
+        def _slot_loop(slot: int) -> None:
             try:
                 worker = pool.get(adapter, spec, gpu, slot)
-            except (AdapterError, EnvBuildError) as exc:
+            except (AdapterError, EnvBuildError, OSError) as exc:
                 reason = f"worker/env unavailable: {exc}"[:500]
                 log.error("GPU %d slot %d: cannot start '%s': %s", gpu, slot, model, reason)
                 if slot == 0:                      # slot 0 failing means the model cannot run
@@ -337,8 +489,9 @@ class GenerationScheduler:
                 started = time.monotonic()
                 try:
                     worker = pool.get(adapter, spec, gpu, slot)
-                except (AdapterError, EnvBuildError) as exc:
-                    outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500])
+                except (AdapterError, EnvBuildError, OSError) as exc:
+                    outcome = Outcome(job.job_id, False, error=f"worker unavailable: {exc}"[:500],
+                                      env_error=True)
                 else:
                     outcome = self._run_one(worker, pool, adapter, spec, gpu, job, out, slot)
                 outcome.seconds = time.monotonic() - started
@@ -365,6 +518,24 @@ class GenerationScheduler:
             t.start()
         for t in threads:
             t.join()
+
+        # A group must account for every job it was given. If a thread still died in a way that
+        # escaped both handlers, the queue holds work nobody recorded; sweep it rather than let
+        # the run report success for videos that were never attempted.
+        stranded = 0
+        while True:
+            try:
+                job = queue.get_nowait()
+            except Empty:
+                break
+            stranded += 1
+            ledger.record(Outcome(job.job_id, False, env_error=True,
+                                  error="job was never attempted (worker group ended early)"))
+            self._note_failure(job, "never attempted")
+            progress.update(False)
+        if stranded:
+            log.error("GPU %d: '%s' ended with %d job(s) unattempted - recorded as failed",
+                      gpu, model, stranded)
         log.info("GPU %d: finished model '%s'", gpu, model)
 
     def _drain(self, queue: "Queue[Optional[Job]]", ledger: Ledger, progress: Progress,

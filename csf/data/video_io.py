@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -29,11 +30,43 @@ from csf.logging_utils import get_logger
 log = get_logger("data.video")
 
 
+def _status_code(exc: Exception) -> Optional[int]:
+    """The HTTP status behind an exception, when there is one.
+
+    `huggingface_hub` raises `HfHubHTTPError`, which carries the original `requests` response;
+    some wrappers lose it, so the message is used as a fallback.
+    """
+    for attr in ("response", "request_response"):
+        code = getattr(getattr(exc, attr, None), "status_code", None)
+        if isinstance(code, int):
+            return code
+    match = re.search(r"\b(4\d\d|5\d\d)\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
 def _is_rate_limit(exc: Exception) -> bool:
     msg = str(exc).lower()
-    resp = getattr(exc, "response", None)
-    return ("429" in msg or "rate limit" in msg or "too many requests" in msg
-            or getattr(resp, "status_code", None) == 429)
+    return ("rate limit" in msg or "too many requests" in msg or _status_code(exc) == 429)
+
+
+def is_transient(exc: Exception) -> bool:
+    """Whether a download failure is worth retrying.
+
+    The Hub is fronted by a CDN, and a 5xx from it says "ask again", not "this file is wrong".
+    Treating one as permanent is expensive out of proportion to the error: a single 503 aborted
+    a feature-extraction run 98% of the way through 97,774 videos, because ten of them landed in
+    a row and tripped `download_fail_fast`. 4xx (a missing path, a gated repo, a bad token) is
+    genuinely permanent and still fails on the first attempt, because retrying cannot fix it.
+    """
+    if _is_rate_limit(exc) or isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    code = _status_code(exc)
+    if code is not None:
+        return code >= 500
+    msg = str(exc).lower()
+    return any(term in msg for term in ("timed out", "timeout", "connection", "service unavailable",
+                                        "bad gateway", "temporarily unavailable", "try again",
+                                        "remote end closed", "incomplete read", "reset by peer"))
 
 
 def download_video(repo_id: str, repo_path: str, video_dir: Path, revision: Optional[str] = None,
@@ -49,9 +82,7 @@ def download_video(repo_id: str, repo_path: str, video_dir: Path, revision: Opti
                                         local_dir=str(video_dir)))
         except Exception as exc:
             attempt += 1
-            transient = _is_rate_limit(exc) or isinstance(exc, (ConnectionError, TimeoutError)) \
-                or "timed out" in str(exc).lower() or "connection" in str(exc).lower()
-            if not transient or attempt > max_retries:
+            if not is_transient(exc) or attempt > max_retries:
                 raise RuntimeError(f"download failed for {repo_path} after {attempt} attempt(s): "
                                    f"{type(exc).__name__}: {exc}") from exc
             wait = min(base_backoff * 2 ** (attempt - 1), 300)

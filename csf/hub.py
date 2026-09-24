@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from csf import PRETTY_LABELS
 from csf.config import Config
 from csf.logging_utils import get_logger
 
@@ -94,7 +95,7 @@ latency percentiles, routing statistics, shortcut baselines) is in `metrics/abla
 ```bash
 git clone https://huggingface.co/{repo_id} csf-model && cd csf-model/code
 pip install -r requirements.txt        # plus a CUDA build of torch, see README of the training repo
-huggingface-cli login                  # Llama 3.2 Vision is gated: accept its license first
+hf auth login                         # Llama 3.2 Vision is gated: accept its license first
 python -m csf.inference /path/to/video.mp4 --model_dir .. --mode agentic --profile balanced
 ```
 
@@ -137,7 +138,10 @@ def export_bundle(cfg: Config, qwen_ckpt: Path, llama_ckpt: Path, dispatcher_dir
                "mosaic_size": d.mosaic_size, "patch_size": d.patch_size, "num_patches": d.num_patches,
                "tool_max_side": d.tool_max_side, "qwen_id": cfg.models.qwen_id, "llama_id": cfg.models.llama_id,
                "vae_id": cfg.models.vae_id, "vae_subfolder": cfg.models.vae_subfolder,
-               "vae_fallback_id": cfg.models.vae_fallback_id, "dataset": d.repo_id, "run_name": cfg.run_name}
+               "vae_fallback_id": cfg.models.vae_fallback_id, "dataset": d.repo_id, "run_name": cfg.run_name,
+               "classes": list(d.classes) if d.classes else ["real", "ai_generated", "ai_edited"],
+               "active_label_ids": d.active_label_ids(),
+               "label_names": [PRETTY_LABELS[c] for c in (d.classes if d.classes else ["real", "ai_generated", "ai_edited"])]}
     (out / "csf_config.json").write_text(json.dumps(csf_cfg, indent=2), encoding="utf-8")
     _copy(cfg.work_dir / "metrics", out / "metrics")
     _copy(cfg.work_dir / "resolved_config.json", out / "metrics" / "resolved_config.json")

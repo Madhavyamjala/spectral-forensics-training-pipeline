@@ -37,11 +37,17 @@ generation:
   ledger: ./cache/regen/ledger.jsonl
   manifest_out: manifest_regen.csv
   job_timeout_s: 1800          # a TokenFlow job is the slow case at ~4 min; 30 min is generous
-  fail_fast: 8                 # abandon a model group after 8 consecutive failures
+  # Abandon a model group after this many consecutive failures. Raised from 8 while the
+  # per-model workers are still being validated: at 8, one broken model abandons its whole
+  # group and every remaining job is recorded as "abandoned", which buried ~220 real errors
+  # under 26,080 cascade records. Higher keeps more distinct errors visible per run. The
+  # cheaper instrument is one model at a time - see docs/REGENERATION.md.
+  fail_fast: 25
   min_free_gb: 100.0
   offline: false               # build the per-model venvs on demand (node has internet)
   deadline_hours: 120.0        # hard backstop only
-  retry_failed: false
+  retry_failed: true          # re-attempt jobs that failed on an earlier run
+  max_attempts: 3             # ... up to this many attempts each, then give up
   keep_old_edited: false       # the old 31,128 ai_edited rows are dropped
   only_models: []              # e.g. [inswapper, wav2lip] to run a subset
   skip_models: []
@@ -61,7 +67,11 @@ generation:
   max_workers_per_gpu: 4
   # REFace (the FaceShifter substitute) is trained on CelebAMask-HQ: NON-COMMERCIAL RESEARCH
   # ONLY, and generated videos inherit that. Leave false to skip it entirely.
-  accept_noncommercial: false
+  # REFace's checkpoint is trained on CelebAMask-HQ: NON-COMMERCIAL RESEARCH ONLY, and the
+  # videos it renders inherit that. The same restriction already applies through InsightFace's
+  # buffalo_l / inswapper_128 weights, which produce the face scores and 1,562 swap videos.
+  # Set for a research dataset; clearing it drops REFace's 1,563 videos (the faceshifter slot).
+  accept_noncommercial: true
   kinetics:
     local_root: null           # set this if Kinetics-400 is already extracted on the cluster
     # Primary source. The loader inspects the repo and picks the right reader (one file per

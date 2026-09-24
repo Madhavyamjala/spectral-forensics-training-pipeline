@@ -40,7 +40,7 @@ def load() -> State:
     repo = repo_path("TokenFlow")
     require(repo / "run_tokenflow_pnp.py", "TokenFlow driver script")
     require(repo / "preprocess.py", "TokenFlow preprocess script")
-    sd_id = os.environ.get("CSF_SD_ID", "stabilityai/stable-diffusion-2-1-base")
+    sd_id = os.environ.get("CSF_SD_ID", "Manojb/stable-diffusion-2-1-base")
     note(f"tokenflow: repo {repo}, sd {sd_id}")
     return State(repo, sd_id)
 
@@ -57,12 +57,16 @@ def render(state: State, payload: dict) -> dict:
 
     with scratch(payload["job_id"]) as tmp:
         tmp = Path(tmp)
-        frame_dir = tmp / "frames"
-        write_frames(frames, str(frame_dir))
+        # preprocess.py opens --data_path with torchvision's reader and extracts the
+        # frames itself into data/<stem>/; handed a directory it raises IsADirectoryError,
+        # and then dies again inside torchvision's own error handling.
+        clip_mp4 = tmp / "clip.mp4"
+        write_video(frames, str(clip_mp4), fps=fps)
+        frame_dir = state.repo / "data" / clip_mp4.stem
         latents = tmp / "latents"
 
         # 1. DDIM inversion of the clip
-        run_cmd([os.sys.executable, "preprocess.py", "--data_path", str(frame_dir),
+        run_cmd([os.sys.executable, "preprocess.py", "--data_path", str(clip_mp4),
                  "--sd_version", "2.1", "--inversion_prompt", "",
                  "--save_dir", str(latents), "--steps", "500",
                  "--n_frames", str(len(frames)), "--H", str(h8), "--W", str(w8)],

@@ -21,7 +21,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,7 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
+from csf import LABELS, PRETTY_LABELS
 from csf.config import Config
 from csf.data.datasets import CachedVideoDataset, LlamaCollator, QwenCollator
 from csf.distributed import DistInfo, all_gather_objects, all_reduce_mean, barrier
@@ -41,10 +42,20 @@ log = get_logger("train.classifier")
 
 
 def make_collator(kind: str, processor, cfg: Config, train: bool):
+    """Build a VLM collator using the classes active in this run.
+
+    Note:
+        Two-class runs use Real / AI-Generated wording in both VLM prompts.
+
+    TODO:
+        Consolidate class-name formatting into a shared prompt schema.
+    """
+    class_names = [PRETTY_LABELS[c] for c in (cfg.data.classes or LABELS)]
     if kind == "qwen":
-        return QwenCollator(processor)
+        return QwenCollator(processor, class_names)
     tool_dropout = cfg.train.llama.tool_dropout if train else 0.0
-    return LlamaCollator(processor, cfg.data.mosaic_frames, cfg.data.mosaic_size, tool_dropout=tool_dropout)
+    return LlamaCollator(processor, cfg.data.mosaic_frames, cfg.data.mosaic_size, tool_dropout=tool_dropout,
+                         class_names=class_names)
 
 
 def _move(batch: Dict[str, Any], device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
@@ -85,8 +96,13 @@ def _scheduler(opt, total_steps: int, warmup_ratio: float):
 
 @torch.no_grad()
 def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.dtype, dist_info: DistInfo,
-                  max_batches=None, return_pooled: bool = False, desc: str = "infer") -> Dict[str, Dict[str, Any]]:
-    """Returns {key: {"probs": np.ndarray[3], "label": int, "latency": sec/sample, ("pooled")}} gathered from all ranks."""
+                  max_batches=None, return_pooled: bool = False, desc: str = "infer",
+                  active_ids: Optional[List[int]] = None) -> Dict[str, Dict[str, Any]]:
+    """Returns {key: {"probs": np.ndarray[3], "label": int, "latency": sec/sample, ("pooled")}} gathered from all ranks.
+
+    `probs` always has one column per label in LABELS so everything downstream keeps its shape. When
+    `active_ids` excludes a class, the softmax is taken over the active columns only and the excluded
+    ones are reported as exactly 0 - renormalising over an untrained logit would invent a probability."""
     from tqdm import tqdm
     was_training = model.training
     model.eval()
@@ -103,7 +119,12 @@ def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.
         t0 = time.perf_counter()
         with torch.autocast(device.type, dtype=dtype, enabled=device.type == "cuda"):
             logits, pooled = model(**{k: v for k, v in batch.items() if k not in NON_MODEL_KEYS})
-        probs = torch.softmax(logits.float(), dim=-1)
+        if active_ids is not None and len(active_ids) < logits.shape[-1]:
+            idx = torch.as_tensor(active_ids, device=logits.device)
+            probs = torch.zeros_like(logits, dtype=torch.float32)
+            probs[:, idx] = torch.softmax(logits.float()[:, idx], dim=-1)
+        else:
+            probs = torch.softmax(logits.float(), dim=-1)
         if device.type == "cuda":
             torch.cuda.synchronize()
         per_sample = (time.perf_counter() - t0) / len(batch["keys"])
@@ -120,12 +141,27 @@ def run_inference(model, loader: DataLoader, device: torch.device, dtype: torch.
     return merged
 
 
-def _val_metrics(results: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+def _val_metrics(results: Dict[str, Dict[str, Any]], active_ids: Optional[List[int]] = None) -> Dict[str, float]:
+    """Compute validation metrics over the classes trained by this run.
+
+    Note:
+        In a two-class run, the classifier keeps a canonical three-slot output, but validation
+        must exclude the intentionally untrained AI-Edited slot from macro-F1 and validation loss.
+
+    TODO:
+        Replace the canonical-head compatibility path with an explicit bundle head schema.
+    """
     y = np.array([r["label"] for r in results.values()])
     p = np.stack([r["probs"] for r in results.values()])
-    pred = p.argmax(1)
-    loss = float(-np.log(np.clip(p[np.arange(len(y)), y], 1e-9, 1)).mean())
-    return {"val_acc": float(accuracy_score(y, pred)), "val_macro_f1": float(f1_score(y, pred, average="macro")),
+    active = list(active_ids) if active_ids is not None else list(range(p.shape[1]))
+    idx = {label_id: i for i, label_id in enumerate(active)}
+    y_local = np.asarray([idx[int(v)] for v in y], dtype=int)
+    p_active = p[:, active]
+    p_active = p_active / p_active.sum(1, keepdims=True)
+    pred_local = p_active.argmax(1)
+    loss = float(-np.log(np.clip(p_active[np.arange(len(y)), y_local], 1e-9, 1)).mean())
+    return {"val_acc": float(accuracy_score(y_local, pred_local)),
+            "val_macro_f1": float(f1_score(y_local, pred_local, average="macro")),
             "val_loss": loss, "val_n": int(len(y))}
 
 
@@ -141,12 +177,28 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
     best_dir, last_dir = ckpt_root / "best", ckpt_root / "last"
     jsonl = cfg.work_dir / "logs" / f"train_{kind}.jsonl"
 
+    active_ids = cfg.data.active_label_ids()
+    # Slice the logits to the active classes rather than masking the others to -inf: with
+    # label_smoothing > 0 an excluded class still carries a non-zero target, and -log(0) is inf.
+    active_idx = torch.tensor(active_ids, device=device)
+    label_remap = torch.full((len(LABELS),), -1, dtype=torch.long, device=device)
+    label_remap[active_idx] = torch.arange(len(active_ids), device=device)
+    if len(active_ids) < len(LABELS):
+        log.warning("[%s] training on %d of %d classes (%s); the excluded head row(s) stay at "
+                    "initialisation instead of being trained to never fire.", kind, len(active_ids),
+                    len(LABELS), [LABELS[i] for i in active_ids])
+
     model, processor = build_classifier(kind, model_id, tcfg, device, cfg.models.attn_implementation)
     if device.type == "cuda":
         log.info("[%s] GPU memory after load: %.2f GiB", kind, torch.cuda.memory_allocated() / 2**30)
 
     train_ds = CachedVideoDataset(index[index["split"] == "train"], cfg.cache_dir, stats)
-    val_ds = CachedVideoDataset(index[index["split"] == "valid"], cfg.cache_dir, stats)
+    # The cache index is grouped by class, and the val loader does not shuffle, so capping validation
+    # with max_eval_batches would score only the first class or two - best-checkpoint selection and
+    # early stopping then track one class. A seeded shuffle keeps the capped subset mixed while every
+    # rank still sees the same order, so DistributedSampler(shuffle=False) shards it consistently.
+    val_ds = CachedVideoDataset(index[index["split"] == "valid"].sample(frac=1.0, random_state=cfg.seed),
+                                cfg.cache_dir, stats)
     train_sampler = DistributedSampler(train_ds, dist_info.world_size, dist_info.rank, shuffle=True, seed=cfg.seed) \
         if dist_info.distributed else None
     val_sampler = DistributedSampler(val_ds, dist_info.world_size, dist_info.rank, shuffle=False) \
@@ -204,8 +256,9 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
     def evaluate_and_checkpoint(force_save: bool = False) -> bool:
         nonlocal best_f1, bad_evals
         res = run_inference(ddp_model.module if dist_info.distributed else ddp_model, val_loader, device, dtype,
-                            dist_info, max_batches=tcfg.max_eval_batches, desc=f"val {kind}")
-        m = _val_metrics(res)
+                            dist_info, max_batches=tcfg.max_eval_batches, desc=f"val {kind}",
+                            active_ids=active_ids)
+        m = _val_metrics(res, active_ids)
         m.update(step=step, time=time.time())
         history.append(m)
         improved = m["val_macro_f1"] > best_f1 or force_save
@@ -260,7 +313,8 @@ def train_classifier(kind: str, cfg: Config, dist_info: DistInfo, index: pd.Data
             with ctx:
                 with torch.autocast(device.type, dtype=dtype, enabled=device.type == "cuda"):
                     logits, _ = ddp_model(**{k: v for k, v in batch.items() if k not in NON_MODEL_KEYS})
-                loss = F.cross_entropy(logits.float(), batch["labels"], label_smoothing=tcfg.label_smoothing)
+                loss = F.cross_entropy(logits.float()[:, active_idx], label_remap[batch["labels"]],
+                                       label_smoothing=tcfg.label_smoothing)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"[{kind}] non-finite loss {loss.item()} at step {step} micro {micro}; "
                                              f"batch keys={batch['keys']}")

@@ -118,7 +118,7 @@ bash setup_env.sh --cuda cu128          # use cu121 for older drivers
 source .venv/bin/activate
 
 # 3. log in to Hugging Face (needed for the gated Llama model and higher rate limits)
-huggingface-cli login                   # paste a READ token
+hf auth login                           # paste a READ token
 
 # 4. verify the machine
 python -m csf.env_check
@@ -138,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File setup_env.ps1 -Cuda cu128
 .\.venv\Scripts\Activate.ps1
 
 # 3. log in to Hugging Face
-huggingface-cli login
+hf auth login
 
 # 4. verify the machine
 python -m csf.env_check
@@ -150,6 +150,25 @@ python -m csf.env_check
 
 `python -m csf.env_check` checks the GPU, bf16 support, a real CUDA matmul, a bitsandbytes 4-bit
 forward pass, OpenCV's ffmpeg backend and your Hub login. Fix anything it reports before going on.
+
+### No root, or conda is broken?
+
+ffmpeg does not have to be installed system-wide. `requirements.txt` includes `imageio-ffmpeg`,
+which ships a **static ffmpeg binary as a normal wheel** — no root, no conda, no module system:
+
+```bash
+pip install imageio-ffmpeg
+```
+
+The pipeline finds it automatically. Resolution order is `CSF_FFMPEG` / `CSF_FFPROBE` → `PATH` →
+the bundled binary, and startup reports which it picked. `imageio-ffmpeg` bundles ffmpeg but not
+ffprobe, so container metadata is parsed from `ffmpeg -i` instead — slightly less precise, and
+otherwise identical. If you would rather point at an existing build:
+
+```bash
+export CSF_FFMPEG=/path/to/ffmpeg
+export CSF_FFPROBE=/path/to/ffprobe
+```
 
 ### Accept the gated licence
 
@@ -255,6 +274,15 @@ Everything is resumable, so re-running the same command picks up where it stoppe
 **Expected wall clock** on 4 × H200: prefetch 1–2 h, environments 2–4 h, Kinetics 8–20 h,
 generation ~3.9 days, feature extraction 8–14 h, training + eval 1.5–2.5 days.
 
+Every long stage shows a progress bar (or periodic log lines when output is redirected), and the
+environment build streams pip's output with a heartbeat so a 15-minute torch install is visibly
+working rather than apparently hung. `CSF_NO_PROGRESS=1` turns it off.
+
+**Everything resumes.** Stop with Ctrl-C and re-run the same command: environments keep what pip
+already installed, Kinetics counts the clips on disk, clip scoring checkpoints every 500 clips,
+and generation resumes from its per-video ledger. See
+[docs/REGENERATION.md](docs/REGENERATION.md) for the details.
+
 ### Smoke tests at a glance
 
 | Command | Needs | Time | Checks |
@@ -262,6 +290,7 @@ generation ~3.9 days, feature extraction 8–14 h, training + eval 1.5–2.5 day
 | `python -m csf.env_check` | — | seconds | GPU, bf16, CUDA matmul, ffmpeg, Hub login |
 | `python -m csf.generation.prefetch --dry-run` | — | ~1 min | every Hub repo is reachable |
 | `python tests/test_generation.py` | — | ~1 min | allocation, splits, budget, substitutions |
+| `python tests/test_download_retry.py` | — | <1 s | Hub download retry classification, resume messaging |
 | `python main.py --config configs/smoke_cpu.yaml` | CPU | ~10 min | the whole training pipeline wires up |
 | `python main.py --config configs/regen_smoke.yaml --stage kinetics,generate,regen_manifest` | 1 GPU | ~30 min | generation workers, ledger, manifest rebuild |
 | `bash scripts/run_test.sh` | 1 GPU ≥12 GB | ~4 h | every training stage on 5,000 videos |
@@ -295,6 +324,79 @@ dataset card carries the required credit, licence link and statement of changes 
 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.
+
+### How manipulation types are assigned
+
+Each family's videos carry a `manipulation_type` (the *variant*: a smile edit, an age edit, an
+object removal). Models are not interchangeable here — StyleGANEX publishes one checkpoint per
+editing direction and only age and hair colour exist for video, while LivePortrait retargets an
+existing face and can do neither. A video labelled `age` that LivePortrait produced would be
+mislabelled data, so adapters declare which variants they can genuinely render and the planner
+respects it.
+
+Where a family's models differ in what they support, the per-model split follows variant demand
+rather than the document's fixed model weights — otherwise a 50/50 model split would force half
+the expression family into two of its nine variants. Family totals and the source-group mix are
+untouched; only the split between models moves, and the realised variant mix then matches the
+document's shares. `python -m csf.generation.spec` still prints the document's own plan.
+
+One variant, `facial_attributes` (glasses), has no released renderer at all. Its share is spread
+over the variants that can be produced, and the run logs it — no video is ever labelled with a
+manipulation that was not performed.
+
+### Version ceilings on the shared frameworks
+
+`transformers` and `diffusers` carry an upper bound (`<5`, `<1`) in every env that installs them.
+Without one, pip takes the newest release: transformers 5 requires torch ≥ 2.5, and in an env
+pinned to torch 2.4.1 it prints *"Disabling PyTorch"* and continues with tokenizers only. The env
+imports cleanly and cannot load a single model. The build now asserts
+`transformers.utils.is_torch_available()` before marking an env ready, so that state cannot reach
+a run.
+
+The same care applies to `onnxruntime` / `onnxruntime-gpu` and `opencv-python` /
+`opencv-python-headless`: each pair installs the same import name, so uninstalling one deletes the
+other's files while pip still records it as installed. The envs that need the GPU runtime remove
+every variant first and then reinstall, and import the result to prove it worked.
+
+### Rebuilding the model environments from scratch
+
+The per-model environments repair themselves — a broken venv is detected and recreated, and a
+changed spec rebuilds — so this is only for when you want a guaranteed-clean install: an
+interrupted build, a hand-modified env, or proving the whole install path works.
+
+```bash
+# delete every built environment, then rebuild them all
+python -m csf.generation.envs --burn all --build all --envs-root cache/regen/envs
+
+# or name several - comma-separated, env or adapter names both work
+python -m csf.generation.envs --build dreamid,reface,vace --envs-root cache/regen/envs
+
+# or as part of a run (one-off; do not leave it in a config file)
+python main.py --config configs/regen.yaml --stage generate --set generation.burn_envs=true
+```
+
+Only directories named after a registered environment are deleted, and the log names each one
+with the space it frees. Everything is re-downloaded afterwards — torch, requirements and
+checkpoints — so expect tens of GB.
+
+### Checkpoints you have to stage by hand
+
+Six checkpoints are hosted on Google Drive / Tsinghua Cloud and cannot be fetched unattended.
+Download them once, drop them in `model_paths/` (`generation.staged_weights_dir`) under these exact
+names, and the env build copies them where each repo expects them:
+
+| File in `model_paths/` | Needed by | Source |
+|---|---|---|
+| `e2fgvi_hq.pth` | video inpainting (E2FGVI-HQ) | [MCG-NKU/E2FGVI](https://github.com/MCG-NKU/E2FGVI) |
+| `sttn.pth` | video inpainting (STTN) | [researchmm/STTN](https://github.com/researchmm/STTN) |
+| `fuseformer.pth` | video inpainting (FuseFormer) | [ruiliu-ai/FuseFormer](https://github.com/ruiliu-ai/FuseFormer) |
+| `vox-adv-cpk.pth.tar` | reenactment (FOMM) | [AliaksandrSiarohin/first-order-model](https://github.com/AliaksandrSiarohin/first-order-model) |
+| `vox.pth.tar` | reenactment (TPSMM) | [yoyo-nb/Thin-Plate-Spline-Motion-Model](https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model) |
+| `styleganex_edit_age.pt` | expression editing (age) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+| `styleganex_edit_hair.pt` | expression editing (hair colour) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+
+A missing file fails that env's build with the filename and where to get it, rather than failing
+its jobs later. Subfolders are fine — `model_paths/styleganex/styleganex_edit_age.pt` is found too.
 
 ## 5. Training profiles and tuning
 
@@ -338,7 +440,37 @@ prepare -> features -> train_qwen -> train_llama -> predict_scanner -> outcomes
 - **Re-running the same command resumes.** Completed stages are skipped, and feature extraction skips videos
   already cached. Training resumes from `checkpoints/<model>/last` with its optimiser and scheduler state.
 - Run specific stages with `--stage train_llama,outcomes`. Redo a finished stage with `--force train_llama`.
+
+### Raw-video latency and tool-dependency benchmarks
+
+The live benchmarks operate on the held-out **test split** after training and use the exported bundle. They do not rebuild the feature cache. Use `--latencynum N` to request exactly N raw test videos; the latency stage checks `paths.video_dir` and downloads only missing test videos from the dataset Hub. Existing files are reused, so raising a previous 100-video run to 1,000 fetches only the additional files.
+
+```bash
+# benchmark 1,000 held-out videos
+python full_2class.py --stage latency --latencynum 1000
+
+# tool-dependency benchmark only
+python full_2class.py --stage tooldependency --latencynum 1000
+```
+
+`--latencynum` also forces the latency stage to rerun. `tooldependency` is a standalone stage and runs every subset of the three forensic domains on the same videos: no tools, spatial, spectral, latent, each pair, and all three. It records the full classification/calibration/latency metrics in `metrics/tool_dependency_benchmark.json`. A `static_reference` row is also included for the all-tool Llama pass without cached vision-state reuse.
+
+Because there are three forensic tool domains (`spatial`, `spectral`, `latent`), **all three = all forensic tools**; the benchmark therefore reports both the fixed three-tool condition (`all_tools`) and the full static reference as separate conditions. Patch-proposal time is reported separately as common toolpool overhead.
+
+The regular live benchmark remains in `metrics/latency_benchmark.json` and reports scanner, static arbiter, and each learned CSF profile. Re-run `export` after latency/dependency benchmarking if you want the updated metric files copied into the publishable export bundle.
 - Override any config value with `--set section.key=value`, for example `--set data.max_rows=2000`.
+- **Generation resumes at job level.** `generate` keeps an append-only ledger (`generation.ledger`).
+  A job that succeeded is never re-run; a job that *failed* is retried on the next run, up to
+  `generation.max_attempts` (default 3), because most failures are environmental - an adapter
+  environment that had not finished building, a checkpoint not yet staged. Set
+  `generation.retry_failed=false` for one attempt per job ever.
+- **`kinetics` re-runs itself when its inputs change.** The stage records a fingerprint of the spec's
+  label set, the video target and the demand margin. If any of those move - say a source label is
+  corrected - the completed marker in `state.json` is ignored and the missing clips are fetched, rather
+  than the stage being skipped and generation silently starving. `--set generation.kinetics.rescore=true`
+  forces it too.
+- After the source pool grows, the existing `jobs.csv` still points at the clips it was planned against;
+  the run warns when it notices. Re-plan with `--set generation.rebuild_jobs=true`.
 
 ## 7. Logs and debugging
 
@@ -365,8 +497,17 @@ failures abort with a clear message instead of silently producing an empty datas
 | `CUDA out of memory` elsewhere on a 12 GB card | Close other GPU apps. Then `--set data.num_frames=6 --set train.llama.lora_r=8` and re-run the same command; it resumes. |
 | `Qwen2VLVideoProcessor requires the Torchvision library` | torchvision is missing (the setup scripts install it with torch; a hand-built venv may not have it). Install the build matching your torch: `pip install torchvision --index-url https://download.pytorch.org/whl/cu130` (swap `cu130` for your `torch.version.cuda`). |
 | `no kernel image is available` / `sm_120 not supported` | RTX 50xx needs CUDA 12.8+ wheels: `setup_env.ps1 -Cuda cu128` |
-| `GatedRepoError` for Llama | Accept the licence on the model page, then `huggingface-cli login` |
+| `GatedRepoError` for Llama | Accept the licence on the model page, then `hf auth login` |
 | Many `download failed` / 429 lines | Log in to the Hub (higher limits) or lower `data.download_workers`. Re-running resumes. |
+| `N consecutive download failures (limit 10)` | A burst of CDN errors, usually 5xx. Those are retried with backoff now; if it still trips, the Hub is having a bad day — re-run once it recovers (everything cached is skipped) or raise `--set data.download_fail_fast=25`. |
+| `Generation produced no videos at all` | The message now lists the recorded failures; the full rows are in `runs/<run>/metrics/generation_failures.csv` and the worker logs in `runs/<run>/logs/generation/`. Re-running retries the failed jobs (`generation.max_attempts`). |
+| `Nothing to do: ... no retries left` | Every job has failed `generation.max_attempts` times. Fix the underlying error first, then raise the cap (`--set generation.max_attempts=5`) or delete the job's rows from the ledger file. |
+| `No module named pip` naming a system Python, or `ModuleNotFoundError` for a package the env installs | The env's interpreter is not running as its own venv. `python -m csf.generation.envs --doctor all --envs-root cache/regen/envs` reports each env's interpreter, pip and missing imports; a broken env is rebuilt automatically on the next run, or force it with `--build <env> --force`. |
+| An env build installs the pinned torch, then immediately replaces it with a different one | A requirement declares a newer torch than the env pins (SAM2 asks for >=2.5.1), so pip swaps the CUDA-matched build for a PyPI one - and the next rebuild swaps it back. Each env now writes a `constraints.txt` pinning torch for every install, and the build fails if the pin did not hold. `--doctor` prints the installed torch next to the pinned one. |
+| `NameResolutionError` / `Could not find a version` during an env build | The node cannot reach the package index. Build the envs where it can — `python -m csf.generation.envs --build all --envs-root cache/regen/envs` — then run generation with `--set generation.offline=true`. Also check `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` and `pip.conf`: an unreachable *extra* index fails the install even when PyPI is reachable. Jobs skipped this way cost no retry attempts. |
+| `kinetics` skipped when you expected it to fetch | It is marked complete in `state.json` and its fingerprint still matches. `--force kinetics` re-runs it unconditionally. |
+| `Only N clip(s) pass the 'face' filter` | The face detectors are missing: `pip install insightface onnxruntime` (or `mediapipe`) in the driver environment. Without them the face families have no eligible source clips. |
+| `Only N GiB free disk space` | The figure names the directory it measured (`disk_probe` in the environment line). If that is not the filesystem holding your cache, check `paths.cache_dir`. |
 | Anything else | Open `runs/<run>/logs/crash_rank0.json`. It names the stage, step and video ids that failed. |
 
 ## 8. Outputs and publishing
@@ -388,6 +529,28 @@ python main.py --config configs/full.yaml --stage push
 ```
 Base-model weights are not re-uploaded. The adapters load on top of the original Qwen and Llama repos, which keeps
 the Llama licence gating intact.
+
+## 9.1 Full Real vs AI-Generated run
+
+Use the dedicated two-class config to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
+
+```bash
+bash scripts/run_full_2class.sh
+```
+
+The bundle is written to `runs/full_2class/export/` and records the active class schema in `csf_config.json`. The ablation metrics and macro-F1 are computed over the two active classes rather than averaging in an absent AI-Edited class.
+
+To classify a few videos and keep the full inference result (including the evidence graph whenever tools are executed):
+
+```bash
+python infer_2class.py \
+  --model-dir runs/full_2class/export \
+  --profile balanced \
+  --save-dir runs/full_2class/inference \
+  video1.mp4 video2.mp4 video3.mp4
+```
+
+The command prints **REAL/FAKE**, the model label, confidence, and selected routing action. Each saved JSON contains the probability distribution, latency breakdown, tools executed and `evidence_graph`. An agentic `early_exit` intentionally has no measured tool evidence; use `--mode static` when you require all tool groups and therefore an evidence graph for every video.
 
 ## 9. Using the trained model
 

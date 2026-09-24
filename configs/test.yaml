@@ -1,7 +1,16 @@
 # TEST RUN - verifies the whole pipeline end to end on a 5 000-video stratified subset.
-# Target: a single 12-16 GB GPU (e.g. laptop RTX 5070 Ti 12 GB). Everything is tuned for memory, not accuracy:
+# Target: a single GPU with >=14 GiB free. Everything is tuned for memory, not accuracy:
 # 4-bit QLoRA for both VLMs (incl. the Llama vision tower), 8 frames, a single 560px frame mosaic, batch 1-2 with
 # gradient accumulation + gradient checkpointing, paged 8-bit AdamW, capped optimiser steps.
+#
+# Measured peak VRAM at these settings:
+#   train_qwen    2.9 GiB - comfortable on anything from a T4 up
+#   train_llama  13.4 GiB - needs >=14 GiB. A 12 GiB card CANNOT run the arbiter: the forward pass
+#                 alone holds ~6.5 GiB of activations on top of 6.2 GiB of NF4 weights, at batch 1
+#                 with gradient checkpointing already on.
+# Verified on Tesla T4 15 GiB (sm_75, fp16, 13.35 GiB) and RTX 5070 Ti laptop 12 GiB (sm_120, bf16,
+# 13.45 GiB - OOM). Lowering mosaic_size does NOT help: the Mllama processor always emits 4x 560px
+# tiles whatever the input size, so the arbiter's vision cost is fixed.
 run_name: csf-test
 mode: test
 seed: 42

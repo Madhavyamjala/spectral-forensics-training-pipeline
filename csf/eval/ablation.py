@@ -45,6 +45,30 @@ from csf.tools.toolpool import ALL_FEATURES
 log = get_logger("eval.ablation")
 TOOL_COL = {"proposal": 1, "spatial": 2, "spectral": 3, "latent": 4}
 
+def _align_probs_to_labels(probs: np.ndarray, classes: np.ndarray) -> np.ndarray:
+    """Map classifier probability columns into the canonical tri-class label order.
+
+    Subset-mode runs can train a baseline on fewer than all canonical classes. Scikit-learn
+    then returns one probability column per observed class; downstream CSF evaluation expects
+    a stable [real, ai_generated, ai_edited] representation. Missing classes receive zero.
+
+    Note:
+        The pipeline remains tri-class internally. This helper only normalizes classifier output
+        shape at the evaluation boundary.
+
+    TODO:
+        Distinguish "class absent from this evaluation" from a genuinely zero-probability class
+        in the human-readable report when running subset experiments.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    classes = np.asarray(classes, dtype=int)
+    aligned = np.zeros((len(probs), len(LABELS)), dtype=np.float64)
+    for src_idx, label_id in enumerate(classes):
+        if 0 <= int(label_id) < len(LABELS):
+            aligned[:, int(label_id)] = probs[:, src_idx]
+    return aligned
+
+
 
 def _tensors(o: Dict[str, np.ndarray], device):
     state = torch.tensor(o["state"].astype(np.float32), device=device)
@@ -143,7 +167,7 @@ def _baselines(cfg: Config, index: pd.DataFrame, test_keys: np.ndarray) -> Dict[
     if all(c in index.columns for c in ("width", "height", "fps", "duration_sec", "bitrate", "codec", "has_audio")):
         clf = HistGradientBoostingClassifier(max_iter=300, random_state=cfg.seed).fit(meta(train), train["label"])
         t0 = time.perf_counter()
-        probs = clf.predict_proba(meta(test))
+        probs = _align_probs_to_labels(clf.predict_proba(meta(test)), clf.classes_)
         per = (time.perf_counter() - t0) / len(test)
         res["baseline_metadata_shortcut"] = {"probs": probs, "latency": np.full(len(test), per), "tool": np.zeros(len(test))}
 
@@ -151,7 +175,7 @@ def _baselines(cfg: Config, index: pd.DataFrame, test_keys: np.ndarray) -> Dict[
     Xtr, Xte = _load_raw_features(train, cfg.cache_dir), _load_raw_features(test, cfg.cache_dir)
     clf = HistGradientBoostingClassifier(max_iter=400, random_state=cfg.seed).fit(Xtr, train["label"])
     t0 = time.perf_counter()
-    probs = clf.predict_proba(Xte)
+    probs = _align_probs_to_labels(clf.predict_proba(Xte), clf.classes_)
     per = (time.perf_counter() - t0) / len(test)
     tools = test[["t_proposal", "t_spatial", "t_spectral", "t_latent"]].sum(1).to_numpy()
     res["baseline_toolpool_gbdt"] = {"probs": probs, "latency": test["t_decode"].to_numpy() + tools + per,
@@ -170,9 +194,12 @@ def evaluate_ablation(cfg: Config, index: pd.DataFrame, scanner_test: Dict[str, 
     results: Dict[str, Dict[str, Any]] = {}
     raw: Dict[str, Dict[str, np.ndarray]] = {}
 
+    active_ids = cfg.data.active_label_ids()
+
     def add(name, probs, latency, tool=None, actions=None):
         results[name] = classification_report_dict(y, probs, latency, methods, actions,
-                                                    ACTIONS if actions is not None else None, tool, cfg.eval.ece_bins)
+                                                    ACTIONS if actions is not None else None, tool, cfg.eval.ece_bins,
+                                                    active_label_ids=active_ids)
         raw[name] = {"probs": probs, "latency": latency}
 
     add("A_qwen_scanner", o["scanner_probs"], decode + o["scanner_latency"])
@@ -211,6 +238,7 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     pdir.mkdir(parents=True, exist_ok=True)
     made = []
     main = [k for k in results if k.startswith(("A_", "B_", "C_"))]
+    active_ids = cfg.data.active_label_ids()
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for name, m in results.items():
@@ -232,7 +260,7 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     axes = np.atleast_1d(axes)
     for ax, name in zip(axes, main):
         ConfusionMatrixDisplay(np.array(results[name]["confusion_matrix_normalized"]),
-                               display_labels=[PRETTY_LABELS[l] for l in LABELS]).plot(ax=ax, colorbar=False,
+                               display_labels=[PRETTY_LABELS[LABELS[l]] for l in active_ids]).plot(ax=ax, colorbar=False,
                                                                                          values_format=".2f")
         ax.set_title(name, fontsize=8)
         ax.tick_params(labelsize=7)
@@ -241,8 +269,9 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
     plt.close(fig)
     made.append("confusion_matrices.png")
 
-    fig, axes = plt.subplots(1, len(LABELS), figsize=(15, 4.5))
-    for k, ax in enumerate(axes):
+    fig, axes = plt.subplots(1, len(active_ids), figsize=(4.5 * len(active_ids), 4.5))
+    axes = np.atleast_1d(axes)
+    for ax, k in zip(axes, active_ids):
         for name in main:
             try:
                 RocCurveDisplay.from_predictions((y == k).astype(int), raw[name]["probs"][:, k], name=name, ax=ax,
@@ -306,6 +335,16 @@ def _plots(results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray, cfg: C
 
 def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y: np.ndarray,
                  extra: Dict[str, Any]) -> Path:
+    """Write the subset-aware ablation report and its tabular summary.
+
+    Note:
+        active_ids must be derived here as well as in evaluation because this function owns
+        the report tables and is called directly by the pipeline.
+
+    TODO:
+        Add a focused report-generation regression test.
+    """
+    active_ids = cfg.data.active_label_ids()
     mdir = cfg.work_dir / "metrics"
     mdir.mkdir(parents=True, exist_ok=True)
     (mdir / "ablation_metrics.json").write_text(json.dumps({"models": results, **extra}, indent=2, default=float),
@@ -319,8 +358,8 @@ def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y:
         row["fake_recall"] = m["binary_fake_detection"]["recall"]
         row["miss_rate"] = m["binary_fake_detection"]["miss_rate"]
         row["false_alarm_rate"] = m["binary_fake_detection"]["false_alarm_rate"]
-        for lab in LABELS:
-            row[f"f1_{lab}"] = m["per_class"][lab]["f1"]
+        for lab in active_ids:
+            row[f"f1_{LABELS[lab]}"] = m["per_class"][LABELS[lab]]["f1"]
         rows.append(row)
     df = pd.DataFrame(rows)
     df.to_csv(mdir / "ablation_summary.csv", index=False)
@@ -332,9 +371,10 @@ def write_report(cfg: Config, results: Dict[str, Dict], raw: Dict[str, Dict], y:
         return f"{100 * v:.2f}" if pct else (f"{v:.1f}" if abs(v) >= 10 else f"{v:.3f}")
 
     lines = [f"# Chrono-Spectral Forensics - ablation report ({cfg.run_name}, mode={cfg.mode})", "",
-             f"Test videos: {len(y)} | class counts: " + ", ".join(f"{PRETTY_LABELS[l]}={int((y == i).sum())}"
-                                                                     for i, l in enumerate(LABELS)), "",
-             "## Main comparison (three model types)", "",
+             f"Test videos: {len(y)} | class counts: " + ", ".join(f"{PRETTY_LABELS[LABELS[i]]}={int((y == i).sum())}"
+                                                                     for i in active_ids), "",
+             f"Active classes: " + ", ".join(PRETTY_LABELS[LABELS[i]] for i in active_ids), "",
+             "## Main comparison (model types)", "",
              "| Model | Acc % | Bal-Acc % | Macro-F1 % | ROC-AUC | Fake recall % | Miss rate % | False alarm % | ECE | p50 ms | p95 ms | videos/s | Early exit |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for _, r in df.iterrows():

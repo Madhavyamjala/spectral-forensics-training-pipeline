@@ -32,6 +32,7 @@ class DataConfig:
     repo_id: str = "madhav-yrc/Chrono-TriClass-100k"
     revision: Optional[str] = None
     manifest: str = "manifest.csv"
+    classes: Optional[List[str]] = None   # train on a subset of LABELS; None = all three
     max_rows: Optional[int] = 5000
     num_frames: int = 8
     frame_size: int = 224
@@ -47,6 +48,17 @@ class DataConfig:
     prefetch: int = 16
     download_fail_fast: int = 10
     extract_fail_fast: int = 50
+
+    def active_label_ids(self) -> List[int]:
+        """Label ids this run actually trains on. `classes` narrows the manifest to a subset - used
+        while a class is unusable (being regenerated, or mislabelled) so the run is not blocked by it."""
+        from csf import LABEL2ID
+        if not self.classes:
+            return list(range(len(LABEL2ID)))
+        unknown = [c for c in self.classes if c not in LABEL2ID]
+        if unknown:
+            raise ValueError(f"data.classes contains unknown label(s) {unknown}; valid: {list(LABEL2ID)}")
+        return sorted(LABEL2ID[c] for c in self.classes)
 
 
 @dataclass
@@ -178,7 +190,26 @@ class GenerationConfig:
     min_free_gb: float = 50.0
     offline: bool = False                       # fail instead of building envs on the fly
     deadline_hours: Optional[float] = None      # stop scheduling new groups after this long
-    retry_failed: bool = False
+    # Retry jobs that failed on an earlier run. On by default: nearly every failure seen in
+    # practice is environmental (an adapter env still building, a checkpoint not yet staged,
+    # a busy GPU), and treating the first failure as final leaves the run permanently stuck
+    # with nothing pending and nothing produced. `max_attempts` caps the retries per job.
+    retry_failed: bool = True
+    max_attempts: int = 3
+    # Re-plan jobs.csv from the current source pool instead of reusing the existing plan.
+    # Needed after the pool changes (new labels, more clips): the old plan still points at the
+    # clips that existed when it was written. Job ids are derived from the assignment, so
+    # re-planning starts the ledger fresh for anything that moved.
+    rebuild_jobs: bool = False
+    #: Where to find checkpoints that cannot be downloaded unattended (Google Drive, Tsinghua
+    #: Cloud, OneDrive). Download them once by hand, drop them in this folder under the exact
+    #: filename the adapter expects, and the env build copies them into place.
+    staged_weights_dir: str = "./model_paths"
+    #: Delete every built per-model environment before generating, so they are recreated from
+    #: scratch. Destructive and expensive - it re-downloads torch, every requirement and every
+    #: checkpoint - so it is meant as `--set generation.burn_envs=true` for a one-off clean
+    #: rebuild, not as a standing setting in a config file.
+    burn_envs: bool = False
     keep_old_edited: bool = False
     only_models: List[str] = field(default_factory=list)      # restrict the run to these models
     skip_models: List[str] = field(default_factory=list)

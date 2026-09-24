@@ -45,10 +45,11 @@ def _level(z: float) -> str:
     return "typical"
 
 
-def build_evidence_graph(z: np.ndarray, mask: np.ndarray) -> nx.DiGraph:
+def build_evidence_graph(z: np.ndarray, mask: np.ndarray, candidate_labels: Optional[List[str]] = None) -> nx.DiGraph:
     g = nx.DiGraph()
     g.add_node("video", kind="root")
-    g.add_node("class_hypothesis", kind="latent_cause", candidates=["Real", "AI-Generated", "AI-Edited"])
+    candidates = list(candidate_labels) if candidate_labels is not None else ["Real", "AI-Generated", "AI-Edited"]
+    g.add_node("class_hypothesis", kind="latent_cause", candidates=candidates)
     g.add_edge("video", "class_hypothesis")
     mechanisms = {"global_synthesis": GLOBAL_SYNTHESIS_EVIDENCE, "local_edit": LOCAL_EDIT_EVIDENCE,
                   "temporal_incoherence": TEMPORAL_EVIDENCE}
@@ -69,8 +70,20 @@ def build_evidence_graph(z: np.ndarray, mask: np.ndarray) -> nx.DiGraph:
     return g
 
 
-def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] = None) -> str:
-    lines = ["Forensic evidence graph (z-scores vs. the training distribution):"]
+def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] = None,
+                  candidate_labels: Optional[List[str]] = None) -> str:
+    """Serialize measured tool evidence for the arbiter prompt.
+
+    Note:
+        The default wording remains tri-class for backwards compatibility; two-class runs pass
+        their active class names explicitly.
+
+    TODO:
+        Store prompt-template version in the export manifest for experiment reproducibility.
+    """
+    candidates = list(candidate_labels) if candidate_labels else ["Real", "AI-Generated", "AI-Edited"]
+    lines = ["Forensic evidence graph (z-scores vs. the training distribution):",
+             "Candidate classes: " + ", ".join(candidates)]
     for gi, group in enumerate(TOOL_GROUPS):
         if not mask[gi]:
             lines.append(f"[{group}] not executed")
@@ -86,6 +99,10 @@ def evidence_text(z: np.ndarray, mask: np.ndarray, scanner_note: Optional[str] =
             lines.append(f"mechanism {mech} <- " + ", ".join(support))
     if scanner_note:
         lines.append(scanner_note)
-    lines.append("Rule of thumb: low DIRE = fits a generative latent manifold (AI-Generated); "
-                 "authentic global statistics with localized phase/colour spikes = AI-Edited.")
+    if "AI-Edited" in candidates:
+        lines.append("Rule of thumb: low DIRE = fits a generative latent manifold (AI-Generated); "
+                     "authentic global statistics with localized phase/colour spikes = AI-Edited.")
+    else:
+        lines.append("Rule of thumb: lower DIRE can support a generative explanation; "
+                     "interpret the evidence jointly with the class hypotheses above.")
     return "\n".join(lines)

@@ -61,22 +61,33 @@ class CSFDetector:
     def __init__(self, model_dir: str, device: Optional[str] = None, quantization: Optional[str] = None,
                  components: Iterable[str] = ("qwen", "llama", "vae"), attn_implementation: str = "sdpa"):
         self.dir = _resolve_dir(model_dir)
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        if device is not None:
+            self.device = torch.device(device)
+        elif torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            self.device = torch.device("cpu")
         self.dtype = compute_dtype_for(self.device)
         self.cfg = json.loads((self.dir / "csf_config.json").read_text(encoding="utf-8"))
         self.stats = json.loads((self.dir / "feature_stats.json").read_text(encoding="utf-8"))
+        self.active_ids = list(self.cfg.get("active_label_ids", range(len(LABELS))))
+        self.active_classes = list(self.cfg.get("classes", LABELS))
         components = set(components)
         self.qwen = self.qwen_proc = self.llama = self.runner = self.vae = None
         if "qwen" in components:
             self.qwen, self.qwen_proc, _ = load_classifier(self.dir / "qwen_scanner", self.device, quantization,
                                                            attn_implementation=attn_implementation)
-            self.qwen_collate = QwenCollator(self.qwen_proc)
+            self.qwen_collate = QwenCollator(
+                self.qwen_proc,
+                [PRETTY_LABELS[LABELS[i]] for i in self.active_ids],
+            )
         if "llama" in components:
             from csf.pipeline import ArbiterRunner
             self.llama, proc, _ = load_classifier(self.dir / "llama_arbiter", self.device, quantization,
                                                   attn_implementation=attn_implementation)
             self.runner = ArbiterRunner(self.llama, proc, _Cfg({"mosaic_frames": self.cfg["mosaic_frames"],
-                                                                "mosaic_size": self.cfg["mosaic_size"]}), self.device)
+                                                                "mosaic_size": self.cfg["mosaic_size"]}), self.device,
+                                         active_ids=self.active_ids)
         if "vae" in components:
             self.vae = LatentTool(self.cfg["vae_id"], self.cfg.get("vae_subfolder"), self.cfg["vae_fallback_id"],
                                   self.device, torch.float16 if self.device.type == "cuda" else torch.float32)
@@ -107,7 +118,8 @@ class CSFDetector:
         t = time.perf_counter()
         with torch.no_grad(), torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == "cuda"):
             logits, _ = self.qwen(**{k: v for k, v in batch.items() if k not in ("labels", "keys")})
-        probs = torch.softmax(logits.float(), -1)[0].cpu().numpy()
+        from csf.pipeline import _active_probs_from_logits
+        probs = _active_probs_from_logits(logits, self.active_ids)[0].cpu().numpy()
         self._sync()
         return probs, time.perf_counter() - t
 
@@ -159,10 +171,14 @@ class CSFDetector:
                    probs={PRETTY_LABELS[l]: float(v) for l, v in zip(LABELS, probs)},
                    action=action, tools_run=groups, profile=profile if mode == "agentic" else None,
                    latency_ms={k: round(v * 1000, 2) for k, v in lat.items()},
-                   total_latency_ms=round(sum(lat.values()) * 1000, 2))
+                   total_latency_ms=round(sum(lat.values()) * 1000, 2),
+                   is_fake=bool(LABELS[int(np.argmax(probs))] != "real"))
         if z is not None:
             from networkx.readwrite import json_graph
-            out["evidence_graph"] = json_graph.node_link_data(build_evidence_graph(z, mask))
+            out["evidence_graph"] = json_graph.node_link_data(
+                build_evidence_graph(z, mask,
+                                     candidate_labels=[PRETTY_LABELS[x] for x in self.active_classes])
+            )
         return out
 
 

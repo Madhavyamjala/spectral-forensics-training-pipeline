@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from csf.generation import progress
 from csf.logging_utils import get_logger
 
 log = get_logger("generation.prefetch")
@@ -50,6 +51,7 @@ class HubAsset:
     used_by: str = ""
     allow_patterns: Optional[Sequence[str]] = None
     note: str = ""
+    check_only: bool = False               # access-checked, never downloaded (content streams later)
 
 
 def training_assets(cfg) -> List[HubAsset]:
@@ -100,15 +102,24 @@ def generation_assets() -> List[HubAsset]:
     # base diffusion models the workers load by id at runtime
     for repo, used in (("black-forest-labs/FLUX.1-schnell", "bg_flux_image, bg_svd_video"),
                        ("stabilityai/stable-video-diffusion-img2vid-xt", "bg_svd_video"),
-                       ("stabilityai/stable-diffusion-2-1-base", "tokenflow")):
+                       ("Manojb/stable-diffusion-2-1-base", "tokenflow")):
         seen.setdefault(repo, HubAsset(repo, stage="generate", used_by=used))
     return sorted(seen.values(), key=lambda a: a.repo_id)
 
 
 def dataset_assets(cfg) -> List[HubAsset]:
-    out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train",
-                    used_by="real / ai_generated classes", files=("manifest.csv",),
-                    note="manifest only; videos stream during the features stage")]
+    local = Path(cfg.data.manifest)
+    if local.is_file():
+        # Mirrors resolve_manifest: a local manifest is used as-is, and the videos stream during
+        # `features`, so only access to the repo matters. Always requesting the repo's root
+        # manifest.csv - which the dataset does not have - 404'd and aborted every default run.
+        out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train", check_only=True,
+                        used_by="training videos",
+                        note=f"access check only; local manifest {local} is used")]
+    else:
+        out = [HubAsset(cfg.data.repo_id, kind="dataset", stage="train",
+                        used_by="training videos", files=(local.name,),
+                        note="manifest only; videos stream during the features stage")]
     hf_repo = getattr(cfg.generation.kinetics, "hf_repo", None)
     if hf_repo:
         out.append(HubAsset(hf_repo, kind="dataset", stage="generate",
@@ -125,7 +136,14 @@ def all_assets(cfg, stage: str = "all") -> List[HubAsset]:
     rather than downloading them twice.
     """
     merged: Dict[str, HubAsset] = {}
-    for a in training_assets(cfg) + generation_assets() + dataset_assets(cfg):
+    candidates = training_assets(cfg) + generation_assets() + dataset_assets(cfg)
+    # Filter by stage BEFORE merging. The merge widens a shared repo's download to the union of
+    # what each side wants, and the SVD video generator wants the whole repo - so a train-only
+    # prefetch that merged first inherited it and pulled ~20 GB of UNet and image encoder, when the
+    # DIRE tool needs only the VAE subfolder.
+    if stage != "all":
+        candidates = [a for a in candidates if a.stage == stage]
+    for a in candidates:
         prior = merged.get(a.repo_id)
         if prior is None:
             merged[a.repo_id] = a
@@ -133,6 +151,7 @@ def all_assets(cfg, stage: str = "all") -> List[HubAsset]:
         if prior.stage != a.stage:
             prior.stage = "both"
         prior.gated = prior.gated or a.gated
+        prior.check_only = prior.check_only and a.check_only   # download if either side needs it
         prior.files = tuple(sorted(set(prior.files) | set(a.files)))
         used = [u for u in (prior.used_by, a.used_by) if u]
         prior.used_by = "; ".join(dict.fromkeys(used))
@@ -170,7 +189,7 @@ def check_access(asset: HubAsset, token: Optional[str] = None) -> Optional[str]:
         return None
     except GatedRepoError:
         return (f"GATED: accept the licence at https://huggingface.co/{asset.repo_id} "
-                f"then `huggingface-cli login` (or set HF_TOKEN)")
+                f"then `hf auth login` (or set HF_TOKEN)")
     except RepositoryNotFoundError:
         return (f"NOT FOUND (or private): https://huggingface.co/{asset.repo_id} - check the id, "
                 f"or log in if it is private")
@@ -232,7 +251,7 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
     log.info("Prefetch: %d Hub asset(s) for stage %r", len(assets), stage)
 
     blocked: Dict[str, str] = {}
-    for a in assets:
+    for a in progress.track(assets, "checking access", unit="repo", log_every=5):
         reason = check_access(a, token)
         if reason:
             blocked[a.repo_id] = reason
@@ -246,24 +265,27 @@ def prefetch(cfg, stage: str = "all", dry_run: bool = False,
         raise RuntimeError(
             "Cannot reach gated repo(s): " + ", ".join(gated_blocked) + ".\n"
             + "\n".join(f"  {r}: {blocked[r]}" for r in gated_blocked) +
-            "\nAccept the licence on each model page, then `huggingface-cli login`.")
+            "\nAccept the licence on each model page, then `hf auth login`.")
 
     if dry_run:
         return {"assets": len(assets), "blocked": blocked, "dry_run": True}
 
+    todo = [a for a in assets if a.repo_id not in blocked and not a.check_only]
     results, failed, total_gb = [], [], 0.0
-    for a in assets:
-        if a.repo_id in blocked:
-            continue
-        log.info("Fetching %s ...", a.repo_id)
-        r = fetch(a, token)
-        results.append(r)
-        if r.get("ok"):
-            total_gb += float(r.get("size_gb") or 0.0)
-            log.info("  %s -> %.2f GB in %.0fs", a.repo_id, r["size_gb"], r["seconds"])
-        else:
-            failed.append(r)
-            log.error("  %s FAILED: %s", a.repo_id, r.get("error"))
+    with progress.bar(len(todo), "downloading repos", "repo", log_every=1) as pbar:
+        for a in todo:
+            pbar.set_postfix_str(a.repo_id[:40])
+            log.info("Fetching %s ...", a.repo_id)
+            with progress.Heartbeat(f"downloading {a.repo_id}"):
+                r = fetch(a, token)
+            pbar.update(1)
+            results.append(r)
+            if r.get("ok"):
+                total_gb += float(r.get("size_gb") or 0.0)
+                log.info("  %s -> %.2f GB in %.0fs", a.repo_id, r["size_gb"], r["seconds"])
+            else:
+                failed.append(r)
+                log.error("  %s FAILED: %s", a.repo_id, r.get("error"))
 
     report = {"assets": len(assets), "fetched": len(results) - len(failed),
               "failed": [f["repo_id"] for f in failed], "blocked": blocked,

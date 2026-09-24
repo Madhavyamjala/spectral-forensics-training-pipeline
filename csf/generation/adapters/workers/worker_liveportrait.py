@@ -31,11 +31,17 @@ MAX_FRAMES = 160
 MAX_SIDE = 720
 
 #: (eye ratio, lip ratio) per expression variant - the magnitude the job asked for.
+#:
+#: Retargeting moves eyelids and lips on the face that is already there. It cannot change age,
+#: hair colour or add an accessory, so those variants are deliberately absent and a job asking
+#: for one is refused rather than rendered. The previous table mapped hair_color to (0.0, 0.0),
+#: which would have written out an unmodified clip labelled as a hair-colour edit - a sample
+#: with no manipulation in it at all, in a dataset whose entire purpose is detecting
+#: manipulation.
 EXPRESSION_RETARGET = {
     "smile_happiness": (0.0, 0.5), "sadness_crying": (-0.2, -0.3), "anger": (-0.3, -0.2),
     "surprise": (0.6, 0.4), "eye_gaze_modification": (0.5, 0.0),
-    "mouth_expression_modification": (0.0, 0.6), "age": (0.1, 0.1),
-    "hair_color": (0.0, 0.0), "facial_attributes": (0.2, 0.2),
+    "mouth_expression_modification": (0.0, 0.6),
 }
 
 
@@ -53,7 +59,7 @@ def load() -> State:
     if not weights.exists() or not any(weights.iterdir()):
         raise RuntimeError(
             f"LivePortrait weights missing at {weights}. Fetch them with:\n"
-            f"    cd {repo} && huggingface-cli download KlingTeam/LivePortrait "
+            f"    cd {repo} && hf download KlingTeam/LivePortrait "
             f"--local-dir pretrained_weights")
     note(f"liveportrait: repo {repo}")
     return State(repo, "")
@@ -89,21 +95,34 @@ def render(state: State, payload: dict) -> dict:
             drive_frames, _ = read_video(driving, max_frames=MAX_FRAMES, max_side=512)
             driving_mp4 = tmp / "driving.mp4"
             write_video(drive_frames, str(driving_mp4), fps=fps)
-            cmd += ["-d", str(driving_mp4), "--flag_relative_motion", "true"]
+            # LivePortrait's CLI is tyro over a dataclass: a bool field is a switch and
+            # takes no value, and relative motion is on by default anyway
+            cmd += ["-d", str(driving_mp4)]
             meta.update(reenactment_model="liveportrait",
                         driving_video_id=Path(driving).stem, target_video_id=Path(src).stem,
                         target_identity=Path(src).stem, driving_identity=Path(driving).stem)
         elif mode == "expression":
             variant = payload.get("variant") or "smile_happiness"
-            eye, lip = EXPRESSION_RETARGET.get(variant, (0.2, 0.3))
+            if variant not in EXPRESSION_RETARGET:
+                raise RuntimeError(
+                    f"LivePortrait retargeting cannot produce the '{variant}' variant - it "
+                    f"deforms the face that is already in the frame. Supported: "
+                    f"{sorted(EXPRESSION_RETARGET)}. This job should have been routed to a "
+                    f"renderer that performs that edit.")
+            eye, lip = EXPRESSION_RETARGET[variant]
             magnitude = float((payload.get("metadata") or {}).get("edit_magnitude", 0.5) or 0.5)
             # drive the clip with itself, then let retargeting supply the edit
-            cmd += ["-d", str(source_mp4),
-                    "--flag_eye_retargeting", "true", "--flag_lip_retargeting", "true",
-                    "--eye_retargeting_multiplier", f"{1.0 + eye * magnitude:.3f}",
-                    "--lip_retargeting_multiplier", f"{1.0 + lip * magnitude:.3f}"]
+            # There are no retargeting multipliers in this release - the flags that do
+            # exist are switches with ratios computed internally, which would leave
+            # edit_magnitude recording a number nothing acted on. `driving_multiplier` is a
+            # real scalar: drive the clip with itself and scale the motion, with
+            # animation_region=exp so only the expression moves and the pose stays put.
+            strength = 1.0 + max(abs(eye), abs(lip)) * magnitude
+            cmd += ["-d", str(source_mp4), "--animation_region", "exp",
+                    "--driving_multiplier", f"{strength:.3f}"]
             meta.update(edit_model="liveportrait_expr", manipulation_type=variant,
-                        edit_magnitude=magnitude, eye_ratio=eye, lip_ratio=lip,
+                        edit_magnitude=magnitude, driving_multiplier=round(strength, 3),
+                        eye_ratio=eye, lip_ratio=lip,
                         # retargeting edits the face in place, so identity is preserved
                         identity_preserved=True)
         else:
