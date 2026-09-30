@@ -6,14 +6,14 @@ What it does
                  CSV list), labels each video real / ai_generated / ai_edited with a category
                  (generator or edit type), flags generators that overlap the Chrono-TriClass training
                  sources, and re-encodes every video to one codec / fps / resolution so that no
-                 detector can separate the classes by container format (csf.data.normalize: 854x480
+                 detector can separate the classes by container format (safer.data.normalize: 854x480
                  letterbox, 24 fps, first 10 s, no audio, H.264 CRF 23 - the paper's protocol).
-    2. csf       The exported CSF bundle (csf.inference.CSFDetector) in every mode: scanner, static,
+    2. csf       The exported CSF bundle (safer.inference.CSFDetector) in every mode: scanner, static,
                  and agentic for each dispatcher profile.
     2b. per_action
                  The SAFER paper's per-action outcome run: for every video, every dispatcher action's
                  prediction and latency (scanner, no-tool arbiter, static, the arbiter given each tool
-                 subset), written to <out>/per_action/ for `python -m csf.eval.paper external`, plus score
+                 subset), written to <out>/per_action/ for `python -m safer.eval.paper external`, plus score
                  files for the report (pa_scanner, pa_default, pa_static, pa_evidence_<action>, ...).
     3. qwen_zeroshot
                  The same Qwen2.5-VL-3B backbone without LoRA or head, asked "Real or Fake?". Scored by
@@ -105,8 +105,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from csf import LABEL2ID, LABELS, PRETTY_LABELS  # noqa: E402
-from csf.data.normalize import normalize_video, parse_size  # noqa: E402
+from safer import LABEL2ID, LABELS, PRETTY_LABELS  # noqa: E402
+from safer.data.normalize import normalize_video, parse_size  # noqa: E402
 
 REAL, GENERATED, EDITED = LABEL2ID["real"], LABEL2ID["ai_generated"], LABEL2ID["ai_edited"]
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".gif"}
@@ -290,8 +290,8 @@ def adapter_chrono(name: str, arg: str, config: Optional[str]) -> Tuple[pd.DataF
     ensure_latency_videos (which downloads whatever rows it is handed)."""
     if not config:
         raise SystemExit("--config is required for the chrono adapter")
-    from csf.config import load_config
-    from csf.eval.latency import ensure_latency_videos
+    from safer.config import load_config
+    from safer.eval.latency import ensure_latency_videos
     cfg = load_config(config)
     n = int(arg)
     index = _chrono_index(cfg)
@@ -329,7 +329,7 @@ def _sample(df: pd.DataFrame, cap: Optional[int], seed: int) -> pd.DataFrame:
 
 
 def _probe(path: str) -> Optional[Dict[str, Any]]:
-    from csf.generation.kinetics import probe_video
+    from safer.generation.kinetics import probe_video
     try:
         return probe_video(Path(path))
     except Exception:
@@ -342,7 +342,7 @@ def step_prepare(args, datasets: Dict[str, Tuple[str, str]], extra_maps: Dict[st
     overlap = {_norm(g) for g in args.overlap_generators.split(",") if g.strip()}
     ffmpeg = None
     if not args.no_normalize:
-        from csf.generation.ffmpeg_tools import ffmpeg_exe
+        from safer.generation.ffmpeg_tools import ffmpeg_exe
         ffmpeg = ffmpeg_exe()
         if ffmpeg is None:
             raise SystemExit("ffmpeg not found (needed to normalise videos). Install it, or pass --no-normalize "
@@ -472,7 +472,7 @@ def _probs_record(probs: Dict[str, float]) -> Dict[str, float]:
 
 def step_csf(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[int, int]) -> None:
     import torch
-    from csf.inference import CSFDetector
+    from safer.inference import CSFDetector
     if not args.model_dir:
         raise SystemExit("--model-dir (the exported CSF bundle) is required for the csf step")
     modes = [m.strip() for m in args.csf_modes.split(",") if m.strip()]
@@ -555,7 +555,7 @@ def step_per_action(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[int, 
     Per video: decode, scanner, all tool groups once (masked per action - a masked group is hidden from
     the arbiter's prompt entirely, so this equals running only that action's groups), the no-tool arbiter
     pass (which caches the vision states), the static pass (all tools, pixels), and one cached arbiter pass
-    per tool action. Writes the raw table to <out>/per_action/ for csf.eval.paper, and derived score files:
+    per tool action. Writes the raw table to <out>/per_action/ for safer.eval.paper, and derived score files:
         pa_scanner          SAFER-Scanner
         pa_arbiter_notool   arbiter with an empty evidence graph (the same-reasoner baseline)
         pa_default          no-tool exit = mean(scanner, no-tool arbiter) = SAFER default
@@ -564,10 +564,10 @@ def step_per_action(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[int, 
         pa_evidence_<a>     evidence mode: mean(scanner, arbiter given a's tools)
     Latency per mode follows the paper's accounting (decode + every forward pass + every tool group run)."""
     import torch
-    from csf.inference import CSFDetector
-    from csf.graph import normalize_features
-    from csf.models.dispatcher import ACTION_GROUPS, ACTIONS, action_mask_array
-    from csf.tools.toolpool import TOOL_GROUPS
+    from safer.inference import CSFDetector
+    from safer.graph import normalize_features
+    from safer.models.dispatcher import ACTION_GROUPS, ACTIONS, action_mask_array
+    from safer.tools.toolpool import TOOL_GROUPS
     det = CSFDetector(args.model_dir, components=("qwen", "llama", "vae"), attn_implementation=args.attn)
     tool_actions = [a for a in ACTIONS if a != "early_exit"]
     names = _per_action_names(ACTIONS)
@@ -668,7 +668,7 @@ def step_qwen_zeroshot(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[in
         from transformers import Qwen2_5_VLForConditionalGeneration as QwenVL
     except ImportError:                                   # very new transformers renamed the auto class
         from transformers import AutoModelForImageTextToText as QwenVL
-    from csf.data.video_io import decode_frames, to_vlm_frames
+    from safer.data.video_io import decode_frames, to_vlm_frames
 
     frame_cfg = {"num_frames": 8, "frame_size": 224, "tool_max_side": 1024}
     model_id = args.qwen_id
@@ -742,7 +742,7 @@ META_COLS = ("width", "height", "fps", "duration_sec", "bitrate", "codec", "has_
 
 
 def _meta_matrix(df: pd.DataFrame) -> np.ndarray:
-    # identical feature construction to csf/eval/ablation.py::_baselines.meta
+    # identical feature construction to safer/eval/ablation.py::_baselines.meta
     return np.column_stack([df["width"], df["height"], df["fps"], df["duration_sec"],
                             np.log1p(df["bitrate"].astype(float)), (df["codec"] == "h264").astype(int),
                             df["has_audio"].astype(int)]).astype(np.float32)
@@ -752,7 +752,7 @@ def step_metadata(args, manifests: Dict[str, pd.DataFrame]) -> None:
     from sklearn.ensemble import HistGradientBoostingClassifier
     if not args.config:
         raise SystemExit("--config is required for the metadata step (it trains on that run's train split)")
-    from csf.config import load_config
+    from safer.config import load_config
     cfg = load_config(args.config)
     index = _chrono_index(cfg)
     missing = [c for c in META_COLS if c not in index.columns]
@@ -989,7 +989,7 @@ def _pred_vector(d: pd.DataFrame) -> Optional[np.ndarray]:
 
 
 def step_report(args, manifests: Dict[str, pd.DataFrame]) -> None:
-    from csf.eval.metrics import classification_report_dict
+    from safer.eval.metrics import classification_report_dict
     out = Path(args.out)
     rdir = out / "report"
     rdir.mkdir(parents=True, exist_ok=True)
@@ -1175,7 +1175,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     ap.add_argument("--profiles", default="ultra_fast,balanced,max_security")
     ap.add_argument("--qwen-id", default=None, help="zero-shot backbone (default: the bundle's qwen_id)")
     ap.add_argument("--attn", default="sdpa")
-    ap.add_argument("--gpus", default="", help="e.g. 0,1,2,3: one worker per GPU for the csf/qwen steps")
+    ap.add_argument("--gpus", default="", help="e.g. 0,1,2,3: one worker per GPU for the safer/qwen steps")
     ap.add_argument("--shard", default="0/1", help=argparse.SUPPRESS)
     ap.add_argument("--external", action="append", default=[], help="NAME='command with {videos} {out}'")
     ap.add_argument("--ingest", action="append", default=[], help="NAME=/path/scores_{dataset}.csv")

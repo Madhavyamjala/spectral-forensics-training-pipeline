@@ -1,5 +1,5 @@
 """
-Tests for csf.eval.paper (the SAFER paper's analyses) on small synthetic outcome tables whose answers
+Tests for safer.eval.paper (the SAFER paper's analyses) on small synthetic outcome tables whose answers
 can be worked out by hand. Torch-free: numpy, scikit-learn, scipy, pandas.
 """
 
@@ -14,8 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from csf.eval import paper  # noqa: E402
-from csf.eval.paper import (ACTIONS, TOOL_ACTIONS, SupervisedRouter, Table, adaptation, choose_tau,  # noqa: E402
+from safer.eval import paper  # noqa: E402
+from safer.eval.paper import (ACTIONS, TOOL_ACTIONS, SupervisedRouter, Table, adaptation, choose_tau,  # noqa: E402
                             decision_changes, fixed_broken, generator_disjoint_split, low_latency, mcnemar,
                             oracle, table_from_outcomes, table_from_per_action, tool_value)
 

@@ -18,14 +18,14 @@ Hugging Face mirror
 ### Changes made
 
 Every AI-Edited video this pipeline produces is a **modified** Kinetics-400 clip. Source clips are
-re-encoded and then altered by one of the manipulation models in `csf/generation/adapters/` — face
+re-encoded and then altered by one of the manipulation models in `safer/generation/adapters/` — face
 swapping, reenactment, lip-sync, expression editing, object insertion/removal, inpainting,
 background replacement or whole-frame transformation. The generated `manifest.csv` records, per
 row, which model produced the video (`model`), which specification slot it fills (`spec_model`)
 and which Kinetics clip it came from (`source_clip_id`).
 
 Datasets produced by this repository are released under **CC BY 4.0**, the same licence as the
-source. `csf/generation/upload.py` writes this attribution into the dataset card and an
+source. `safer/generation/upload.py` writes this attribution into the dataset card and an
 `ATTRIBUTION.md` on every push.
 
 ## Model weights
@@ -52,4 +52,4 @@ attention:
   `CSF_SD_ID` at another source if you prefer one; whatever renders is what the manifest records.
 - **Llama-3.2-11B-Vision-Instruct** — gated; accept the licence on its model page before use.
 
-`python -m csf.generation.adapters` lists every model with its environment and notes.
+`python -m safer.generation.adapters` lists every model with its environment and notes.

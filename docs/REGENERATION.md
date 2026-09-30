@@ -13,8 +13,8 @@ parameters — which is what makes per-method forensic analysis possible at all.
 ## 0. Before you start
 
 ```bash
-python -m csf.generation.prefetch --list            # the ~21 Hub repos a run needs
-python -m csf.generation.prefetch --stage generate  # pull them (~90 GB), resumable
+python -m safer.generation.prefetch --list            # the ~21 Hub repos a run needs
+python -m safer.generation.prefetch --stage generate  # pull them (~90 GB), resumable
 ```
 
 Source clips come from the Hugging Face mirror
@@ -60,7 +60,7 @@ is enough on a machine where you cannot install system packages.
 
 Kinetics-400 is **CC BY 4.0**, and every AI-Edited video is a modified Kinetics clip, so anything
 you redistribute has to credit the original authors, link the licence and say that changes were
-made. `csf/generation/upload.py` writes all three into the dataset card and an `ATTRIBUTION.md`
+made. `safer/generation/upload.py` writes all three into the dataset card and an `ATTRIBUTION.md`
 on every push; see [ATTRIBUTION.md](../ATTRIBUTION.md) in the repo root.
 
 ## 1. What gets built
@@ -85,7 +85,7 @@ Every (source group × model) cell count is derived by controlled rounding from 
 margins, so rows and columns both add up exactly. Inspect the full plan with:
 
 ```bash
-python -m csf.generation.spec
+python -m safer.generation.spec
 ```
 
 The document's hand-computed tables are reproduced exactly at the base targets — including the
@@ -113,7 +113,7 @@ fingerprint to VideoReTalking, and the per-method accuracy breakdown - the thing
 regeneration exists to enable - would report a model that never ran.
 
 ```bash
-python -m csf.generation.adapters      # full table: slot, renderer, videos, GPU-hours
+python -m safer.generation.adapters      # full table: slot, renderer, videos, GPU-hours
 ```
 
 **Coverage: 26,828 of 33,333 videos (80.5%) across 23 distinct renderers**, of which 12,515 are
@@ -207,7 +207,7 @@ workers/GPU   effective GPU-h   wall clock on 4 GPUs
 ```
 
 ```bash
-python -m csf.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
+python -m safer.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
 ```
 
 Raise `generation.max_workers_per_gpu` past 4 and nothing improves — the diffusion models are
@@ -221,7 +221,7 @@ least `budget_diversity_floor` (default 2) *distinct renderers* per family — r
 slots, since two VACE slots are one mechanism — and spending the rest on volume.
 
 ```bash
-python -m csf.generation.budget --hours 84 --gpus 3      # 18 models, 18,941 videos
+python -m safer.generation.budget --hours 84 --gpus 3      # 18 models, 18,941 videos
 ```
 
 This is preferred over `deadline_hours`, which stops whichever group is in flight when it fires
@@ -406,7 +406,7 @@ The `regen_manifest` stage writes two files from one pass over the produced vide
 
 | file | purpose |
 |---|---|
-| `manifest_regen.csv` | training-facing, read by `csf.data.manifest` on every run - class, split, method |
+| `manifest_regen.csv` | training-facing, read by `safer.data.manifest` on every run - class, split, method |
 | `metadata.csv` | analysis-facing, **70 columns**, 43 of them the specification's per-video fields |
 
 They share `video_id`. Splitting them keeps the manifest narrow (the ablation only needs class,
@@ -414,7 +414,7 @@ split and method) while making the attribution fields the document asks for - id
 quality, visibility, occlusion, pose, mask class, audio source - real queryable columns rather
 than a truncated JSON blob.
 
-Column groups, listed by `python -m csf.generation.metadata --columns`:
+Column groups, listed by `python -m safer.generation.metadata --columns`:
 
 - **identity** - `video_id`, `family`, `model`, `spec_model`, `substituted`, `split`, `sha256`
 - **container** - duration, resolution, fps, codec, bitrate, audio. Probed from the *produced*
@@ -445,7 +445,7 @@ Rebuild it at any time without re-rendering anything - it is reconstructed from 
 the generation ledger:
 
 ```bash
-python -m csf.generation.metadata --config configs/regen.yaml
+python -m safer.generation.metadata --config configs/regen.yaml
 ```
 
 The push uploads `metadata.csv` and `metadata_schema.json` alongside the manifest, so the Hub
@@ -477,7 +477,7 @@ rather than missing ones. Dry-run first with `--set generation.push.dry_run=true
 | `No clips were downloaded to ...` | The download genuinely produced nothing - check `hf_repo` / `local_root` / `mirror_base` and your Hub login. |
 | `N label(s) the spec needs have no file in this mirror` | Those Kinetics classes are spelled differently (or absent) upstream. The sampler redistributes within each source group, so a few are harmless. |
 | `Only N clips pass the 'face' filter` | No face detector in the **driver** environment (the adapter envs have their own). `pip install insightface onnxruntime` or `pip install mediapipe`, then re-run with `--set generation.kinetics.rescore=true`. Without it the face families fall back to the unfiltered pool and their workers will reject clips with no face. |
-| `The interpreter for env 'X' is missing` | The env did not finish building. Rebuild it: `python -m csf.generation.envs --build X --force`. |
+| `The interpreter for env 'X' is missing` | The env did not finish building. Rebuild it: `python -m safer.generation.envs --build X --force`. |
 | A whole model group fails instantly | Usually a missing weight. Read `runs/regen/logs/generation/worker_<model>_gpu<N>.log` — the worker names the file it wanted. |
 | `group abandoned after N consecutive failures` | `fail_fast` tripped. The group is skipped, the run continues; fix the cause and re-run with `retry_failed=true`. |
 | `NotImplemented[<model>]` | Tier-2 model. Expected — see §2. |

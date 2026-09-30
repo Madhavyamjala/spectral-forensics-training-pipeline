@@ -155,7 +155,7 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
         log.warning("CUDA is NOT available - training will run on CPU (only sensible for tiny smoke tests).")
 
     if cfg.generation.enabled and selected & set(GENERATION_STAGES):
-        from csf.generation.ffmpeg_tools import INSTALL_HINT, describe, ffprobe_exe, have_ffmpeg
+        from safer.generation.ffmpeg_tools import INSTALL_HINT, describe, ffprobe_exe, have_ffmpeg
         info.update(describe())
         if not have_ffmpeg():
             raise RuntimeError(
@@ -178,7 +178,7 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
 
     # free space is not permission to write: a per-user quota refuses the write with terabytes
     # still free on the filesystem, and every symptom downstream wears a different costume
-    from csf.generation.diskcheck import require_writable
+    from safer.generation.diskcheck import require_writable
     require_writable(cfg.paths.cache_dir, mib=16, label="the cache")
     if Path(cfg.paths.video_dir).resolve() != Path(cfg.paths.cache_dir).resolve():
         require_writable(cfg.paths.video_dir, mib=16, label="the videos")
@@ -257,18 +257,18 @@ def _stale_reason(name: str, cfg, info):
     """
     if name not in GENERATION_STAGES:
         return None
-    from csf.generation import run as generation
+    from safer.generation import run as generation
     return generation.stale_reason(name, cfg, info)
 
 
 def main() -> int:
     """Run the selected stages of the forensics pipeline."""
     args = parse_args()
-    from csf.config import load_config
+    from safer.config import load_config
     cfg = load_config(args.config, args.overrides)
 
-    from csf.distributed import barrier, cleanup, init_distributed
-    from csf.logging_utils import RunState, setup_logging, stage
+    from safer.distributed import barrier, cleanup, init_distributed
+    from safer.logging_utils import RunState, setup_logging, stage
 
     # Bind the driver to a GPU the run is actually allowed to use. On a shared box GPU 0 often
     # belongs to something else, and a single-process run has no LOCAL_RANK to take the hint from.
@@ -354,7 +354,7 @@ def main() -> int:
             if should_run("prefetch"):
                 report = {}
                 if dist_info.is_main:
-                    from csf.generation.prefetch import prefetch
+                    from safer.generation.prefetch import prefetch
                     report = prefetch(cfg, stage="train")
                 # mark() ends in a barrier, so every rank has to call it. Calling it on rank 0 only
                 # left rank 0 one barrier ahead for the rest of the run: the other ranks paired their
@@ -373,7 +373,7 @@ def main() -> int:
                 "must not run under torchrun. Run them first on a single process:\n"
                 f"    python main.py --config {args.config} --stage {','.join(gen_selected)}\n"
                 "then launch the training stages with torchrun as usual.")
-        from csf.generation import run as generation
+        from safer.generation import run as generation
         handlers = {"prefetch": generation.stage_prefetch,
                     "kinetics": generation.stage_kinetics, "generate": generation.stage_generate,
                     "regen_manifest": generation.stage_regen_manifest,
@@ -395,7 +395,7 @@ def main() -> int:
         if dist_info.is_main:
             cfg.save(work_dir / "resolved_config.json")
 
-    from csf.data.manifest import load_run_manifest
+    from safer.data.manifest import load_run_manifest
     run_manifest = work_dir / "run_manifest.csv"
     if should_run("prepare") or not run_manifest.exists():
         with stage("prepare", work_dir, dist_info.rank):
@@ -424,7 +424,7 @@ def main() -> int:
                         ", ".join(f"{c} {v:.0%}" for c, v in thin.items()))
     if should_run("features") or not index_file.exists() or stale_index:
         with stage("features", work_dir, dist_info.rank):
-            from csf.data.feature_cache import build_feature_cache
+            from safer.data.feature_cache import build_feature_cache
             index = build_feature_cache(df, cfg, dist_info)
             mark("features", cached=int(len(index)))
     index = pd.read_parquet(index_file)
@@ -434,7 +434,7 @@ def main() -> int:
     log.info("Cached dataset: %d videos | %s", len(index), index["split"].value_counts().to_dict())
 
     ckpt = {k: work_dir / "checkpoints" / k / "best" for k in ("qwen", "llama")}
-    from csf.train.classifier_trainer import train_classifier
+    from safer.train.classifier_trainer import train_classifier
     for kind in ("qwen", "llama"):
         name = f"train_{kind}"
         missing = name in selected and not (ckpt[kind] / "head.pt").exists()
@@ -451,11 +451,11 @@ def main() -> int:
                     raise RuntimeError(f"{name} finished without producing {ckpt[kind]}")
                 mark(name)
 
-    from csf.pipeline import build_outcomes, load_npz, predict_scanner, save_npz
+    from safer.pipeline import build_outcomes, load_npz, predict_scanner, save_npz
     pred_dir = work_dir / "predictions"
     if should_run("predict_scanner"):
         with stage("predict_scanner", work_dir, dist_info.rank):
-            from csf.models.classifier import load_classifier
+            from safer.models.classifier import load_classifier
             bundle = load_classifier(ckpt["qwen"], dist_info.device, attn_implementation=cfg.models.attn_implementation)
             for split in ("valid", "test"):
                 res = predict_scanner(cfg, dist_info, index, stats, ckpt["qwen"], split, model_bundle=bundle)
@@ -476,7 +476,7 @@ def main() -> int:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             mark("outcomes")
 
-    from csf.eval.ablation import evaluate_ablation, train_dispatchers, write_report
+    from safer.eval.ablation import evaluate_ablation, train_dispatchers, write_report
     disp_dir = work_dir / "checkpoints" / "dispatcher"
     if should_run("train_dispatcher"):
         with stage("train_dispatcher", work_dir, dist_info.rank):
@@ -498,7 +498,7 @@ def main() -> int:
                 write_report(cfg, results, raw, o_test["labels"], extra)
             mark("evaluate")
 
-    from csf.hub import export_bundle, push_interactive
+    from safer.hub import export_bundle, push_interactive
     export_dir = work_dir / "export"
     if should_run("export"):
         with stage("export", work_dir, dist_info.rank):
@@ -508,8 +508,8 @@ def main() -> int:
 
     if should_run("latency"):
         with stage("latency", work_dir, dist_info.rank):
-            from csf import PRETTY_LABELS
-            from csf.eval.latency import ensure_latency_videos, live_latency_benchmark
+            from safer import PRETTY_LABELS
+            from safer.eval.latency import ensure_latency_videos, live_latency_benchmark
 
             if dist_info.is_main:
                 ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
@@ -529,8 +529,8 @@ def main() -> int:
 
     if should_run("tooldependency"):
         with stage("tooldependency", work_dir, dist_info.rank):
-            from csf import PRETTY_LABELS
-            from csf.eval.latency import ensure_latency_videos, tool_dependency_benchmark
+            from safer import PRETTY_LABELS
+            from safer.eval.latency import ensure_latency_videos, tool_dependency_benchmark
 
             if not export_dir.exists():
                 raise RuntimeError(
@@ -555,7 +555,7 @@ def main() -> int:
     if should_run("report"):
         with stage("report", work_dir, dist_info.rank):
             if dist_info.is_main:
-                from csf.eval.report import write_full_results_report
+                from safer.eval.report import write_full_results_report
                 write_full_results_report(cfg, index)
             mark("report")
 

@@ -55,7 +55,7 @@ generation:
   # room for training inside a week. The planner picks the model set up front instead: it keeps
   # at least `budget_diversity_floor` distinct renderers per family, then spends the rest on
   # volume. Set to null to run everything and take the extra days.
-  #   python -m csf.generation.budget --hours 84 --gpus 3      # preview the selection
+  #   python -m safer.generation.budget --hours 84 --gpus 3      # preview the selection
   budget_wall_clock_hours: null   # null = run every wired model (the full 33,333)
   budget_diversity_floor: 2
   budget_pin_models: []

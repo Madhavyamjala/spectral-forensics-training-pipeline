@@ -33,7 +33,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 def _load_classifier() -> types.ModuleType:
     """Load the retry helpers without importing cv2/torch, which tests must not need."""
-    src = (ROOT / "csf" / "data" / "video_io.py").read_text(encoding="utf-8")
+    src = (ROOT / "safer" / "data" / "video_io.py").read_text(encoding="utf-8")
     body = src[src.index("def _status_code"):src.index("def download_video")]
     mod = types.ModuleType("video_io_retry")
     mod.__dict__.update({"re": re, "Optional": Optional})
@@ -89,7 +89,7 @@ def test_retry_classification() -> None:
           mod._status_code(_HubError("Server error '503 Service Unavailable'")) == 503)
     check("a message with no status yields None", mod._status_code(Exception("boom")) is None)
 
-    src = (ROOT / "csf" / "data" / "video_io.py").read_text(encoding="utf-8")
+    src = (ROOT / "safer" / "data" / "video_io.py").read_text(encoding="utf-8")
     check("download_video routes every failure through the classifier",
           "if not is_transient(exc) or attempt > max_retries:" in src)
     check("the retry loop still backs off exponentially",
@@ -99,7 +99,7 @@ def test_retry_classification() -> None:
 def test_abort_message() -> None:
     """A run that stops must say what survived, in numbers."""
     print("abort message")
-    src = (ROOT / "csf" / "data" / "feature_cache.py").read_text(encoding="utf-8")
+    src = (ROOT / "safer" / "data" / "feature_cache.py").read_text(encoding="utf-8")
     check("the abort reports how many items are already cached",
           "Nothing cached is lost:" in src and "item(s) for this" in src)
     check("it says a re-run resumes rather than starting over",

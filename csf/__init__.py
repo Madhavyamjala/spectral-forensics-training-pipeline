@@ -1,22 +1,61 @@
 """
-SAFER: cost-aware forensic evidence acquisition for AI-generated video detection.
+Compatibility alias: this package was renamed to `safer`.
 
-The package keeps the project's working name `csf` (Chrono-Spectral Forensics). The paper's setting is binary
-(Real vs AI-Generated, Chrono-66k: the two-class part of the Chrono-TriClass-100k manifest, selected with
-`data.classes`); the code also supports the full three-class Real / AI-Generated / AI-Edited setting.
-
-    Frontline   Qwen2.5-VL-3B scanner + Llama-3.2-Vision no-tool pass  -> csf.models.classifier
-    Dispatcher  GRPO cost-aware router (exit without tools, or pay for tools) -> csf.models.dispatcher
-    Toolpool    spatial / spectral / latent forensic features             -> csf.tools
-    Arbiter     evidence graph + the same Llama-3.2-Vision weights       -> csf.graph, csf.models.classifier
-
-The no-tool arbiter pass is the same-reasoner baseline against which the value of every tool subset is measured.
-
-Entry point: main.py at the repository root (full_2class.py for the paper's configuration).
+`import csf`, `import csf.inference`, `from csf.eval.metrics import ...` and `python -m csf.<module>` all keep
+working. Every `csf.X` resolves to the *same module object* as `safer.X` (not a second copy), so classes,
+registries and module-level state are shared and `isinstance` checks behave. New code should import `safer`.
 """
 
-__version__ = "1.0.0"
+from __future__ import annotations
 
-LABELS = ["real", "ai_generated", "ai_edited"]
-LABEL2ID = {name: i for i, name in enumerate(LABELS)}
-PRETTY_LABELS = {"real": "Real", "ai_generated": "AI-Generated", "ai_edited": "AI-Edited"}
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+
+import safer as _safer
+
+_PREFIX = __name__ + "."
+
+
+class _SaferAlias(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Resolves csf.X to safer.X. Also serves runpy (`python -m csf.X`) through get_code."""
+
+    @staticmethod
+    def _target(fullname: str) -> str:
+        return "safer." + fullname[len(_PREFIX):]
+
+    def find_spec(self, fullname, path=None, target=None):
+        if not fullname.startswith(_PREFIX):
+            return None
+        real = importlib.util.find_spec(self._target(fullname))
+        if real is None:
+            return None
+        # origin is the real file: runpy uses it for sys.argv[0] and __file__ under `python -m csf.X`
+        spec = importlib.util.spec_from_loader(fullname, self, origin=real.origin,
+                                               is_package=real.submodule_search_locations is not None)
+        spec.has_location = real.has_location
+        if real.submodule_search_locations is not None:
+            spec.submodule_search_locations = list(real.submodule_search_locations)
+        return spec
+
+    def create_module(self, spec):
+        return importlib.import_module(self._target(spec.name))
+
+    def exec_module(self, module):
+        pass                                           # already executed as safer.X
+
+    # runpy (`python -m csf.X`) executes the target's code as __main__
+    def get_code(self, fullname):
+        real = importlib.util.find_spec(self._target(fullname))
+        return real.loader.get_code(real.name)
+
+    def is_package(self, fullname):
+        real = importlib.util.find_spec(self._target(fullname))
+        return real is not None and real.submodule_search_locations is not None
+
+
+if not any(isinstance(f, _SaferAlias) for f in sys.meta_path):
+    sys.meta_path.insert(0, _SaferAlias())
+
+sys.modules[__name__] = _safer

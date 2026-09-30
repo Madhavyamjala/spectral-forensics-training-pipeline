@@ -26,10 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from csf.generation import spec as S
-from csf.generation.adapters import (ADAPTERS, coverage, cost_estimate, env_specs,
+from safer.generation import spec as S
+from safer.generation.adapters import (ADAPTERS, coverage, cost_estimate, env_specs,
                                      videos_per_model)
-from csf.generation.jobs import Job, build_jobs, object_operations, summarise
+from safer.generation.jobs import Job, build_jobs, object_operations, summarise
 
 FAILURES: list = []
 
@@ -182,7 +182,7 @@ def test_degraded_pool() -> None:
 
 def test_naming() -> None:
     print("manifest compatibility")
-    # the regex from csf/data/manifest.py:repo_path_for must resolve every generated id
+    # the regex from safer/data/manifest.py:repo_path_for must resolve every generated id
     pattern = re.compile(r"^aiedit-(.+)-\d+$")
     ok = True
     for family in S.FAMILIES:
@@ -256,7 +256,7 @@ def test_substitutions() -> None:
 
 def test_budget() -> None:
     print("budget planner")
-    from csf.generation.budget import family_breakdown, plan
+    from safer.generation.budget import family_breakdown, plan
 
     full = cost_estimate(gpus=3)
     check("full cost is reported", full["gpu_hours_total"] > 0)
@@ -337,8 +337,8 @@ def test_reallocation() -> None:
 
 def test_concurrency() -> None:
     print("concurrency model")
-    from csf.generation.budget import effective_speedup, wall_clock_estimate
-    from csf.generation.scheduler import concurrency_for
+    from safer.generation.budget import effective_speedup, wall_clock_estimate
+    from safer.generation.scheduler import concurrency_for
 
     check("a 3 GB model packs many workers into 143 GB",
           concurrency_for("inswapper", 143.0, 6) == 6)
@@ -366,7 +366,7 @@ def test_concurrency() -> None:
 def test_kinetics_schema() -> None:
     """The default mirror carries no label column and stores clip paths, not bytes."""
     print("kinetics mirror schema")
-    from csf.generation.kinetics import (Annotation, label_from_path, rank_clips,
+    from safer.generation.kinetics import (Annotation, label_from_path, rank_clips,
                                          resolve_row_label, _safe_name)
 
     wanted = {"playing guitar": 10, "riding a bike": 10, "singing": 5}
@@ -420,8 +420,8 @@ def test_kinetics_schema() -> None:
 def test_attribution() -> None:
     """Kinetics-400 is CC BY 4.0, so anything we redistribute has to carry the credit."""
     print("licence attribution")
-    from csf.config import load_config
-    from csf.generation.upload import KINETICS_ATTRIBUTION, build_dataset_card
+    from safer.config import load_config
+    from safer.generation.upload import KINETICS_ATTRIBUTION, build_dataset_card
 
     card = build_dataset_card(load_config("configs/regen.yaml"),
                               {"per_class": {"ai_edited": 33333},
@@ -442,7 +442,7 @@ def test_metadata() -> None:
     print("per-video metadata")
     import json as _json
 
-    from csf.generation.metadata import (CONTAINER_COLUMNS, IDENTITY_COLUMNS, coverage,
+    from safer.generation.metadata import (CONTAINER_COLUMNS, IDENTITY_COLUMNS, coverage,
                                          metadata_columns, metadata_row, spec_metadata_columns)
 
     cols = metadata_columns()
@@ -506,7 +506,7 @@ def test_metadata_merge() -> None:
     import csv as _csv
     import tempfile
 
-    from csf.generation.metadata import merge_metadata, read_metadata, write_metadata
+    from safer.generation.metadata import merge_metadata, read_metadata, write_metadata
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "metadata.csv"
@@ -588,7 +588,7 @@ def test_probe_fallback() -> None:
     import subprocess as _sp
     import tempfile
 
-    import csf.generation.kinetics as K
+    import safer.generation.kinetics as K
 
     original_run = _sp.run
     original_cv = K._probe_with_opencv
@@ -662,7 +662,7 @@ def test_ffmpeg_resolution() -> None:
     import sys as _sys
     import types as _types
 
-    import csf.generation.ffmpeg_tools as F
+    import safer.generation.ffmpeg_tools as F
 
     orig_usable, orig_run = F._usable, _sp.run
     orig_module = _sys.modules.get("imageio_ffmpeg")
@@ -707,8 +707,8 @@ def test_ffmpeg_resolution() -> None:
         F.ffmpeg_exe.cache_clear()
         F.ffprobe_exe.cache_clear()
 
-    # the workers carry their own copy, since they cannot import csf
-    common = (Path(__file__).resolve().parent.parent / "csf" / "generation" / "adapters"
+    # the workers carry their own copy, since they cannot import safer
+    common = (Path(__file__).resolve().parent.parent / "safer" / "generation" / "adapters"
               / "workers" / "_common.py").read_text(encoding="utf-8")
     check("workers resolve ffmpeg rather than hardcoding it",
           'subprocess.run(["ffmpeg"' not in common and '["ffprobe"' not in common)
@@ -794,7 +794,7 @@ def test_progress() -> None:
     print("progress reporting")
     import inspect
 
-    from csf.generation import progress as P
+    from safer.generation import progress as P
 
     check("duration formatting is human", P._fmt_duration(75) == "1m15s"
           and P._fmt_duration(3725) == "1h02m", P._fmt_duration(3725))
@@ -818,7 +818,7 @@ def test_progress() -> None:
     check("the heartbeat tracks elapsed time", beat.elapsed > 0)
 
     # the stages a long run spends its time in must all report progress
-    from csf.generation import envs, filters, kinetics, manifest_build, prefetch, scheduler
+    from safer.generation import envs, filters, kinetics, manifest_build, prefetch, scheduler
     for module, name in ((envs, "envs"), (filters, "filters"), (kinetics, "kinetics"),
                          (manifest_build, "manifest_build"), (prefetch, "prefetch"),
                          (scheduler, "scheduler")):
@@ -842,8 +842,8 @@ def test_env_paths() -> None:
     import shutil as _shutil
     import tempfile
 
-    import csf.generation.envs as E
-    from csf.generation.adapters import base as adapter_base
+    import safer.generation.envs as E
+    from safer.generation.adapters import base as adapter_base
 
     with tempfile.TemporaryDirectory() as tmp:
         rel = os.path.relpath(tmp, os.getcwd())
@@ -873,7 +873,7 @@ def test_env_paths() -> None:
     # the same trap as the interpreter: a worker's cwd is its env root, so a relative video
     # root would put every mp4 under cache/.../envs/<env>/ and the driver would record "ok"
     # for a file it cannot find
-    from csf.generation.scheduler import GenerationScheduler
+    from safer.generation.scheduler import GenerationScheduler
     sched = GenerationScheduler(video_root=Path("cache/rel/videos"), envs_root=Path("cache/envs"),
                                 log_dir=Path("logs"), gpus=[0])
     check("the video root is absolute", sched.video_root.is_absolute(), str(sched.video_root))
@@ -895,7 +895,7 @@ def test_no_job_left_behind() -> None:
     print("job accounting")
     import inspect
 
-    from csf.generation import scheduler as S_
+    from safer.generation import scheduler as S_
 
     src = inspect.getsource(S_.GenerationScheduler._run_group)
     check("slot failures are caught rather than killing the thread",
@@ -912,7 +912,7 @@ def test_retry_policy() -> None:
     print("retry policy")
     import tempfile
 
-    from csf.generation.scheduler import Ledger, Outcome, group_jobs
+    from safer.generation.scheduler import Ledger, Outcome, group_jobs
 
     def job(n: int, model: str = "inswapper") -> Job:
         return Job(job_id=f"j{n}", video_id=f"v{n}", family="face_swap", model=model,
@@ -1005,7 +1005,7 @@ def test_retry_policy() -> None:
 def test_stage_staleness() -> None:
     """A completed stage must re-run when the inputs it depended on have changed."""
     print("stage staleness")
-    from csf.generation import run as R
+    from safer.generation import run as R
 
     class _K:
         demand_margin = 1.2
@@ -1087,7 +1087,7 @@ def test_env_interpreter() -> None:
     import subprocess
     import tempfile
 
-    from csf.generation.envs import EnvSpec, _venv_is_sane, _venv_python, diagnose
+    from safer.generation.envs import EnvSpec, _venv_is_sane, _venv_python, diagnose
 
     with tempfile.TemporaryDirectory() as tmp:
         venv = Path(tmp) / "env" / "venv"
@@ -1119,7 +1119,7 @@ def test_env_interpreter() -> None:
     try:
         os.environ["PYTHONPATH"] = "/driver/site-packages"
         os.environ["PYTHONHOME"] = "/conda/base"
-        from csf.generation.envs import ReadyEnv
+        from safer.generation.envs import ReadyEnv
         ready = ReadyEnv(EnvSpec(name="x", torch=""), Path("/envs/x"),
                          Path("/envs/x/venv/bin/python"), {"r": Path("/envs/x/repos/r")})
         env = ready.environ()
@@ -1141,7 +1141,7 @@ def test_env_interpreter() -> None:
                 os.environ[key] = value
 
     # a requirement must not be able to swap the pinned torch out from under the env
-    import csf.generation.envs as E_
+    import safer.generation.envs as E_
     with tempfile.TemporaryDirectory() as tmp:
         spec = EnvSpec(name="pinned", torch="torch==2.5.1 torchvision==0.20.1")
         check("torch pins are read off the spec",
@@ -1176,7 +1176,7 @@ def test_env_interpreter() -> None:
           env_specs()["sam2_diffusers"].torch)
 
     # burning: only registered environments, nothing else living under the envs root
-    from csf.generation.envs import burn_envs
+    from safer.generation.envs import burn_envs
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         for name in ("insightface", "sam2_diffusers", "not_an_env"):
@@ -1191,7 +1191,7 @@ def test_env_interpreter() -> None:
         check("burn on an empty root is a no-op", burn_envs(specs, root / "nope") == {})
 
     # 'all' must mean "every env a runnable model needs", and a list must be accepted
-    import csf.generation.envs as _E
+    import safer.generation.envs as _E
     src_cli = inspect.getsource(_E._main)
     check("'all' skips envs no implemented adapter uses",
           "a.implemented" in src_cli and "no implemented adapter uses" in src_cli)
@@ -1202,7 +1202,7 @@ def test_env_interpreter() -> None:
           f"{len(live)} vs {len(env_specs())}")
 
     # a Git LFS pointer is not a checkpoint
-    from csf.generation.envs import WeightFile, _is_lfs_pointer, _staged_file
+    from safer.generation.envs import WeightFile, _is_lfs_pointer, _staged_file
     with tempfile.TemporaryDirectory() as tmp:
         staged = Path(tmp)
         (staged / "real.pth").write_bytes(b"\x80\x02}q\x00." * 100)
@@ -1304,7 +1304,7 @@ def test_env_interpreter() -> None:
           all("transformers>=4" in r and (",<5" in r or ",<4." in r)
               for sp in specs_all.values() for r in sp.pip_requirements()
               if r.startswith("transformers")))
-    from csf.generation.envs import FRAMEWORK_PROBE, _verify_framework
+    from safer.generation.envs import FRAMEWORK_PROBE, _verify_framework
 
     # a stub interpreter whose framework probe reports PyTorch disabled: both the build and
     # the doctor must refuse it, because every other signal in such an env looks healthy
@@ -1347,7 +1347,7 @@ esac
 
     # the swap must survive the state that broke it: opencv-python uninstalled out from under
     # opencv-python-headless, whose metadata then suppresses the reinstall
-    from csf.generation.adapters import RUNTIME_SWAP
+    from safer.generation.adapters import RUNTIME_SWAP
     import ast as _ast
     _ast.parse(RUNTIME_SWAP)
     for pkg in ("onnxruntime", "onnxruntime-gpu", "opencv-python", "opencv-python-headless",
@@ -1355,7 +1355,7 @@ esac
         check(f"the swap removes {pkg} before installing", f"'{pkg}'" in RUNTIME_SWAP)
     check("the swap imports what it installed, so a silent no-op cannot pass",
           "importlib.import_module(name)" in RUNTIME_SWAP)
-    from csf.generation.adapters import ENVS as ALL_ENVS
+    from safer.generation.adapters import ENVS as ALL_ENVS
     check("no env pins opencv alongside insightface, which pulls its own",
           not any("opencv" in r
                   for n in ("dreamid", "reface", "insightface", "faceshifter")
@@ -1400,7 +1400,7 @@ esac
           != EnvSpec(name="x", verify_imports=("b",)).digest())
 
     # the build must confirm the env works rather than trusting its own marker
-    build_src = inspect.getsource(__import__("csf.generation.envs", fromlist=["build_env"]).build_env)
+    build_src = inspect.getsource(__import__("safer.generation.envs", fromlist=["build_env"]).build_env)
     check("a ready marker is re-verified before the env is handed out",
           "_venv_is_sane(py, venv_dir)" in build_src and "_verify_imports" in build_src)
     check("pip is bootstrapped when the venv has none", "_ensure_pip(py," in build_src)
@@ -1410,7 +1410,7 @@ esac
 def test_variant_capability() -> None:
     """No job may carry a manipulation_type its renderer cannot actually perform."""
     print("variant capability")
-    from csf.generation.jobs import variant_pools
+    from safer.generation.jobs import variant_pools
 
     allowed = {k for k, a in ADAPTERS.items() if a.implemented}
     jobs = build_jobs(synthetic_pool(400), S.FAMILY_TARGETS, seed=42, allowed_models=allowed)
@@ -1431,12 +1431,12 @@ def test_variant_capability() -> None:
           "facial_attributes" not in {j.variant for j in expr})
 
     # the worker tables must agree with what the registry advertises
-    lp = (Path(__file__).resolve().parents[1] / "csf/generation/adapters/workers"
+    lp = (Path(__file__).resolve().parents[1] / "safer/generation/adapters/workers"
           / "worker_liveportrait.py").read_text(encoding="utf-8")
     check("LivePortrait has no no-op retargeting entry",
           '"hair_color": (0.0, 0.0)' not in lp)
     check("LivePortrait refuses a variant it cannot perform", "cannot produce the" in lp)
-    sg = (Path(__file__).resolve().parents[1] / "csf/generation/adapters/workers"
+    sg = (Path(__file__).resolve().parents[1] / "safer/generation/adapters/workers"
           / "worker_styleganex.py").read_text(encoding="utf-8")
     check("StyleGANEX maps each variant to a released checkpoint",
           "styleganex_edit_age.pt" in sg and "styleganex_edit_hair.pt" in sg)
@@ -1595,7 +1595,7 @@ def test_worker_dependencies() -> None:
                   rx.sub(lambda m: m.group(1), "np.float32 np.int64 np.bool_")
                   == "np.float32 np.int64 np.bool_")
 
-    dreamid = (ROOT / "csf/generation/adapters/workers/worker_dreamid.py").read_text()
+    dreamid = (ROOT / "safer/generation/adapters/workers/worker_dreamid.py").read_text()
     for flag in ("--ref_image", "--ref_video", "--save_file", "--dreamidv_ckpt",
                  "generate_dreamidv.py"):
         check(f"the DreamID-V worker uses {flag}", flag in dreamid)
@@ -1642,7 +1642,7 @@ def test_second_round_dependencies() -> None:
     check("Wav2Lip's shared intermediates become per-job", "CSF_JOB_TMP" in w2l)
     for shared in ("'temp/temp.wav'", "'temp/result.avi'"):
         check(f"{shared} is rewritten", shared in w2l)
-    worker = (ROOT / "csf/generation/adapters/workers/worker_wav2lip.py").read_text()
+    worker = (ROOT / "safer/generation/adapters/workers/worker_wav2lip.py").read_text()
     check("the worker sets the variable the patch reads", "CSF_JOB_TMP" in worker)
 
     sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
@@ -1652,7 +1652,7 @@ def test_second_round_dependencies() -> None:
     check("but the build still fails if the weights are absent afterwards",
           "did not produce" in sad)
 
-    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    vi = (ROOT / "safer/generation/adapters/workers/worker_videoinpaint.py").read_text()
     check("FuseFormer's output is read from the clone it actually writes to",
           "_result.mp4" in vi and "state.repo" in vi)
     check("and is named per job, so concurrent workers cannot collide",
@@ -1665,7 +1665,7 @@ def test_import_scanner() -> None:
     print("import scanner")
     import tempfile
 
-    from csf.generation.importscan import format_report, scan
+    from safer.generation.importscan import format_report, scan
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp) / "repo"
@@ -1771,7 +1771,7 @@ def test_import_scanner() -> None:
 def test_envs_cli_root() -> None:
     """The envs command must build where the pipeline looks."""
     print("envs cli root")
-    src = (ROOT / "csf/generation/envs.py").read_text()
+    src = (ROOT / "safer/generation/envs.py").read_text()
     check("the CLI has no hard-coded env root of its own",
           '"./cache/generation/envs"' not in src,
           "it used to default somewhere the run stage never reads, so a rebuild landed in a "
@@ -1780,7 +1780,7 @@ def test_envs_cli_root() -> None:
     check("--envs-root still overrides it", '"override the root from --config"' in src)
     check("and it says which root it chose", "Environments root: %s (from %s)" in src)
 
-    from csf.config import load_config
+    from safer.config import load_config
     cfg = load_config(str(ROOT / "configs/regen.yaml"), [])
     check("the config's env root is the regen tree",
           cfg.generation.envs_root.rstrip("/").endswith("cache/regen/envs"),
@@ -1812,7 +1812,7 @@ def test_musetalk_dwpose_patch() -> None:
     print("musetalk dwpose patch")
     import tempfile
 
-    from csf.generation.adapters import MUSETALK_DWPOSE_PATCH
+    from safer.generation.adapters import MUSETALK_DWPOSE_PATCH
 
     # the lines the patch targets, exactly as upstream writes them
     upstream = (
@@ -1914,7 +1914,7 @@ def test_third_round_dependencies() -> None:
     check("and the headless OpenCV is restored after mmcv drags the full one in",
           joined.index("mmcv==1.7.2") < joined.index("opencv-python-headless"))
 
-    envs_src = (ROOT / "csf/generation/envs.py").read_text()
+    envs_src = (ROOT / "safer/generation/envs.py").read_text()
     check("a hook that pip-installs honours the same pins as the requirements step",
           'hook_env["PIP_CONSTRAINT"]' in envs_src,
           "mmcv pulls numpy 2 into an env built entirely against numpy<2 otherwise")
@@ -1932,7 +1932,7 @@ def test_third_round_dependencies() -> None:
     sad = "".join("".join(c) for c in envs["sadtalker"].post_install)
     check("SadTalker's ragged alignment array is flattened", "np.squeeze(s)" in sad)
 
-    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    smoke_src = (ROOT / "safer/generation/smoke.py").read_text()
     check("smoke honours accept_noncommercial like the run stage does",
           "CSF_ACCEPT_NONCOMMERCIAL" in smoke_src,
           "otherwise REFace reports a licence gate as though it were a broken model")
@@ -1987,7 +1987,7 @@ def test_last_three_findings() -> None:
           "kornia.utils.grid" in tf and "from kornia.geometry import create_meshgrid" in tf,
           "kornia 0.8 collapsed kornia/utils into a deprecation shim")
 
-    scan_src = (ROOT / "csf/generation/importscan.py").read_text()
+    scan_src = (ROOT / "safer/generation/importscan.py").read_text()
     check("a module reached through a sys.path edit counts as local", "repo_index" in scan_src,
           "MuseTalk appends its own directory, so face_detection is importable and was "
           "being reported as missing")
@@ -1997,7 +1997,7 @@ def test_runtime_failures() -> None:
     """The fourteen the first clean-scan sweep still failed on, each for its own reason."""
     print("runtime failures")
     envs = env_specs()
-    worker = lambda name: (ROOT / f"csf/generation/adapters/workers/worker_{name}.py").read_text()
+    worker = lambda name: (ROOT / f"safer/generation/adapters/workers/worker_{name}.py").read_text()
     hooks = lambda name: "".join("".join(c) for c in envs[name].post_install)
 
     # VACE: the DiT calls flash_attention() directly, and that function asserts
@@ -2010,7 +2010,7 @@ def test_runtime_failures() -> None:
           "wan is pip-installed; the clone has no copy to edit")
 
     # E2FGVI: mmcv.ops needs compiled kernels, torchvision already has the operator
-    shim = (ROOT / "csf/generation/adapters/shims/e2fgvi_deform.py").read_text()
+    shim = (ROOT / "safer/generation/adapters/shims/e2fgvi_deform.py").read_text()
     check("the deformable-conv shim exists", "def modulated_deform_conv2d" in shim)
     check("it is backed by torchvision", "from torchvision.ops import deform_conv2d" in shim)
     check("its weight shape matches what the checkpoint holds",
@@ -2074,7 +2074,7 @@ def test_runtime_failures() -> None:
 def test_fomm_source_frame() -> None:
     """A clip qualifies on half its frames; FOMM must not demand a face in the first one."""
     print("fomm source frame")
-    src = (ROOT / "csf/generation/adapters/workers/worker_fomm.py").read_text()
+    src = (ROOT / "safer/generation/adapters/workers/worker_fomm.py").read_text()
     check("the source frame is searched for, not assumed to be frame 0",
           "_sample(full or target, SOURCE_SCAN)" in src)
     check("the old single-frame check is gone", "_face_box(state, target[0])" not in src)
@@ -2083,7 +2083,7 @@ def test_fomm_source_frame() -> None:
     check("and the error says how hard it looked", "frames sampled from the target clip" in src)
 
     # the planner's own promise: these clips carry a face in at least half their frames
-    from csf.generation.filters import ClipFeatures
+    from safer.generation.filters import ClipFeatures
     marginal = ClipFeatures(clip_id="c", label="l", path="p", frames_scanned=20,
                             face_ratio=0.5, mean_face_size=0.08)
     check("a clip with a face in half its frames qualifies for the face pool",
@@ -2115,9 +2115,9 @@ def test_ffmpeg_shim() -> None:
     """Repos that shell out to a bare `ffmpeg` must find one on the env's PATH."""
     print("ffmpeg shim")
     import tempfile
-    from csf.generation import envs as envs_mod
+    from safer.generation import envs as envs_mod
 
-    src = (ROOT / "csf/generation/envs.py").read_text()
+    src = (ROOT / "safer/generation/envs.py").read_text()
     check("the shim is applied where the environment is built, not at install time",
           "_ffmpeg_shim(venv_bin)" in src,
           "envs built before it existed must pick it up without a rebuild")
@@ -2150,13 +2150,13 @@ def test_ffmpeg_shim() -> None:
 def test_smoke_output_location() -> None:
     """Workers run with cwd set to their env root, so a relative output path goes astray."""
     print("smoke output location")
-    src = (ROOT / "csf/generation/smoke.py").read_text()
+    src = (ROOT / "safer/generation/smoke.py").read_text()
     check("the smoke output directory is made absolute", "os.path.abspath(out_dir)" in src,
           "a relative path put eight rendered videos under cache/regen/envs/<env>/ instead")
-    base = (ROOT / "csf/generation/adapters/base.py").read_text()
+    base = (ROOT / "safer/generation/adapters/base.py").read_text()
     check("workers really do run from their env root", "cwd=str(self.env.root)" in base)
 
-    vi = (ROOT / "csf/generation/adapters/workers/worker_videoinpaint.py").read_text()
+    vi = (ROOT / "safer/generation/adapters/workers/worker_videoinpaint.py").read_text()
     check("STTN is handed a video file, not the frame folder", "video_is_file" in vi,
           "it opens --video with cv2.VideoCapture, which reads a directory as zero frames")
     check("the other two still get the folder they expect", vi.count("video_is_file") == 2)
@@ -2169,7 +2169,7 @@ def test_quota_probe() -> None:
     import tempfile
     from unittest import mock
 
-    from csf.generation.diskcheck import EDQUOT, require_writable, write_probe
+    from safer.generation.diskcheck import EDQUOT, require_writable, write_probe
 
     with tempfile.TemporaryDirectory() as tmp:
         check("a writable directory passes", write_probe(tmp, mib=2) is None)
@@ -2207,17 +2207,17 @@ def test_quota_probe() -> None:
     main_src = (ROOT / "main.py").read_text()
     check("preflight probes before a run starts",
           "require_writable(cfg.paths.cache_dir" in main_src)
-    sched_src = (ROOT / "csf/generation/scheduler.py").read_text()
+    sched_src = (ROOT / "safer/generation/scheduler.py").read_text()
     check("the scheduler re-probes while it runs", "write_probe(self.video_root" in sched_src)
     check("but not once per job", "probe_interval_s" in sched_src)
-    smoke_src = (ROOT / "csf/generation/smoke.py").read_text()
+    smoke_src = (ROOT / "safer/generation/smoke.py").read_text()
     check("smoke probes before loading a model", "require_writable(out_dir" in smoke_src)
 
 
 def test_env_selection_typos() -> None:
     """One typo in a list of envs must not silently build nothing."""
     print("env selection")
-    src = (ROOT / "csf/generation/envs.py").read_text()
+    src = (ROOT / "safer/generation/envs.py").read_text()
     check("an unknown name raises rather than returning an empty list",
           "unknown env/adapter {part!r} in {name!r}" in src)
     for verb in ("built", "burned", "checked"):
@@ -2227,7 +2227,7 @@ def test_env_selection_typos() -> None:
 def test_child_process_errors() -> None:
     """A failed upstream CLI must report the head of its traceback, not only the tail."""
     print("child process errors")
-    common = ROOT / "csf/generation/adapters/workers/_common.py"
+    common = ROOT / "safer/generation/adapters/workers/_common.py"
     src = common.read_text()
     namespace: dict = {}
     body = src[src.index("def clip_output"):src.index("def run_cmd")]
@@ -2252,7 +2252,7 @@ def test_child_process_errors() -> None:
 def test_smoke_selection() -> None:
     """The per-model smoke command must refuse what it cannot honestly test."""
     print("smoke selection")
-    from csf.generation import smoke
+    from safer.generation import smoke
 
     wired = smoke.selectable()
     check("every selectable model is wired up", all(ADAPTERS[k].implemented for k in wired))
@@ -2281,7 +2281,7 @@ def test_smoke_selection() -> None:
             refused = True
         check("a tier-2 scaffold cannot be smoke-tested", refused)
 
-    src = (ROOT / "csf/generation/smoke.py").read_text()
+    src = (ROOT / "safer/generation/smoke.py").read_text()
     check("smoke renders into its own directory, never the dataset tree",
           "AI Edited" not in src)
     check("one resident worker, so a full sweep needs one model's VRAM",

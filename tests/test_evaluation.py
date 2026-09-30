@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from csf.eval.ablation import _align_probs_to_labels
-from csf.eval.metrics import classification_report_dict
+from safer.eval.ablation import _align_probs_to_labels
+from safer.eval.metrics import classification_report_dict
 
 
 def test_align_probs_to_labels_inserts_missing_class() -> None:

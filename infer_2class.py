@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from csf.inference import CSFDetector
+from safer.inference import CSFDetector
 
 
 def _expand_videos(inputs: Iterable[str]) -> list[Path]:
