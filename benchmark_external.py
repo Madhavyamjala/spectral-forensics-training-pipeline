@@ -6,9 +6,15 @@ What it does
                  CSV list), labels each video real / ai_generated / ai_edited with a category
                  (generator or edit type), flags generators that overlap the Chrono-TriClass training
                  sources, and re-encodes every video to one codec / fps / resolution so that no
-                 detector can separate the classes by container format.
+                 detector can separate the classes by container format (csf.data.normalize: 854x480
+                 letterbox, 24 fps, first 10 s, no audio, H.264 CRF 23 - the paper's protocol).
     2. csf       The exported CSF bundle (csf.inference.CSFDetector) in every mode: scanner, static,
                  and agentic for each dispatcher profile.
+    2b. per_action
+                 The SAFER paper's per-action outcome run: for every video, every dispatcher action's
+                 prediction and latency (scanner, no-tool arbiter, static, the arbiter given each tool
+                 subset), written to <out>/per_action/ for `python -m csf.eval.paper external`, plus score
+                 files for the report (pa_scanner, pa_default, pa_static, pa_evidence_<action>, ...).
     3. qwen_zeroshot
                  The same Qwen2.5-VL-3B backbone without LoRA or head, asked "Real or Fake?". Scored by
                  the next-token probability of the two answer words, so it yields a probability and
@@ -100,11 +106,12 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from csf import LABEL2ID, LABELS, PRETTY_LABELS  # noqa: E402
+from csf.data.normalize import normalize_video, parse_size  # noqa: E402
 
 REAL, GENERATED, EDITED = LABEL2ID["real"], LABEL2ID["ai_generated"], LABEL2ID["ai_edited"]
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".gif"}
-STEPS = ["prepare", "csf", "qwen_zeroshot", "metadata", "external", "report"]
-GPU_STEPS = {"csf", "qwen_zeroshot"}
+STEPS = ["prepare", "csf", "per_action", "qwen_zeroshot", "metadata", "external", "report"]
+GPU_STEPS = {"csf", "per_action", "qwen_zeroshot"}
 
 # ----------------------------------------------------------------------------------------------------
 # Known baselines. Only facts checked against each project's README are stated as such; everything
@@ -329,38 +336,6 @@ def _probe(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _normalise_one(src: str, dst: Path, size: Tuple[int, int], fps: float, max_seconds: float, crf: int,
-                   ffmpeg: str) -> Tuple[bool, str]:
-    """Re-encode onto one fixed canvas. Every output has the same width, height, fps, codec, pixel
-    format and no audio: scaling only the short side (and never upscaling) left resolution and
-    aspect ratio as a class signal, which is exactly the container shortcut this step removes.
-    Aspect ratio is kept by letterboxing, so no content is cropped away (an edit near a border
-    would otherwise vanish). Duration is only capped - see the report notes."""
-    if dst.exists() and dst.stat().st_size > 0:
-        return True, "cached"
-    info = _probe(src)
-    if not info or not info.get("width") or not info.get("height"):
-        return False, "unreadable"
-    w, h = size
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".part.mp4")
-    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic,"
-          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:g}")
-    cmd = [ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", src, "-t", f"{max_seconds:g}", "-vf", vf,
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p", "-an",
-           "-map_metadata", "-1", "-movflags", "+faststart", str(tmp)]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        tmp.unlink(missing_ok=True)
-        return False, "ffmpeg timeout"
-    if res.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-        tmp.unlink(missing_ok=True)
-        return False, (res.stderr or "ffmpeg failed").strip().splitlines()[-1][:200]
-    tmp.replace(dst)
-    return True, "ok"
-
-
 def step_prepare(args, datasets: Dict[str, Tuple[str, str]], extra_maps: Dict[str, Dict[str, str]]) -> None:
     out = Path(args.out)
     (out / "manifests").mkdir(parents=True, exist_ok=True)
@@ -394,7 +369,7 @@ def step_prepare(args, datasets: Dict[str, Tuple[str, str]], extra_maps: Dict[st
             norm_dir = out / "videos_norm" / name
             ok_col, why_col, paths = [], [], []
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                futs = {pool.submit(_normalise_one, src, norm_dir / f"{vid}.mp4", _size(args.norm_size),
+                futs = {pool.submit(normalize_video, src, norm_dir / f"{vid}.mp4", _size(args.norm_size),
                                     args.norm_fps, args.norm_max_seconds, args.norm_crf, ffmpeg): i
                         for i, (vid, src) in enumerate(zip(df["video_id"], df["src_path"]))}
                 results: Dict[int, Tuple[bool, str]] = {}
@@ -558,6 +533,121 @@ def step_csf(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[int, int]) -
             if time.time() - t_last > 60:
                 log(f"[csf/{ds}] {i + 1}/{len(todo)}")
                 t_last = time.time()
+        for w in writers.values():
+            w.close()
+    del det
+    torch.cuda.empty_cache()
+
+
+# ====================================================================================================
+# per-action outcome run (SAFER paper, Appendix D)
+# ====================================================================================================
+
+def _per_action_names(actions: Sequence[str]) -> List[str]:
+    tool_actions = [a for a in actions if a != "early_exit"]
+    return (["pa_scanner", "pa_arbiter_notool", "pa_default", "pa_static"]
+            + [f"pa_arbiter_{a}" for a in tool_actions] + [f"pa_evidence_{a}" for a in tool_actions])
+
+
+def step_per_action(args, manifests: Dict[str, pd.DataFrame], shard: Tuple[int, int]) -> None:
+    """Every dispatcher action's prediction and latency for every video, like the in-domain outcome tables.
+
+    Per video: decode, scanner, all tool groups once (masked per action - a masked group is hidden from
+    the arbiter's prompt entirely, so this equals running only that action's groups), the no-tool arbiter
+    pass (which caches the vision states), the static pass (all tools, pixels), and one cached arbiter pass
+    per tool action. Writes the raw table to <out>/per_action/ for csf.eval.paper, and derived score files:
+        pa_scanner          SAFER-Scanner
+        pa_arbiter_notool   arbiter with an empty evidence graph (the same-reasoner baseline)
+        pa_default          no-tool exit = mean(scanner, no-tool arbiter) = SAFER default
+        pa_static           SAFER-Static (all tools, full pixel pass, no dispatcher-state pass)
+        pa_arbiter_<a>      the arbiter alone given action a's tools (what a dispatcher tool action returns)
+        pa_evidence_<a>     evidence mode: mean(scanner, arbiter given a's tools)
+    Latency per mode follows the paper's accounting (decode + every forward pass + every tool group run)."""
+    import torch
+    from csf.inference import CSFDetector
+    from csf.graph import normalize_features
+    from csf.models.dispatcher import ACTION_GROUPS, ACTIONS, action_mask_array
+    from csf.tools.toolpool import TOOL_GROUPS
+    det = CSFDetector(args.model_dir, components=("qwen", "llama", "vae"), attn_implementation=args.attn)
+    tool_actions = [a for a in ACTIONS if a != "early_exit"]
+    names = _per_action_names(ACTIONS)
+    out = Path(args.out)
+    log(f"per-action run | bundle {args.model_dir} | classes {det.active_classes} | device {det.device}")
+
+    def rec(vid: str, probs: np.ndarray, ms: float) -> Dict[str, Any]:
+        return {"video_id": vid, **_probs_record({PRETTY_LABELS[l]: float(v) for l, v in zip(LABELS, probs)}),
+                "latency_ms": ms}
+
+    for ds, df in manifests.items():
+        raw_path = out / "per_action" / f"{ds}.shard{shard[0]}of{shard[1]}.jsonl"
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        done = set()
+        if raw_path.exists():
+            for line in raw_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "error" not in r:
+                    done.add(r["video_id"])
+        writers = {n: PredWriter(out, n, ds, shard) for n in names}
+        for n in names:
+            write_kind(out, n, ds, True, det.active_ids)
+        todo = _shard(df, shard)
+        todo = todo[~todo["video_id"].isin(done)]
+        log(f"[per_action/{ds}] {len(todo)} videos to run on this shard")
+        t_last = time.time()
+        with open(raw_path, "a", encoding="utf-8") as fh:
+            for i, row in enumerate(todo.itertuples(index=False)):
+                try:
+                    native, vlm, t_dec = det.load_video(row.path)
+                    p_scan, t_scan = det.scan(vlm)
+                    res, _ = det.tools(native, TOOL_GROUPS)
+                    z = normalize_features(res.features, det.stats)
+                    empty = {"frames": vlm, "z": np.zeros_like(z), "mask": np.zeros(3, bool), "label": 0, "key": "v"}
+                    p0, _, t_state, cache = det.runner.pixel_pass([empty], np.zeros(3, bool))
+                    full = {"frames": vlm, "z": z, "mask": res.mask, "label": 0, "key": "v"}
+                    p_static, _, t_static, _ = det.runner.pixel_pass([full], res.mask)
+                    p_act, t_act = {}, {}
+                    for a in tool_actions:
+                        m = action_mask_array(a) & res.mask
+                        pa, ta = det.runner.cached_pass([{**full, "mask": m}], m, cache)
+                        p_act[a], t_act[a] = pa[0], ta
+                except Exception as exc:
+                    fh.write(json.dumps({"video_id": row.video_id, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}) + "\n")
+                    fh.flush()
+                    if isinstance(exc, torch.cuda.OutOfMemoryError):
+                        torch.cuda.empty_cache()
+                    continue
+                t = {"decode": t_dec, "scanner": t_scan, "state": t_state, "static": t_static,
+                     "proposal": res.times.get("proposal", 0.0),
+                     **{g: res.times.get(g, 0.0) for g in TOOL_GROUPS},
+                     **{f"arbiter_{a}": t_act[a] for a in tool_actions}}
+                fh.write(json.dumps({"video_id": row.video_id, "scanner": p_scan.tolist(), "notool": p0[0].tolist(),
+                                     "static": p_static[0].tolist(),
+                                     "actions": {a: p_act[a].tolist() for a in tool_actions},
+                                     "tool_mask": res.mask.tolist(), "t": t}) + "\n")
+                fh.flush()
+
+                def tools_s(a: str) -> float:
+                    return t["proposal"] + sum(t[g] for g in ACTION_GROUPS[a])
+
+                frontline = t_dec + t_scan + t_state
+                default = (p_scan + p0[0]) / 2.0
+                vals = {"pa_scanner": (p_scan, t_dec + t_scan),
+                        "pa_arbiter_notool": (p0[0], t_dec + t_state),
+                        "pa_default": (default, frontline),
+                        "pa_static": (p_static[0], t_dec + tools_s("full_tri_domain") + t_static)}
+                for a in tool_actions:
+                    routed = frontline + tools_s(a) + t_act[a]
+                    vals[f"pa_arbiter_{a}"] = (p_act[a], routed)
+                    vals[f"pa_evidence_{a}"] = ((p_scan + p_act[a]) / 2.0, routed)
+                for n, (probs, secs) in vals.items():
+                    if row.video_id not in writers[n].done:
+                        writers[n].write(rec(row.video_id, np.asarray(probs, dtype=np.float64), secs * 1000.0))
+                if time.time() - t_last > 60:
+                    log(f"[per_action/{ds}] {i + 1}/{len(todo)}")
+                    t_last = time.time()
         for w in writers.values():
             w.close()
     del det
@@ -1107,10 +1197,10 @@ def parse_args(argv: Optional[Sequence[str]] = None):
 
 
 def _size(spec: str) -> Tuple[int, int]:
-    m = re.match(r"^(\d+)x(\d+)$", spec)
-    if not m or int(m.group(1)) % 2 or int(m.group(2)) % 2:
-        raise SystemExit(f"--norm-size expects even WxH such as 854x480, got {spec!r}")
-    return int(m.group(1)), int(m.group(2))
+    try:
+        return parse_size(spec)
+    except ValueError as exc:
+        raise SystemExit(f"--norm-size: {exc}")
 
 
 def _parse_datasets(items: Sequence[str]) -> Dict[str, Tuple[str, str]]:
@@ -1186,7 +1276,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     _size(args.norm_size)
-    if "csf" in steps and not (args.model_dir and (Path(args.model_dir) / "csf_config.json").exists()):
+    if ("csf" in steps or "per_action" in steps) and not (args.model_dir and (Path(args.model_dir) / "csf_config.json").exists()):
         raise SystemExit(f"--model-dir must be an exported CSF bundle (with csf_config.json), got {args.model_dir!r}")
     if "metadata" in steps and not args.config:
         raise SystemExit("--config (the training config of the run) is required for the metadata step")
@@ -1203,6 +1293,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
         if "csf" in gpu_steps:
             step_csf(args, manifests, shard)
+        if "per_action" in gpu_steps:
+            step_per_action(args, manifests, shard)
         if "qwen_zeroshot" in gpu_steps:
             step_qwen_zeroshot(args, manifests, shard)
     if n > 1:                                   # a GPU worker: the parent does the rest
