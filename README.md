@@ -1,45 +1,162 @@
-# Chrono-Spectral Forensics (CSF): training pipeline
+# SAFER: when is acquiring forensic evidence worth the cost?
 
-Distributed PyTorch implementation of the **Chrono-Spectral Forensics** proposal (*Agentic Forensic Systems for
-AI-Generated Video Detection*). It uses **Chrono-TriClass-100k** (`madhav-yrc/Chrono-TriClass-100k`, 97,774 videos)
-to classify each video as **Real / AI-Generated / AI-Edited**. It then runs an ablation study across three model
-types, reports detailed metrics (quality, calibration, robustness and latency), and pushes the weights and metrics to
-a Hugging Face model repo.
+Code for **SAFER: When Is Acquiring Forensic Evidence Worth the Cost in Agentic AI-Generated Video Detection?**
+(under review at ICLR 2027).
+
+Agentic video detectors let a vision-language model (VLM) call forensic tools and reason over what they return.
+Every tool call costs latency, and the value of a tool is usually measured against a *different* model, which mixes
+the value of the evidence with the difference between the two models. SAFER treats forensic analysis as evidence
+acquisition under a latency budget, and measures what the evidence is worth against **the same reasoner without it**.
+
+**What the paper finds.** On Chrono-66k and four external benchmarks:
+- The 23 forensic features carry real signal on their own (a gradient-boosted classifier on them alone reaches 96.39%
+  macro-F1 in-domain), but add little beyond the VLM frontline: in-domain, running every tool fixes 6 of the 20 errors
+  that remain after the default, at 1.71x the latency.
+- Across 44 generator and editing categories unseen in training, the mean AUC change from adding the full tool suite
+  to the same arbiter is -0.007 (95% bootstrap interval [-0.017, 0.003]).
+- The cost-aware GRPO dispatcher learns to skip tools, matching or beating full-tool baselines at about 0.60x their latency.
+- Under domain shift the errors come mainly from a miscalibrated decision threshold, not missing evidence: recalibrating
+  the threshold on a small labelled target sample improves balanced accuracy by 4.3 to 12.9 points on three of four
+  benchmarks, more than refitting the router on the same sample.
+
+> The Python package is `safer`. It was called `csf` (Chrono-Spectral Forensics, the project's working name) before the
+> paper; `import csf...` and `python -m csf...` still work through an alias, so older scripts and exported bundles
+> keep running. Identifiers that are part of saved artefacts keep their names: `CSFDetector` (also available as
+> `SAFERDetector`), `csf_config.json` in bundles, the `CSF_*` environment variables and the `csf_*` report rows.
 
 ```mermaid
 flowchart LR
-    V[video] --> D[decode 8-16 frames<br/>native res + 224px]
-    D --> Q["Phase 1 scanner<br/>Qwen2.5-VL-3B + LoRA"]
-    D --> S["Llama-3.2-11B-Vision + LoRA<br/>pass 0: dispatcher state<br/>(vision states cached)"]
-    Q --> P{"Phase 2 GRPO dispatcher<br/>ultra_fast / balanced / max_security"}
-    S --> P
-    P -- early_exit --> OUT[Real / AI-Gen / AI-Edit]
-    P -- tool subset --> T["Phase 3 toolpool on sparse 64x64 patches<br/>spatial | spectral (FFT, 3D-DCT, phase) | latent (DIRE, SVD-VAE)"]
-    T --> G["Phase 4 evidence graph -> arbiter<br/>same Llama backbone, reuses cached vision states"]
+    V[video] --> D[decode 16 frames<br/>native res + 224px]
+    D --> Q["Scanner<br/>Qwen2.5-VL-3B + LoRA"]
+    D --> A0["Arbiter, no-tool pass<br/>Llama-3.2-11B-Vision + LoRA<br/>(vision states cached)"]
+    Q --> P{"Cost-aware dispatcher<br/>GRPO, 6 actions"}
+    A0 --> P
+    P -- "exit without tools<br/>(mean of scanner + no-tool arbiter)" --> OUT[Real / AI-Generated]
+    P -- "pay for a tool subset" --> T["Toolpool on sparse patches<br/>spatial 9 | spectral 9 | latent 5 features"]
+    T --> G["Evidence graph -> arbiter<br/>same weights, reuses cached vision states"]
     G --> OUT
 ```
 
-## What gets trained and compared
+The **frontline** (scanner plus the arbiter's no-tool pass) runs on every video and gives the dispatcher its state
+`s = [h0, p_scan, p_nt]`. The dispatcher either exits without tools or pays for one of five tool subsets (spatial,
+spectral, latent, spatial+spectral, all). Because the no-tool arbiter pass runs anyway, it doubles as the
+**same-reasoner baseline**: the value of a tool subset T is the arbiter's AUC with T minus its AUC with an empty
+evidence graph, from the same weights, frames and cached vision states.
 
-| Id | Model type | What it is |
+## Task and data
+
+Binary detection: **Real vs AI-Generated**. Models are trained on **Chrono-66k** and evaluated on its held-out test
+split and, zero-shot, on four external benchmarks.
+
+| Chrono-66k | Source | Videos | Train | Valid | Test |
+|---|---|---|---|---|---|
+| Real | Kinetics-400 | 33,334 | 26,684 | 3,305 | 3,345 |
+| AI-Generated | VidProM (Pika, VideoCrafter2) | 33,312 | 26,650 | 3,331 | 3,331 |
+| **Total** | | **66,646** | **53,334** | **6,636** | **6,676** |
+
+Chrono-66k is the Real and AI-Generated part of the `madhav-yrc/Chrono-TriClass-100k` manifest in this repo
+(`manifest.csv`, split at the source-clip level by SHA-256, 80/10/10 stratified). The AI-Edited class and its
+generator (section 4) are not used by the paper. `configs/full_2class.yaml` selects exactly these two classes
+(`data.classes: [real, ai_generated]`).
+
+**Format normalisation.** A classifier on container metadata alone separates the original real and generated files,
+so every video is letterboxed to 854x480, resampled to 24 fps, cut to its first 10 s, stripped of audio and re-encoded
+with H.264 (CRF 23, yuv420p). External benchmarks: GenBuster, ViF-Bench, FakePartsBench and GenVidBench (Pika and
+VideoCrafter2 removed, as they are training generators). `benchmark_external.py` builds and normalises them the same way.
+
+## Detector modes
+
+| Mode (paper name) | What runs | In this repo |
 |---|---|---|
-| A | `A_qwen_scanner` | Qwen2.5-VL-3B-Instruct + LoRA + linear head. Reads the frames as video (Phase 1 only). |
-| B | `B_llama_arbiter_static` | Llama-3.2-11B-Vision-Instruct + LoRA. Reads a 2x2 frame mosaic plus the evidence graph from **all** tools (Phases 3 and 4, no routing). |
-| C | `C_csf_agentic_<profile>` | Full CSF: scanner, then the GRPO dispatcher, then only the chosen tools, then the arbiter reusing the dispatcher's vision states. Trained once per proposal profile: `ultra_fast` (λ=1, β=0, no latent tool), `balanced` (λ=0.2, β=0.5), `max_security` (λ=0, β=2). |
+| SAFER-Scanner | scanner only | `CSFDetector.predict(mode="scanner")`; ablation row `A_qwen_scanner` |
+| Arbiter, no tools | arbiter with an empty evidence graph | `notool_probs` in the outcome tables |
+| **SAFER default** | frontline, then the learned dispatcher, which exits without tools | dispatcher action `early_exit` = mean of scanner and no-tool arbiter; the Ultra-Fast and Balanced dispatchers pick it on every in-domain test video |
+| SAFER-Static | arbiter once with all tools, no dispatcher-state pass | `mode="static"`; ablation row `B_llama_arbiter_static` |
+| Evidence mode | scanner averaged with the arbiter given a tool subset | `safer.eval.paper` (`evidence:<action>`) |
+| Low-latency mode (τ) | scanner alone unless its confidence is below τ | `safer.eval.paper.low_latency` |
+| Adaptation mode | decision threshold (or router) refitted on a labelled sample of the target domain | `safer.eval.paper.adaptation` |
+| Max-Security dispatcher | GRPO with λ=0, β=2 | ablation row `C_csf_agentic_max_security` |
 
-The report also includes these supporting rows:
-- **Fixed-routing ladder** (`csf_fixed_<action>`): each tool subset run without a learned dispatcher.
-- **`baseline_toolpool_gbdt`**: forensic features only, no VLM.
-- **`baseline_metadata_shortcut`**: gradient boosting on container metadata (resolution, fps, codec, bitrate). It shows how much of the dataset can be solved from source cues alone. Read the VLM numbers against it.
+Dispatcher reward: `R = 1[ŷ=y] − λ·C(a)/max C − β·1[y≠Real ∧ ŷ=Real]`, with C(a) the measured latency of action a.
+Profiles: Ultra-Fast (λ=1, β=0, latent disabled), Balanced (λ=0.2, β=0.5), Max-Security (λ=0, β=2).
 
-**Metrics** for each model are written to `runs/<run>/metrics/`:
-- Quality: accuracy, balanced accuracy, macro and weighted F1, MCC, Cohen's κ.
-- Per class: precision, recall, F1, ROC-AUC, PR-AUC, plus confusion matrices.
-- Calibration: log-loss, Brier score, ECE.
-- Forensic behaviour: binary fake-detection recall, miss rate, false-alarm rate, Edited↔Generated confusion, and accuracy per AI-Edited method.
-- Latency: p50/p90/p95/p99, throughput, tool cost, routing distribution and early-exit rate.
-- Live raw-video latency benchmark and training curves.
-- Plots: Pareto frontier, confusion matrices, ROC curves, bar charts, loss and GRPO reward curves.
+## Results reported in the paper
+
+In-domain, Chrono-66k test split (n=6,676; median end-to-end latency, batch 4, resident models):
+
+| Model | Macro-F1 | Errors | Miss % | False alarm % | p50 ms |
+|---|---|---|---|---|---|
+| Toolpool-GBDT (tools only, no VLM) | 96.39 | 241 | 3.57 | 3.65 | 235.9 |
+| SAFER-Scanner | 99.63 | 25 | 0.39 | 0.36 | 142.2 |
+| Arbiter, no tools | 99.36 | 43 | 0.60 | 0.69 | - |
+| SAFER-Static | 99.54 | 31 | 0.39 | 0.54 | 348.5 |
+| SAFER low-latency mode (τ=0.5) | 99.66 | 23 | 0.39 | 0.30 | 143.0 |
+| **SAFER default** | **99.70** | **20** | 0.27 | 0.33 | 239.1 |
+| SAFER evidence mode, all tools | 99.79 | 14 | 0.15 | 0.27 | 409.4 |
+| Oracle (cheapest correct action) | 99.81 | 13 | - | - | 239.1 |
+
+Zero-shot AUC on normalised external benchmarks († Pika and VideoCrafter2 removed):
+
+| Detector | GenBuster | ViF-Bench | FakeParts | GenVidBench† |
+|---|---|---|---|---|
+| Metadata-GBDT, normalised | 0.18 | 0.48 | 0.50 | - |
+| Qwen2.5-VL-3B, zero-shot | 0.69 | 0.56 | 0.64 | - |
+| SAFER-Scanner | 0.867 | 0.638 | 0.714 | 0.830 |
+| Arbiter, no tools | 0.808 | 0.621 | 0.692 | 0.802 |
+| SAFER-Static | 0.735 | 0.616 | 0.690 | 0.788 |
+| SAFER evidence mode, all tools | 0.800 | 0.645 | 0.725 | 0.821 |
+| **SAFER default** | 0.853 | 0.646 | 0.725 | 0.831 |
+
+Balanced accuracy at the 0.5 threshold, change relative to the SAFER default (adaptation rows: mean ± std over 10
+generator-disjoint splits):
+
+| | ViF-Bench | FakeParts | GenBuster | GenVidBench† |
+|---|---|---|---|---|
+| SAFER default (balanced accuracy, %) | 53.7 | 62.2 | 68.1 | 73.8 |
+| Routing oracle (cheapest correct action) | +1.6 | +3.8 | +7.2 | +5.1 |
+| Router refit on target labels | +0.9 ±0.1 | +0.6 ±0.1 | +3.3 ±0.8 | −0.6 ±0.4 |
+| **Adaptation mode (recalibration)** | **+7.4 ±0.8** | **+4.3 ±0.9** | **+12.9 ±0.5** | −0.6 ±0.5 |
+
+These numbers are copied from the paper; they are not regenerated by CI. All runs used seed 42 on four NVIDIA H200 NVL GPUs.
+
+**Scope.** All conclusions come from one scanner/arbiter pair (Qwen2.5-VL-3B, Llama-3.2-11B-Vision) and one pool of
+23 hand-crafted features; other backbones or fusion mechanisms may use tool evidence differently.
+
+## Reproducing the paper's tables
+
+The analyses behind Sections 4.1-4.4 read only saved per-action outcome tables. `safer/eval/paper.py` computes
+them. **It is a reimplementation written from the paper's text, not the scripts that produced the paper's
+numbers**; each definition the paper leaves open is marked "Assumption" in its docstring (the low-latency
+confidence, how τ is chosen, the adaptation threshold criterion, the supervised router's model). Check its
+output against the paper before citing it as a reproduction.
+
+| Paper | How to produce it |
+|---|---|
+| Table 1, Figure 2 (in-domain modes, low-latency τ, evidence modes, oracle), McNemar, Table 9 | `python -m safer.eval.paper indomain --outcomes-dir runs/safer/predictions --out runs/safer/paper` |
+| Tables 3 (dispatchers), 7, per-profile routing | the pipeline's `evaluate` stage: `runs/safer/metrics/ablation_report.md` |
+| Table 8 (latency components) | `python full_2class.py --config configs/safer.yaml --stage latency --latencynum 1000` |
+| Format normalisation | `python -m safer.data.normalize SRC_DIR DST_DIR` (854x480 letterbox, 24 fps, 10 s, no audio, H.264 CRF 23) |
+| Table 2 (external zero-shot AUC with CIs), Table 11, Table 15 (container audit) | `benchmark_external.py --steps prepare,per_action,qwen_zeroshot,metadata,report` (the `chrono` adapter gives the Table 15 subset) |
+| Tables 4, 10, 12, 13, 16, Figure 3, Appendix E (tool value, TOST, adaptation mode, routing) | `python -m safer.eval.paper external --bench-out runs/extbench --out runs/extbench/paper --fit-outcomes runs/safer/predictions/outcomes_valid.npz` |
+
+Not reimplemented: the confidence gate over matched actions and GRPO trained on target-domain labels (Tables 3
+and 12), and the cue statistics of Appendix F.
+
+## What the pipeline trains and reports
+
+| Id | Report row | What it is |
+|---|---|---|
+| A | `A_qwen_scanner` | SAFER-Scanner: Qwen2.5-VL-3B-Instruct + LoRA + linear head, 16 frames at 224 px. |
+| B | `B_llama_arbiter_static` | SAFER-Static: Llama-3.2-11B-Vision-Instruct + 4-bit LoRA on a 2x2 mosaic at 560 px, with the evidence graph from **all** tools. |
+| C | `C_csf_agentic_<profile>` | Full SAFER: frontline, GRPO dispatcher, only the chosen tools, arbiter reusing the cached vision states; one dispatcher per profile. |
+
+Supporting rows: the fixed-routing ladder (`csf_fixed_<action>`, including `csf_fixed_early_exit`, the no-tool exit),
+`baseline_toolpool_gbdt` (the 23 tool features only, no VLM) and `baseline_metadata_shortcut` (container metadata only).
+
+**Metrics** for each model are written to `runs/<run>/metrics/`: accuracy, balanced accuracy, macro and weighted F1,
+MCC, Cohen's κ; per-class precision, recall, F1, ROC-AUC, PR-AUC and confusion matrices; log-loss, Brier score, ECE;
+miss and false-alarm rates; latency percentiles, throughput, tool cost, routing distribution and early-exit rate;
+the live raw-video latency benchmark; and plots (Pareto frontier, confusion matrices, ROC curves, training and GRPO curves).
 
 ## Repository layout
 
@@ -47,14 +164,22 @@ The report also includes these supporting rows:
 main.py                   stage driver (resumable) - the only entry point
 configs/test.yaml         test run: 5 000 videos, 12-16 GB GPU (e.g. laptop RTX 5070 Ti 12 GB)
 configs/full.yaml         full run: all videos, >=24 GB GPU(s), tuned for speed + quality
+configs/safer.yaml        the paper's configuration, every stated hyperparameter pinned (Table 6, App. B)
+configs/full_2class.yaml  same training settings as safer.yaml (own run dir, 100-video latency benchmark)
+full_2class.py            entry point for configs/full_2class.yaml (same stages as main.py)
+infer_2class.py           batch inference with an exported two-class bundle
+benchmark_external.py     zero-shot evaluation on normalised external benchmarks + baselines
 configs/smoke_cpu.yaml    CPU wiring check with tiny random models (no GPU, no gated weights)
 configs/regen.yaml        AI-Edited regeneration + training (4x H200)
 configs/regen_smoke.yaml  200-video generator wiring check
 tests/test_generation.py  dependency-free checks for the generator's allocation
+tests/test_evaluation.py  class-subset evaluation regressions
+tests/test_paper_analysis.py  the paper's analyses on hand-checkable synthetic outcome tables
 manifest.csv              Chrono-TriClass-100k manifest (leakage-aware train/valid/test split)
 setup_env.ps1 / .sh       environment setup (Windows / Linux)
 scripts/                  launch.ps1/.sh (auto torchrun on >1 GPU), run_test.*, run_full.*
-csf/
+csf/                      alias for the package's old name: `import csf.X` returns `safer.X`
+safer/
   generation/             AI-Edited dataset generator (see docs/REGENERATION.md)
     spec.py               the specification as data + exact integer allocation
     prefetch.py           Hugging Face model/dataset prefetch, gated-repo checks
@@ -72,13 +197,15 @@ csf/
   data/feature_cache.py   distributed, resumable, disk-bounded extraction (frames + toolpool features)
   data/extract_worker.py  torch-free CPU worker (download, decode, spatial / spectral tools)
   data/datasets.py        cached dataset + Qwen / Llama collators
+  data/normalize.py       format normalisation onto one fixed canvas (the paper's protocol)
   tools/toolpool.py       Phase 3 spatial / spectral / latent (DIRE) tools
   graph.py                Phase 4 evidence graph + arbiter prompt serialisation
   models/classifier.py    quantised VLM + LoRA + pooled classification head
   models/dispatcher.py    Phase 2 policy, reward, profiles, GRPO trainer
   train/classifier_trainer.py  DDP training loop
   pipeline.py             scanner inference + shared-backbone outcome tables
-  eval/                   metrics, ablation + report, live latency benchmark
+  eval/                   metrics, ablation + report, live latency / tool-dependency benchmarks,
+                          unified results report, paper.py (the paper's analyses)
   hub.py                  export bundle, model card, interactive Hub push
   inference.py            CSFDetector: raw video -> verdict (used by the published repo)
   env_check.py            environment verification
@@ -91,8 +218,8 @@ There are two independent halves. You can run either on its own, or both end to 
 
 | Half | What it does | Entry point |
 |---|---|---|
-| **Dataset generator** | Builds the AI-Edited class from scratch: fetches Kinetics-400 clips, renders 33,333 manipulated videos with 24 models, rebuilds `manifest.csv` | `scripts/run_regen.sh` |
-| **Training pipeline** | Trains the CSF scanner/arbiter/dispatcher on a manifest, runs the ablation, exports and publishes | `scripts/run_full.sh` |
+| **Dataset generator** | Builds the AI-Edited class from scratch: fetches Kinetics-400 clips, renders 33,333 manipulated videos with 24 models, rebuilds `manifest.csv`. **Not used by the SAFER paper**, which is Real vs AI-Generated only. | `scripts/run_regen.sh` |
+| **Training pipeline** | Trains the SAFER scanner, arbiter and dispatchers on a manifest, runs the ablation, exports and publishes | `scripts/run_full_2class.sh` (the paper's run) or `scripts/run_full.sh` |
 
 The generator writes its videos where the training half looks for them, so "both" is just running
 one after the other. Section 3 has the exact commands for each.
@@ -118,10 +245,10 @@ bash setup_env.sh --cuda cu128          # use cu121 for older drivers
 source .venv/bin/activate
 
 # 3. log in to Hugging Face (needed for the gated Llama model and higher rate limits)
-huggingface-cli login                   # paste a READ token
+hf auth login                           # paste a READ token
 
 # 4. verify the machine
-python -m csf.env_check
+python -m safer.env_check
 ```
 
 ### Windows (PowerShell)
@@ -138,18 +265,37 @@ powershell -ExecutionPolicy Bypass -File setup_env.ps1 -Cuda cu128
 .\.venv\Scripts\Activate.ps1
 
 # 3. log in to Hugging Face
-huggingface-cli login
+hf auth login
 
 # 4. verify the machine
-python -m csf.env_check
+python -m safer.env_check
 ```
 
 > **Windows note.** The *training* half runs on Windows. The *dataset generator* does not: its
 > per-model environments clone Linux-only upstream repositories. Generate on Linux, then train
 > anywhere.
 
-`python -m csf.env_check` checks the GPU, bf16 support, a real CUDA matmul, a bitsandbytes 4-bit
+`python -m safer.env_check` checks the GPU, bf16 support, a real CUDA matmul, a bitsandbytes 4-bit
 forward pass, OpenCV's ffmpeg backend and your Hub login. Fix anything it reports before going on.
+
+### No root, or conda is broken?
+
+ffmpeg does not have to be installed system-wide. `requirements.txt` includes `imageio-ffmpeg`,
+which ships a **static ffmpeg binary as a normal wheel** — no root, no conda, no module system:
+
+```bash
+pip install imageio-ffmpeg
+```
+
+The pipeline finds it automatically. Resolution order is `CSF_FFMPEG` / `CSF_FFPROBE` → `PATH` →
+the bundled binary, and startup reports which it picked. `imageio-ffmpeg` bundles ffmpeg but not
+ffprobe, so container metadata is parsed from `ffmpeg -i` instead — slightly less precise, and
+otherwise identical. If you would rather point at an existing build:
+
+```bash
+export CSF_FFMPEG=/path/to/ffmpeg
+export CSF_FFPROBE=/path/to/ffprobe
+```
 
 ### Accept the gated licence
 
@@ -158,7 +304,7 @@ forward pass, OpenCV's ffmpeg backend and your Hub login. Fix anything it report
 then make sure your token can reach it:
 
 ```bash
-python -m csf.generation.prefetch --stage train --dry-run
+python -m safer.generation.prefetch --stage train --dry-run
 ```
 
 That checks every repository the run needs without downloading anything, and names any that are
@@ -172,10 +318,10 @@ A full run touches ~21 Hub repositories. Pull them once, up front, so a gated li
 does not surface three days into generation:
 
 ```bash
-python -m csf.generation.prefetch --list                 # what will be fetched, and why
-python -m csf.generation.prefetch --stage train          # ~25 GB: Qwen, Llama, the VAEs
-python -m csf.generation.prefetch --stage generate       # ~90 GB: SAM2, FLUX, VACE, LatentSync, ...
-python -m csf.generation.prefetch --stage all            # everything
+python -m safer.generation.prefetch --list                 # what will be fetched, and why
+python -m safer.generation.prefetch --stage train          # ~25 GB: Qwen, Llama, the VAEs
+python -m safer.generation.prefetch --stage generate       # ~90 GB: SAM2, FLUX, VACE, LatentSync, ...
+python -m safer.generation.prefetch --stage all            # everything
 ```
 
 It resumes (the Hub cache is reused), retries rate limits with backoff, and reports the size of
@@ -255,13 +401,23 @@ Everything is resumable, so re-running the same command picks up where it stoppe
 **Expected wall clock** on 4 × H200: prefetch 1–2 h, environments 2–4 h, Kinetics 8–20 h,
 generation ~3.9 days, feature extraction 8–14 h, training + eval 1.5–2.5 days.
 
+Every long stage shows a progress bar (or periodic log lines when output is redirected), and the
+environment build streams pip's output with a heartbeat so a 15-minute torch install is visibly
+working rather than apparently hung. `CSF_NO_PROGRESS=1` turns it off.
+
+**Everything resumes.** Stop with Ctrl-C and re-run the same command: environments keep what pip
+already installed, Kinetics counts the clips on disk, clip scoring checkpoints every 500 clips,
+and generation resumes from its per-video ledger. See
+[docs/REGENERATION.md](docs/REGENERATION.md) for the details.
+
 ### Smoke tests at a glance
 
 | Command | Needs | Time | Checks |
 |---|---|---|---|
-| `python -m csf.env_check` | — | seconds | GPU, bf16, CUDA matmul, ffmpeg, Hub login |
-| `python -m csf.generation.prefetch --dry-run` | — | ~1 min | every Hub repo is reachable |
+| `python -m safer.env_check` | — | seconds | GPU, bf16, CUDA matmul, ffmpeg, Hub login |
+| `python -m safer.generation.prefetch --dry-run` | — | ~1 min | every Hub repo is reachable |
 | `python tests/test_generation.py` | — | ~1 min | allocation, splits, budget, substitutions |
+| `python tests/test_download_retry.py` | — | <1 s | Hub download retry classification, resume messaging |
 | `python main.py --config configs/smoke_cpu.yaml` | CPU | ~10 min | the whole training pipeline wires up |
 | `python main.py --config configs/regen_smoke.yaml --stage kinetics,generate,regen_manifest` | 1 GPU | ~30 min | generation workers, ledger, manifest rebuild |
 | `bash scripts/run_test.sh` | 1 GPU ≥12 GB | ~4 h | every training stage on 5,000 videos |
@@ -269,6 +425,9 @@ generation ~3.9 days, feature extraction 8–14 h, training + eval 1.5–2.5 day
 ---
 
 ## 4. Regenerating the AI-Edited class
+
+> The SAFER paper does not use the AI-Edited class: it trains and evaluates on Real vs AI-Generated only.
+> This section is kept for the three-class dataset.
 
 The AI-Edited third of the dataset is rebuilt from Kinetics-400 following
 *AI Edited Data Source and Pipeline*: **33,333 videos, 8 manipulation families, 24 distinct
@@ -296,6 +455,79 @@ dataset card carries the required credit, licence link and statement of changes 
 Full runbook, substitution table with metrics, licence warnings and troubleshooting:
 **[docs/REGENERATION.md](docs/REGENERATION.md)**.
 
+### How manipulation types are assigned
+
+Each family's videos carry a `manipulation_type` (the *variant*: a smile edit, an age edit, an
+object removal). Models are not interchangeable here — StyleGANEX publishes one checkpoint per
+editing direction and only age and hair colour exist for video, while LivePortrait retargets an
+existing face and can do neither. A video labelled `age` that LivePortrait produced would be
+mislabelled data, so adapters declare which variants they can genuinely render and the planner
+respects it.
+
+Where a family's models differ in what they support, the per-model split follows variant demand
+rather than the document's fixed model weights — otherwise a 50/50 model split would force half
+the expression family into two of its nine variants. Family totals and the source-group mix are
+untouched; only the split between models moves, and the realised variant mix then matches the
+document's shares. `python -m safer.generation.spec` still prints the document's own plan.
+
+One variant, `facial_attributes` (glasses), has no released renderer at all. Its share is spread
+over the variants that can be produced, and the run logs it — no video is ever labelled with a
+manipulation that was not performed.
+
+### Version ceilings on the shared frameworks
+
+`transformers` and `diffusers` carry an upper bound (`<5`, `<1`) in every env that installs them.
+Without one, pip takes the newest release: transformers 5 requires torch ≥ 2.5, and in an env
+pinned to torch 2.4.1 it prints *"Disabling PyTorch"* and continues with tokenizers only. The env
+imports cleanly and cannot load a single model. The build now asserts
+`transformers.utils.is_torch_available()` before marking an env ready, so that state cannot reach
+a run.
+
+The same care applies to `onnxruntime` / `onnxruntime-gpu` and `opencv-python` /
+`opencv-python-headless`: each pair installs the same import name, so uninstalling one deletes the
+other's files while pip still records it as installed. The envs that need the GPU runtime remove
+every variant first and then reinstall, and import the result to prove it worked.
+
+### Rebuilding the model environments from scratch
+
+The per-model environments repair themselves — a broken venv is detected and recreated, and a
+changed spec rebuilds — so this is only for when you want a guaranteed-clean install: an
+interrupted build, a hand-modified env, or proving the whole install path works.
+
+```bash
+# delete every built environment, then rebuild them all
+python -m safer.generation.envs --burn all --build all --envs-root cache/regen/envs
+
+# or name several - comma-separated, env or adapter names both work
+python -m safer.generation.envs --build dreamid,reface,vace --envs-root cache/regen/envs
+
+# or as part of a run (one-off; do not leave it in a config file)
+python main.py --config configs/regen.yaml --stage generate --set generation.burn_envs=true
+```
+
+Only directories named after a registered environment are deleted, and the log names each one
+with the space it frees. Everything is re-downloaded afterwards — torch, requirements and
+checkpoints — so expect tens of GB.
+
+### Checkpoints you have to stage by hand
+
+Six checkpoints are hosted on Google Drive / Tsinghua Cloud and cannot be fetched unattended.
+Download them once, drop them in `model_paths/` (`generation.staged_weights_dir`) under these exact
+names, and the env build copies them where each repo expects them:
+
+| File in `model_paths/` | Needed by | Source |
+|---|---|---|
+| `e2fgvi_hq.pth` | video inpainting (E2FGVI-HQ) | [MCG-NKU/E2FGVI](https://github.com/MCG-NKU/E2FGVI) |
+| `sttn.pth` | video inpainting (STTN) | [researchmm/STTN](https://github.com/researchmm/STTN) |
+| `fuseformer.pth` | video inpainting (FuseFormer) | [ruiliu-ai/FuseFormer](https://github.com/ruiliu-ai/FuseFormer) |
+| `vox-adv-cpk.pth.tar` | reenactment (FOMM) | [AliaksandrSiarohin/first-order-model](https://github.com/AliaksandrSiarohin/first-order-model) |
+| `vox.pth.tar` | reenactment (TPSMM) | [yoyo-nb/Thin-Plate-Spline-Motion-Model](https://github.com/yoyo-nb/Thin-Plate-Spline-Motion-Model) |
+| `styleganex_edit_age.pt` | expression editing (age) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+| `styleganex_edit_hair.pt` | expression editing (hair colour) | [williamyang1991/StyleGANEX](https://github.com/williamyang1991/StyleGANEX) |
+
+A missing file fails that env's build with the filename and where to get it, rather than failing
+its jobs later. Subfolders are fine — `model_paths/styleganex/styleganex_edit_age.pt` is found too.
+
 ## 5. Training profiles and tuning
 
 `configs/test.yaml` is tuned for a single 12 GB card: 4-bit NF4 QLoRA for both VLMs, 8 frames per
@@ -318,7 +550,7 @@ bash scripts/run_full.sh --set models.attn_implementation=flash_attention_2
 bash scripts/run_test.sh --set data.num_frames=6 --set train.llama.lora_r=8
 ```
 
-On Windows with more than one GPU the launcher uses `python -m csf.launch --nproc N`, which spawns
+On Windows with more than one GPU the launcher uses `python -m safer.launch --nproc N`, which spawns
 one process per GPU with a Gloo backend and a file-based rendezvous; torchrun's TCP rendezvous
 fails on Windows builds of PyTorch (libuv store errors). On Linux it uses `torchrun` with NCCL.
 
@@ -338,7 +570,37 @@ prepare -> features -> train_qwen -> train_llama -> predict_scanner -> outcomes
 - **Re-running the same command resumes.** Completed stages are skipped, and feature extraction skips videos
   already cached. Training resumes from `checkpoints/<model>/last` with its optimiser and scheduler state.
 - Run specific stages with `--stage train_llama,outcomes`. Redo a finished stage with `--force train_llama`.
+
+### Raw-video latency and tool-dependency benchmarks
+
+The live benchmarks operate on the held-out **test split** after training and use the exported bundle. They do not rebuild the feature cache. Use `--latencynum N` to request exactly N raw test videos; the latency stage checks `paths.video_dir` and downloads only missing test videos from the dataset Hub. Existing files are reused, so raising a previous 100-video run to 1,000 fetches only the additional files.
+
+```bash
+# benchmark 1,000 held-out videos
+python full_2class.py --stage latency --latencynum 1000
+
+# tool-dependency benchmark only
+python full_2class.py --stage tooldependency --latencynum 1000
+```
+
+`--latencynum` also forces the latency stage to rerun. `tooldependency` is a standalone stage and runs every subset of the three forensic domains on the same videos: no tools, spatial, spectral, latent, each pair, and all three. It records the full classification/calibration/latency metrics in `metrics/tool_dependency_benchmark.json`. A `static_reference` row is also included for the all-tool Llama pass without cached vision-state reuse.
+
+Because there are three forensic tool domains (`spatial`, `spectral`, `latent`), **all three = all forensic tools**; the benchmark therefore reports both the fixed three-tool condition (`all_tools`) and the full static reference as separate conditions. Patch-proposal time is reported separately as common toolpool overhead.
+
+The regular live benchmark remains in `metrics/latency_benchmark.json` and reports scanner, static arbiter, and each learned CSF profile. Re-run `export` after latency/dependency benchmarking if you want the updated metric files copied into the publishable export bundle.
 - Override any config value with `--set section.key=value`, for example `--set data.max_rows=2000`.
+- **Generation resumes at job level.** `generate` keeps an append-only ledger (`generation.ledger`).
+  A job that succeeded is never re-run; a job that *failed* is retried on the next run, up to
+  `generation.max_attempts` (default 3), because most failures are environmental - an adapter
+  environment that had not finished building, a checkpoint not yet staged. Set
+  `generation.retry_failed=false` for one attempt per job ever.
+- **`kinetics` re-runs itself when its inputs change.** The stage records a fingerprint of the spec's
+  label set, the video target and the demand margin. If any of those move - say a source label is
+  corrected - the completed marker in `state.json` is ignored and the missing clips are fetched, rather
+  than the stage being skipped and generation silently starving. `--set generation.kinetics.rescore=true`
+  forces it too.
+- After the source pool grows, the existing `jobs.csv` still points at the clips it was planned against;
+  the run warns when it notices. Re-plan with `--set generation.rebuild_jobs=true`.
 
 ## 7. Logs and debugging
 
@@ -365,8 +627,17 @@ failures abort with a clear message instead of silently producing an empty datas
 | `CUDA out of memory` elsewhere on a 12 GB card | Close other GPU apps. Then `--set data.num_frames=6 --set train.llama.lora_r=8` and re-run the same command; it resumes. |
 | `Qwen2VLVideoProcessor requires the Torchvision library` | torchvision is missing (the setup scripts install it with torch; a hand-built venv may not have it). Install the build matching your torch: `pip install torchvision --index-url https://download.pytorch.org/whl/cu130` (swap `cu130` for your `torch.version.cuda`). |
 | `no kernel image is available` / `sm_120 not supported` | RTX 50xx needs CUDA 12.8+ wheels: `setup_env.ps1 -Cuda cu128` |
-| `GatedRepoError` for Llama | Accept the licence on the model page, then `huggingface-cli login` |
+| `GatedRepoError` for Llama | Accept the licence on the model page, then `hf auth login` |
 | Many `download failed` / 429 lines | Log in to the Hub (higher limits) or lower `data.download_workers`. Re-running resumes. |
+| `N consecutive download failures (limit 10)` | A burst of CDN errors, usually 5xx. Those are retried with backoff now; if it still trips, the Hub is having a bad day — re-run once it recovers (everything cached is skipped) or raise `--set data.download_fail_fast=25`. |
+| `Generation produced no videos at all` | The message now lists the recorded failures; the full rows are in `runs/<run>/metrics/generation_failures.csv` and the worker logs in `runs/<run>/logs/generation/`. Re-running retries the failed jobs (`generation.max_attempts`). |
+| `Nothing to do: ... no retries left` | Every job has failed `generation.max_attempts` times. Fix the underlying error first, then raise the cap (`--set generation.max_attempts=5`) or delete the job's rows from the ledger file. |
+| `No module named pip` naming a system Python, or `ModuleNotFoundError` for a package the env installs | The env's interpreter is not running as its own venv. `python -m safer.generation.envs --doctor all --envs-root cache/regen/envs` reports each env's interpreter, pip and missing imports; a broken env is rebuilt automatically on the next run, or force it with `--build <env> --force`. |
+| An env build installs the pinned torch, then immediately replaces it with a different one | A requirement declares a newer torch than the env pins (SAM2 asks for >=2.5.1), so pip swaps the CUDA-matched build for a PyPI one - and the next rebuild swaps it back. Each env now writes a `constraints.txt` pinning torch for every install, and the build fails if the pin did not hold. `--doctor` prints the installed torch next to the pinned one. |
+| `NameResolutionError` / `Could not find a version` during an env build | The node cannot reach the package index. Build the envs where it can — `python -m safer.generation.envs --build all --envs-root cache/regen/envs` — then run generation with `--set generation.offline=true`. Also check `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` and `pip.conf`: an unreachable *extra* index fails the install even when PyPI is reachable. Jobs skipped this way cost no retry attempts. |
+| `kinetics` skipped when you expected it to fetch | It is marked complete in `state.json` and its fingerprint still matches. `--force kinetics` re-runs it unconditionally. |
+| `Only N clip(s) pass the 'face' filter` | The face detectors are missing: `pip install insightface onnxruntime` (or `mediapipe`) in the driver environment. Without them the face families have no eligible source clips. |
+| `Only N GiB free disk space` | The figure names the directory it measured (`disk_probe` in the environment line). If that is not the filesystem holding your cache, check `paths.cache_dir`. |
 | Anything else | Open `runs/<run>/logs/crash_rank0.json`. It names the stage, step and video ids that failed. |
 
 ## 8. Outputs and publishing
@@ -389,17 +660,49 @@ python main.py --config configs/full.yaml --stage push
 Base-model weights are not re-uploaded. The adapters load on top of the original Qwen and Llama repos, which keeps
 the Llama licence gating intact.
 
+## 9.1 Reproducing the paper's training run (Chrono-66k, Real vs AI-Generated)
+
+`configs/safer.yaml` records the paper's settings explicitly (16 frames, LoRA 32/64/0.05, label smoothing 0.05,
+effective batch 64 on four GPUs, GRPO: 1,500 iterations, 256 videos x 16 actions, KL 0.02, entropy 0.01, seed 42):
+
+```bash
+bash scripts/run_safer.sh            # Windows: scripts\run_safer.ps1
+```
+
+`configs/full_2class.yaml` has the same training settings with its own run directory
+(`runs/full_2class`) and a 100-video latency benchmark; keep using it to resume a run you started with it.
+Use it to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
+
+```bash
+bash scripts/run_full_2class.sh
+```
+
+The bundle is written to `runs/full_2class/export/` and records the active class schema in `csf_config.json`. The ablation metrics and macro-F1 are computed over the two active classes rather than averaging in an absent AI-Edited class.
+
+To classify a few videos and keep the full inference result (including the evidence graph whenever tools are executed):
+
+```bash
+python infer_2class.py \
+  --model-dir runs/full_2class/export \
+  --profile balanced \
+  --save-dir runs/full_2class/inference \
+  video1.mp4 video2.mp4 video3.mp4
+```
+
+The command prints **REAL/FAKE**, the model label, confidence, and selected routing action. Each saved JSON contains the probability distribution, latency breakdown, tools executed and `evidence_graph`. An agentic `early_exit` intentionally has no measured tool evidence; use `--mode static` when you require all tool groups and therefore an evidence graph for every video.
+
 ## 9. Using the trained model
 
 ```python
-from csf.inference import CSFDetector
-det = CSFDetector("runs/full/export")          # or "<namespace>/<repo>" after pushing
+from safer.inference import CSFDetector
+det = CSFDetector("runs/full_2class/export")   # or "<namespace>/<repo>" after pushing
 det.predict("clip.mp4", mode="agentic", profile="balanced")
-# {'label': 'AI-Edited', 'probs': {...}, 'action': 'spatial_spectral', 'tools_run': [...],
+# {'label': 'AI-Generated', 'probs': {...}, 'is_fake': True, 'action': 'early_exit', 'tools_run': [],
 #  'latency_ms': {'decode': ..., 'scanner': ..., 'dispatcher_state': ..., 'tools': ..., 'arbiter': ...},
 #  'evidence_graph': {...}}
 ```
-Or from the command line: `python -m csf.inference clip.mp4 --model_dir runs/full/export --mode agentic`.
+Or from the command line: `python -m safer.inference clip.mp4 --model_dir runs/full_2class/export --mode agentic`.
+`mode="agentic"` with the Balanced profile is the SAFER default; `mode="scanner"` is SAFER-Scanner; `mode="static"` is SAFER-Static.
 
 ## Design notes
 
@@ -414,5 +717,8 @@ Or from the command line: `python -m csf.inference clip.mp4 --model_dir runs/ful
   the arbiter pass, normalised to [0, 1] so a correct answer is never outweighed by its cost.
 - **No leakage into routing.** Dispatchers are trained on the validation outcome table, which neither VLM was fit
   on. The test split is used only for the final report.
-- **Limitations.** The dataset has no manipulation masks, so the proposal's `α·R_attr` (mIoU) term is 0. The
-  evidence graph encodes hypothesised mechanisms, not established causal relations.
+- **Same-reasoner measurement.** The no-tool arbiter pass is part of every run, so the value of a tool subset is
+  always measured against the same weights on the same frames, never against a different model.
+- **Limitations.** The dataset has no manipulation masks, so the attribution term `α·R_attr` (mIoU) is 0. The
+  evidence graph encodes hypothesised mechanisms, not established causal relations. All findings come from one
+  scanner/arbiter pair and one feature pool.

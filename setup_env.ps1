@@ -2,7 +2,7 @@
 Windows environment setup for Chrono-Spectral Forensics.
 
 Creates .venv, installs a CUDA build of PyTorch (default cu128 = required for RTX 50xx / Blackwell,
-also fine for RTX 30xx/40xx with driver >= 570), installs requirements.txt and runs csf.env_check.
+also fine for RTX 30xx/40xx with driver >= 570), installs requirements.txt and runs safer.env_check.
 
 Usage (PowerShell, from the repo root):
     powershell -ExecutionPolicy Bypass -File setup_env.ps1
@@ -42,7 +42,7 @@ Write-Host "==> Installing requirements"
 if ($LASTEXITCODE -ne 0) { throw "requirements install failed" }
 
 Write-Host "==> Verifying environment"
-& $venvPy -m csf.env_check
+& $venvPy -m safer.env_check
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. .venv\Scripts\Activate.ps1"

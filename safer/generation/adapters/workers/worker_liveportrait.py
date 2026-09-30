@@ -1,0 +1,144 @@
+"""
+LivePortrait - implicit-keypoint animation with stitching and retargeting.
+
+Two spec slots, selected by `options["mode"]`:
+
+    mode="reenact"     the Face2Face slot. Face2Face was never publicly released; LivePortrait
+                       stands in with a genuinely different mechanism from the FOMM slot next to
+                       it (implicit keypoints + stitching, versus FOMM's local affine warping),
+                       so the family keeps two distinct artifact classes rather than two of one.
+                       Driven video-to-video: the target clip is animated by a separate driver.
+
+    mode="expression"  the GANimation slot. GANimation published no weights; LivePortrait's
+                       retargeting ratios give the continuous, magnitude-controlled expression
+                       edits that slot is defined by (eyes and lips, driven by scalar ratios),
+                       which is the closest honest analogue to AU-conditioned control.
+
+Recorded in the manifest as `liveportrait` / `liveportrait_expr`, never as the slot name.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import cv2
+
+from _common import (has_audio, note, read_video, repo_path, require, run_cmd, scratch, serve,
+                     write_video)
+
+MAX_FRAMES = 160
+MAX_SIDE = 720
+
+#: (eye ratio, lip ratio) per expression variant - the magnitude the job asked for.
+#:
+#: Retargeting moves eyelids and lips on the face that is already there. It cannot change age,
+#: hair colour or add an accessory, so those variants are deliberately absent and a job asking
+#: for one is refused rather than rendered. The previous table mapped hair_color to (0.0, 0.0),
+#: which would have written out an unmodified clip labelled as a hair-colour edit - a sample
+#: with no manipulation in it at all, in a dataset whose entire purpose is detecting
+#: manipulation.
+EXPRESSION_RETARGET = {
+    "smile_happiness": (0.0, 0.5), "sadness_crying": (-0.2, -0.3), "anger": (-0.3, -0.2),
+    "surprise": (0.6, 0.4), "eye_gaze_modification": (0.5, 0.0),
+    "mouth_expression_modification": (0.0, 0.6),
+}
+
+
+class State:
+    def __init__(self, repo: Path, mode: str):
+        """Store the reusable components required by this model worker."""
+        self.repo, self.mode = repo, mode
+
+
+def load() -> State:
+    """Load the model and return its reusable worker state."""
+    repo = repo_path("LivePortrait")
+    require(repo / "inference.py", "LivePortrait inference script")
+    weights = repo / "pretrained_weights"
+    if not weights.exists() or not any(weights.iterdir()):
+        raise RuntimeError(
+            f"LivePortrait weights missing at {weights}. Fetch them with:\n"
+            f"    cd {repo} && hf download KlingTeam/LivePortrait "
+            f"--local-dir pretrained_weights")
+    note(f"liveportrait: repo {repo}")
+    return State(repo, "")
+
+
+def _collect(out_dir: Path, exclude_concat: bool = True):
+    """Find the video artifact produced by the upstream model."""
+    mp4s = sorted(out_dir.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if exclude_concat:
+        plain = [p for p in mp4s if "concat" not in p.name]
+        mp4s = plain or mp4s
+    return mp4s
+
+
+def render(state: State, payload: dict) -> dict:
+    """Render one generation job with the loaded worker state."""
+    opts = payload.get("options") or {}
+    mode = opts.get("mode", "reenact")
+    src = payload["source_path"]
+    frames, fps = read_video(src, max_frames=MAX_FRAMES, max_side=MAX_SIDE)
+
+    with scratch(payload["job_id"]) as tmp:
+        tmp = Path(tmp)
+        source_mp4, out_dir = tmp / "source.mp4", tmp / "animations"
+        write_video(frames, str(source_mp4), fps=fps)
+        cmd = [sys.executable, "inference.py", "-s", str(source_mp4), "-o", str(out_dir)]
+        meta: dict = {}
+
+        if mode == "reenact":
+            driving = payload.get("driving_path") or ""
+            if not driving or not Path(driving).exists() or driving == src:
+                raise RuntimeError("reenactment job needs a driving clip distinct from the target")
+            drive_frames, _ = read_video(driving, max_frames=MAX_FRAMES, max_side=512)
+            driving_mp4 = tmp / "driving.mp4"
+            write_video(drive_frames, str(driving_mp4), fps=fps)
+            # LivePortrait's CLI is tyro over a dataclass: a bool field is a switch and
+            # takes no value, and relative motion is on by default anyway
+            cmd += ["-d", str(driving_mp4)]
+            meta.update(reenactment_model="liveportrait",
+                        driving_video_id=Path(driving).stem, target_video_id=Path(src).stem,
+                        target_identity=Path(src).stem, driving_identity=Path(driving).stem)
+        elif mode == "expression":
+            variant = payload.get("variant") or "smile_happiness"
+            if variant not in EXPRESSION_RETARGET:
+                raise RuntimeError(
+                    f"LivePortrait retargeting cannot produce the '{variant}' variant - it "
+                    f"deforms the face that is already in the frame. Supported: "
+                    f"{sorted(EXPRESSION_RETARGET)}. This job should have been routed to a "
+                    f"renderer that performs that edit.")
+            eye, lip = EXPRESSION_RETARGET[variant]
+            magnitude = float((payload.get("metadata") or {}).get("edit_magnitude", 0.5) or 0.5)
+            # drive the clip with itself, then let retargeting supply the edit
+            # There are no retargeting multipliers in this release - the flags that do
+            # exist are switches with ratios computed internally, which would leave
+            # edit_magnitude recording a number nothing acted on. `driving_multiplier` is a
+            # real scalar: drive the clip with itself and scale the motion, with
+            # animation_region=exp so only the expression moves and the pose stays put.
+            strength = 1.0 + max(abs(eye), abs(lip)) * magnitude
+            cmd += ["-d", str(source_mp4), "--animation_region", "exp",
+                    "--driving_multiplier", f"{strength:.3f}"]
+            meta.update(edit_model="liveportrait_expr", manipulation_type=variant,
+                        edit_magnitude=magnitude, driving_multiplier=round(strength, 3),
+                        eye_ratio=eye, lip_ratio=lip,
+                        # retargeting edits the face in place, so identity is preserved
+                        identity_preserved=True)
+        else:
+            raise RuntimeError(f"unknown liveportrait mode {mode!r}")
+
+        run_cmd(cmd, cwd=str(state.repo), timeout=1800)
+        produced = _collect(out_dir)
+        if not produced:
+            raise RuntimeError(f"LivePortrait produced no output under {out_dir}")
+        result, out_fps = read_video(str(produced[0]), max_side=0)
+
+    write_video(result, payload["output_path"], fps=out_fps or fps,
+                audio_from=src if has_audio(src) else None)
+    meta.update(substitutes_for=payload.get("spec_model", ""), frames=len(result))
+    return meta
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve(load, render, model_name="liveportrait"))

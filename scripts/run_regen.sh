@@ -43,21 +43,21 @@ gen_stage() {   # generation stages are single-process: they schedule their own 
 case "$PHASE" in
   --envs)
     echo "==> Building per-model environments (this pulls torch + repos + weights; allow ~1-2 h)"
-    exec "$PY" -m csf.generation.envs --build all \
-         --envs-root "$("$PY" -c "from csf.config import load_config; print(load_config('$CONFIG').generation.envs_root)")"
+    exec "$PY" -m safer.generation.envs --build all \
+         --envs-root "$("$PY" -c "from safer.config import load_config; print(load_config('$CONFIG').generation.envs_root)")"
     ;;
   --status)
-    exec "$PY" -m csf.generation.envs --status \
-         --envs-root "$("$PY" -c "from csf.config import load_config; print(load_config('$CONFIG').generation.envs_root)")"
+    exec "$PY" -m safer.generation.envs --status \
+         --envs-root "$("$PY" -c "from safer.config import load_config; print(load_config('$CONFIG').generation.envs_root)")"
     ;;
-  --plan)     exec "$PY" -m csf.generation.spec ;;
-  --adapters) exec "$PY" -m csf.generation.adapters ;;
+  --plan)     exec "$PY" -m safer.generation.spec ;;
+  --adapters) exec "$PY" -m safer.generation.adapters ;;
   --budget)
     HOURS="${1:-84}"
-    exec "$PY" -m csf.generation.budget --hours "$HOURS" --gpus 4 --workers-per-gpu 4
+    exec "$PY" -m safer.generation.budget --hours "$HOURS" --gpus 4 --workers-per-gpu 4
     ;;
   --eta)
-    exec "$PY" -m csf.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
+    exec "$PY" -m safer.generation.budget --reallocate --gpus 4 --workers-per-gpu 4
     ;;
   --kinetics) gen_stage kinetics "$@" ;;
   --generate) gen_stage generate "$@" ;;

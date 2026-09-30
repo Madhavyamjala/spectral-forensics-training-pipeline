@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux environment setup for Chrono-Spectral Forensics.
 # Creates .venv, installs a CUDA build of PyTorch (default cu128; use cu126 for older drivers, cpu for CPU-only),
-# installs requirements.txt, optionally flash-attn, and runs csf.env_check.
+# installs requirements.txt, optionally flash-attn, and runs safer.env_check.
 #
 # Usage:  bash setup_env.sh [--cuda cu128] [--python python3.11] [--flash-attn]
 set -euo pipefail
@@ -42,7 +42,7 @@ if [[ "$FLASH" == "1" ]]; then
 fi
 
 echo "==> Verifying environment"
-"$VPY" -m csf.env_check || true
+"$VPY" -m safer.env_check || true
 cat <<'EOF'
 
 Next steps:

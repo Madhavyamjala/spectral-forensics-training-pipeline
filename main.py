@@ -33,6 +33,8 @@ Multi-GPU:
 Options:
     --stage all | <stage>[,<stage>...]   run a subset (default all)
     --force <stage>[,<stage>...]         re-run stages even if marked complete in <work_dir>/state.json
+    --latencynum N                       benchmark exactly N held-out test videos; missing raw files are fetched
+    --tooldependency                     run the paired forensic-tool subset benchmark with the latency stage
     --set section.key=value              override any config value (repeatable)
 
 Input : YAML config (configs/*.yaml).
@@ -60,7 +62,7 @@ else:
 GENERATION_STAGES = ["prefetch", "kinetics", "generate", "regen_manifest", "push_dataset"]
 TRAINING_STAGES = [
     "prepare", "features", "train_qwen", "train_llama", "predict_scanner", "outcomes",
-    "train_dispatcher", "evaluate", "export", "latency", "push"]
+    "train_dispatcher", "evaluate", "export", "latency", "tooldependency", "report", "push"]
 STAGES = GENERATION_STAGES + TRAINING_STAGES
 
 
@@ -70,6 +72,10 @@ def parse_args():
     ap.add_argument("--config", required=True)
     ap.add_argument("--stage", default="all")
     ap.add_argument("--force", default="")
+    ap.add_argument("--latencynum", type=int, default=None,
+                    help="number of held-out test videos for the live latency/tool benchmarks")
+    ap.add_argument("--tooldependency", action="store_true",
+                    help="run the separate forensic-tool dependency benchmark stage")
     ap.add_argument("--set", action="append", default=[], dest="overrides")
     return ap.parse_args()
 
@@ -149,20 +155,56 @@ def preflight(cfg, dist_info, log, selected=None) -> None:
         log.warning("CUDA is NOT available - training will run on CPU (only sensible for tiny smoke tests).")
 
     if cfg.generation.enabled and selected & set(GENERATION_STAGES):
-        info["ffmpeg"] = bool(_shutil.which("ffmpeg")) and bool(_shutil.which("ffprobe"))
-        if not info["ffmpeg"]:
+        from safer.generation.ffmpeg_tools import INSTALL_HINT, describe, ffprobe_exe, have_ffmpeg
+        info.update(describe())
+        if not have_ffmpeg():
             raise RuntimeError(
-                "ffmpeg and ffprobe must be on PATH for the generation stages - every worker "
-                "encodes with them, and the manifest stage probes each produced file.\n"
-                "    Linux:   sudo apt install ffmpeg\n"
-                "    Windows: winget install Gyan.FFmpeg")
+                "No ffmpeg binary could be found, and every generation worker encodes with it.\n"
+                + INSTALL_HINT)
+        if ffprobe_exe() is None:
+            log.warning("ffprobe was not found (imageio-ffmpeg ships ffmpeg without it). "
+                        "Container metadata will be parsed from ffmpeg instead, which is "
+                        "slightly less precise but sufficient.")
         _check_generation_gpus(cfg, log)
 
-    free_gb = _shutil.disk_usage(Path(cfg.paths.cache_dir).resolve().anchor).free / 2**30
+    free_gb, probed = free_space_gib(cfg.paths.cache_dir)
     info["disk_free_gib"] = round(free_gb, 1)
+    info["disk_probe"] = str(probed)
+    video_free, video_probed = free_space_gib(cfg.paths.video_dir)
+    if video_probed != probed:                      # a second filesystem holds the videos
+        info["video_disk_free_gib"] = round(video_free, 1)
+        info["video_disk_probe"] = str(video_probed)
     log.info("Environment: %s", json.dumps(info))
-    if free_gb < (20 if cfg.mode == "test" else 120):
-        log.warning("Only %.1f GiB free disk space; the feature cache + model downloads may not fit.", free_gb)
+
+    # free space is not permission to write: a per-user quota refuses the write with terabytes
+    # still free on the filesystem, and every symptom downstream wears a different costume
+    from safer.generation.diskcheck import require_writable
+    require_writable(cfg.paths.cache_dir, mib=16, label="the cache")
+    if Path(cfg.paths.video_dir).resolve() != Path(cfg.paths.cache_dir).resolve():
+        require_writable(cfg.paths.video_dir, mib=16, label="the videos")
+
+    for label, gib, where in (("cache", free_gb, probed), ("videos", video_free, video_probed)):
+        if gib < (20 if cfg.mode == "test" else 120):
+            log.warning("Only %.1f GiB free for the %s directory (measured on %s); the feature "
+                        "cache + model downloads may not fit.", gib, label, where)
+        if where == probed and label == "videos":
+            break                                   # same filesystem, one warning is enough
+
+
+def free_space_gib(path) -> "tuple[float, Path]":
+    """Free GiB on the filesystem that will hold `path`, and the directory actually measured.
+
+    The directory usually does not exist yet on a first run, which is why this used to measure
+    `Path(...).anchor` - and on POSIX that is always "/". It therefore reported the root
+    filesystem forever: on a cluster where the cache lives on a 30 TB mount, preflight warned
+    about the 71 GiB left on the OS disk, a number with no bearing on the run. Walking up to the
+    nearest existing parent measures the filesystem the data will really land on, and the caller
+    logs which directory that was so the figure can be checked.
+    """
+    probe = Path(path).resolve()
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / 2 ** 30, probe
 
 
 def _check_generation_gpus(cfg, log) -> None:
@@ -204,17 +246,29 @@ def check_gated_access(model_id: str, log) -> None:
             log.info("Access OK with provided token: %s", model_id)
         else:
             raise RuntimeError(f"No access to gated model {model_id}: {exc}. Accept the licence on the Hub and run "
-                               f"`huggingface-cli login` (or set HF_TOKEN) before launching.") from exc
+                               f"`hf auth login` (or set HF_TOKEN) before launching.") from exc
+
+
+def _stale_reason(name: str, cfg, info):
+    """Why a completed stage has to run again, or None to honour state.json.
+
+    Only the regeneration stages record enough to answer this; everything else is skipped on
+    the strength of state.json alone, as before.
+    """
+    if name not in GENERATION_STAGES:
+        return None
+    from safer.generation import run as generation
+    return generation.stale_reason(name, cfg, info)
 
 
 def main() -> int:
     """Run the selected stages of the forensics pipeline."""
     args = parse_args()
-    from csf.config import load_config
+    from safer.config import load_config
     cfg = load_config(args.config, args.overrides)
 
-    from csf.distributed import barrier, cleanup, init_distributed
-    from csf.logging_utils import RunState, setup_logging, stage
+    from safer.distributed import barrier, cleanup, init_distributed
+    from safer.logging_utils import RunState, setup_logging, stage
 
     # Bind the driver to a GPU the run is actually allowed to use. On a shared box GPU 0 often
     # belongs to something else, and a single-process run has no LOCAL_RANK to take the hint from.
@@ -233,9 +287,6 @@ def main() -> int:
                     "into that list, not physical ids. generation.gpus=%s will be interpreted "
                     "that way too. Unset it if you meant physical ids.",
                     os.environ["CUDA_VISIBLE_DEVICES"], cfg.generation.gpus)
-    if dist_info.is_main:
-        cfg.save(work_dir / "resolved_config.json")
-
     import pandas as pd
     import torch
     if cfg.train.tf32 and torch.cuda.is_available():
@@ -244,10 +295,25 @@ def main() -> int:
     seed_everything(cfg.seed + dist_info.rank)
 
     selected = STAGES if args.stage == "all" else [s.strip() for s in args.stage.split(",")]
+    if args.latencynum is not None:
+        if args.latencynum < 1:
+            raise SystemExit("--latencynum must be >= 1")
+        cfg.eval.latency_samples = args.latencynum
+        if "latency" not in selected and "tooldependency" not in selected:
+            selected.append("latency")
+    if args.tooldependency and "tooldependency" not in selected:
+        selected.append("tooldependency")
     unknown = [s for s in selected if s not in STAGES]
     if unknown:
         raise SystemExit(f"Unknown stage(s) {unknown}; choose from {STAGES}")
     forced = {s.strip() for s in args.force.split(",") if s.strip()}
+    if args.latencynum is not None and "latency" in selected:
+        forced.add("latency")
+    if args.tooldependency:
+        forced.add("tooldependency")
+    if dist_info.is_main:
+        cfg.save(work_dir / "resolved_config.json")
+
     state = RunState(work_dir)
 
     def should_run(name: str) -> bool:
@@ -258,6 +324,11 @@ def main() -> int:
         if name in forced:
             return True
         if state.done(name):
+            reason = _stale_reason(name, cfg, state.info(name))
+            if reason:
+                log.warning("Stage %s is marked complete in state.json, but %s -> re-running it.",
+                            name, reason)
+                return True
             log.info("Stage %s already completed (state.json) -> skipping. Use --force %s to redo.", name, name)
             return False
         return True
@@ -271,7 +342,7 @@ def main() -> int:
     with stage("preflight", work_dir, dist_info.rank):
         if dist_info.is_main:
             preflight(cfg, dist_info, log, selected)
-            if any(s in selected for s in ("train_llama", "outcomes", "latency")):
+            if any(s in selected for s in ("train_llama", "outcomes", "latency", "tooldependency")):
                 check_gated_access(cfg.models.llama_id, log)
         barrier()
 
@@ -280,9 +351,16 @@ def main() -> int:
     if "prefetch" in gen_selected and not cfg.generation.enabled:
         # a training-only run still wants its base models pulled up front
         with stage("prefetch", work_dir, dist_info.rank):
-            if dist_info.is_main and should_run("prefetch"):
-                from csf.generation.prefetch import prefetch
-                mark("prefetch", **prefetch(cfg, stage="train"))
+            if should_run("prefetch"):
+                report = {}
+                if dist_info.is_main:
+                    from safer.generation.prefetch import prefetch
+                    report = prefetch(cfg, stage="train")
+                # mark() ends in a barrier, so every rank has to call it. Calling it on rank 0 only
+                # left rank 0 one barrier ahead for the rest of the run: the other ranks paired their
+                # `prepare` barrier with it and read run_manifest.csv before rank 0 had written it -
+                # or, if rank 0 won that race, deadlocked at a later collective instead.
+                mark("prefetch", **report)
         gen_selected = [s for s in gen_selected if s != "prefetch"]
     if gen_selected and not cfg.generation.enabled:
         log.info("Stage(s) %s requested but generation.enabled is false -> skipping. Use "
@@ -295,7 +373,7 @@ def main() -> int:
                 "must not run under torchrun. Run them first on a single process:\n"
                 f"    python main.py --config {args.config} --stage {','.join(gen_selected)}\n"
                 "then launch the training stages with torchrun as usual.")
-        from csf.generation import run as generation
+        from safer.generation import run as generation
         handlers = {"prefetch": generation.stage_prefetch,
                     "kinetics": generation.stage_kinetics, "generate": generation.stage_generate,
                     "regen_manifest": generation.stage_regen_manifest,
@@ -317,7 +395,7 @@ def main() -> int:
         if dist_info.is_main:
             cfg.save(work_dir / "resolved_config.json")
 
-    from csf.data.manifest import load_run_manifest
+    from safer.data.manifest import load_run_manifest
     run_manifest = work_dir / "run_manifest.csv"
     if should_run("prepare") or not run_manifest.exists():
         with stage("prepare", work_dir, dist_info.rank):
@@ -329,9 +407,24 @@ def main() -> int:
     df = pd.read_csv(run_manifest, dtype={"video_id": str})
 
     index_file = cfg.cache_dir / "index.parquet"
-    if should_run("features") or not index_file.exists():
+    # A completed `features` stage is only valid for the manifest it was built from. When the
+    # manifest changes - the regenerated AI-Edited class landing is the case that matters - the old
+    # index is filtered to the new rows below, so every video it lacks is silently dropped and the run
+    # trains without that class. Re-extract when a class is mostly missing; cached items are skipped,
+    # so only the new videos cost anything. The threshold ignores the usual few undecodable videos.
+    stale_index = False
+    if index_file.exists():
+        cached = set(pd.read_parquet(index_file, columns=["video_id"])["video_id"].astype(str))
+        coverage = df.assign(hit=df["video_id"].astype(str).isin(cached)).groupby("class")["hit"].mean()
+        thin = coverage[coverage < 0.5]
+        if not thin.empty:
+            stale_index = True
+            log.warning("Feature cache %s covers too little of this manifest (%s) -> re-running "
+                        "features; already-cached videos are skipped.", index_file,
+                        ", ".join(f"{c} {v:.0%}" for c, v in thin.items()))
+    if should_run("features") or not index_file.exists() or stale_index:
         with stage("features", work_dir, dist_info.rank):
-            from csf.data.feature_cache import build_feature_cache
+            from safer.data.feature_cache import build_feature_cache
             index = build_feature_cache(df, cfg, dist_info)
             mark("features", cached=int(len(index)))
     index = pd.read_parquet(index_file)
@@ -341,7 +434,7 @@ def main() -> int:
     log.info("Cached dataset: %d videos | %s", len(index), index["split"].value_counts().to_dict())
 
     ckpt = {k: work_dir / "checkpoints" / k / "best" for k in ("qwen", "llama")}
-    from csf.train.classifier_trainer import train_classifier
+    from safer.train.classifier_trainer import train_classifier
     for kind in ("qwen", "llama"):
         name = f"train_{kind}"
         missing = name in selected and not (ckpt[kind] / "head.pt").exists()
@@ -358,11 +451,11 @@ def main() -> int:
                     raise RuntimeError(f"{name} finished without producing {ckpt[kind]}")
                 mark(name)
 
-    from csf.pipeline import build_outcomes, load_npz, predict_scanner, save_npz
+    from safer.pipeline import build_outcomes, load_npz, predict_scanner, save_npz
     pred_dir = work_dir / "predictions"
     if should_run("predict_scanner"):
         with stage("predict_scanner", work_dir, dist_info.rank):
-            from csf.models.classifier import load_classifier
+            from safer.models.classifier import load_classifier
             bundle = load_classifier(ckpt["qwen"], dist_info.device, attn_implementation=cfg.models.attn_implementation)
             for split in ("valid", "test"):
                 res = predict_scanner(cfg, dist_info, index, stats, ckpt["qwen"], split, model_bundle=bundle)
@@ -383,7 +476,7 @@ def main() -> int:
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             mark("outcomes")
 
-    from csf.eval.ablation import evaluate_ablation, train_dispatchers, write_report
+    from safer.eval.ablation import evaluate_ablation, train_dispatchers, write_report
     disp_dir = work_dir / "checkpoints" / "dispatcher"
     if should_run("train_dispatcher"):
         with stage("train_dispatcher", work_dir, dist_info.rank):
@@ -405,7 +498,7 @@ def main() -> int:
                 write_report(cfg, results, raw, o_test["labels"], extra)
             mark("evaluate")
 
-    from csf.hub import export_bundle, push_interactive
+    from safer.hub import export_bundle, push_interactive
     export_dir = work_dir / "export"
     if should_run("export"):
         with stage("export", work_dir, dist_info.rank):
@@ -415,20 +508,56 @@ def main() -> int:
 
     if should_run("latency"):
         with stage("latency", work_dir, dist_info.rank):
+            from safer import PRETTY_LABELS
+            from safer.eval.latency import ensure_latency_videos, live_latency_benchmark
+
             if dist_info.is_main:
-                from csf import PRETTY_LABELS
-                from csf.eval.latency import live_latency_benchmark
-                test = index[index["split"] == "test"].sort_values("video_id")
-                vids, labs = [], []
-                for cls, repo_path in zip(test["class"], test["repo_path"]):
-                    p = Path(cfg.paths.video_dir) / repo_path
-                    if p.exists():
-                        vids.append(p)
-                        labs.append(PRETTY_LABELS[cls])
-                vids, labs = vids[:cfg.eval.latency_samples], labs[:cfg.eval.latency_samples]
-                live_latency_benchmark(cfg, export_dir, vids, labs, resident=cfg.mode == "full")
+                ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            barrier()
+
+            rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            vids = [Path(p) for p in rows["video_path"]]
+            labs = [PRETTY_LABELS[c] for c in rows["class"]]
+
+            live_latency_benchmark(
+                cfg, export_dir, vids, labs, resident=cfg.mode == "full", dist_info=dist_info
+            )
+            if dist_info.is_main:
                 shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
-            mark("latency")
+            barrier()
+            mark("latency", latency_samples=int(cfg.eval.latency_samples))
+
+    if should_run("tooldependency"):
+        with stage("tooldependency", work_dir, dist_info.rank):
+            from safer import PRETTY_LABELS
+            from safer.eval.latency import ensure_latency_videos, tool_dependency_benchmark
+
+            if not export_dir.exists():
+                raise RuntimeError(
+                    "Export bundle is missing. Run python full_2class.py --stage export first."
+                )
+            if dist_info.is_main:
+                ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            barrier()
+
+            rows = ensure_latency_videos(cfg, index, cfg.eval.latency_samples)
+            vids = [Path(p) for p in rows["video_path"]]
+            labs = [PRETTY_LABELS[c] for c in rows["class"]]
+
+            tool_dependency_benchmark(
+                cfg, export_dir, vids, labs, resident=cfg.mode == "full", dist_info=dist_info
+            )
+            if dist_info.is_main:
+                shutil.copytree(work_dir / "metrics", export_dir / "metrics", dirs_exist_ok=True)
+            barrier()
+            mark("tooldependency", latency_samples=int(cfg.eval.latency_samples))
+
+    if should_run("report"):
+        with stage("report", work_dir, dist_info.rank):
+            if dist_info.is_main:
+                from safer.eval.report import write_full_results_report
+                write_full_results_report(cfg, index)
+            mark("report")
 
     cleanup()
     if dist_info.is_main and "push" in selected:
