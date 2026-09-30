@@ -1,45 +1,140 @@
-# Chrono-Spectral Forensics (CSF): training pipeline
+# SAFER: when is acquiring forensic evidence worth the cost?
 
-Distributed PyTorch implementation of the **Chrono-Spectral Forensics** proposal (*Agentic Forensic Systems for
-AI-Generated Video Detection*). It uses **Chrono-TriClass-100k** (`madhav-yrc/Chrono-TriClass-100k`, 97,774 videos)
-to classify each video as **Real / AI-Generated / AI-Edited**. It then runs an ablation study across three model
-types, reports detailed metrics (quality, calibration, robustness and latency), and pushes the weights and metrics to
-a Hugging Face model repo.
+Code for **SAFER: When Is Acquiring Forensic Evidence Worth the Cost in Agentic AI-Generated Video Detection?**
+(under review at ICLR 2027).
+
+Agentic video detectors let a vision-language model (VLM) call forensic tools and reason over what they return.
+Every tool call costs latency, and the value of a tool is usually measured against a *different* model, which mixes
+the value of the evidence with the difference between the two models. SAFER treats forensic analysis as evidence
+acquisition under a latency budget, and measures what the evidence is worth against **the same reasoner without it**.
+
+**What the paper finds.** On Chrono-66k and four external benchmarks:
+- The 23 forensic features carry real signal on their own (a gradient-boosted classifier on them alone reaches 96.39%
+  macro-F1 in-domain), but add little beyond the VLM frontline: in-domain, running every tool fixes 6 of the 20 errors
+  that remain after the default, at 1.71x the latency.
+- Across 44 generator and editing categories unseen in training, the mean AUC change from adding the full tool suite
+  to the same arbiter is -0.007 (95% bootstrap interval [-0.017, 0.003]).
+- The cost-aware GRPO dispatcher learns to skip tools, matching or beating full-tool baselines at about 0.60x their latency.
+- Under domain shift the errors come mainly from a miscalibrated decision threshold, not missing evidence: recalibrating
+  the threshold on a small labelled target sample improves balanced accuracy by 4.3 to 12.9 points on three of four
+  benchmarks, more than refitting the router on the same sample.
+
+> The Python package is still named `csf` (Chrono-Spectral Forensics, the project's working name). SAFER is the
+> method; `csf` is where it lives.
 
 ```mermaid
 flowchart LR
-    V[video] --> D[decode 8-16 frames<br/>native res + 224px]
-    D --> Q["Phase 1 scanner<br/>Qwen2.5-VL-3B + LoRA"]
-    D --> S["Llama-3.2-11B-Vision + LoRA<br/>pass 0: dispatcher state<br/>(vision states cached)"]
-    Q --> P{"Phase 2 GRPO dispatcher<br/>ultra_fast / balanced / max_security"}
-    S --> P
-    P -- early_exit --> OUT[Real / AI-Gen / AI-Edit]
-    P -- tool subset --> T["Phase 3 toolpool on sparse 64x64 patches<br/>spatial | spectral (FFT, 3D-DCT, phase) | latent (DIRE, SVD-VAE)"]
-    T --> G["Phase 4 evidence graph -> arbiter<br/>same Llama backbone, reuses cached vision states"]
+    V[video] --> D[decode 16 frames<br/>native res + 224px]
+    D --> Q["Scanner<br/>Qwen2.5-VL-3B + LoRA"]
+    D --> A0["Arbiter, no-tool pass<br/>Llama-3.2-11B-Vision + LoRA<br/>(vision states cached)"]
+    Q --> P{"Cost-aware dispatcher<br/>GRPO, 6 actions"}
+    A0 --> P
+    P -- "exit without tools<br/>(mean of scanner + no-tool arbiter)" --> OUT[Real / AI-Generated]
+    P -- "pay for a tool subset" --> T["Toolpool on sparse patches<br/>spatial 9 | spectral 9 | latent 5 features"]
+    T --> G["Evidence graph -> arbiter<br/>same weights, reuses cached vision states"]
     G --> OUT
 ```
 
-## What gets trained and compared
+The **frontline** (scanner plus the arbiter's no-tool pass) runs on every video and gives the dispatcher its state
+`s = [h0, p_scan, p_nt]`. The dispatcher either exits without tools or pays for one of five tool subsets (spatial,
+spectral, latent, spatial+spectral, all). Because the no-tool arbiter pass runs anyway, it doubles as the
+**same-reasoner baseline**: the value of a tool subset T is the arbiter's AUC with T minus its AUC with an empty
+evidence graph, from the same weights, frames and cached vision states.
 
-| Id | Model type | What it is |
+## Task and data
+
+Binary detection: **Real vs AI-Generated**. Models are trained on **Chrono-66k** and evaluated on its held-out test
+split and, zero-shot, on four external benchmarks.
+
+| Chrono-66k | Source | Videos | Train | Valid | Test |
+|---|---|---|---|---|---|
+| Real | Kinetics-400 | 33,334 | 26,684 | 3,305 | 3,345 |
+| AI-Generated | VidProM (Pika, VideoCrafter2) | 33,312 | 26,650 | 3,331 | 3,331 |
+| **Total** | | **66,646** | **53,334** | **6,636** | **6,676** |
+
+Chrono-66k is the Real and AI-Generated part of the `madhav-yrc/Chrono-TriClass-100k` manifest in this repo
+(`manifest.csv`, split at the source-clip level by SHA-256, 80/10/10 stratified). The AI-Edited class and its
+generator (section 4) are not used by the paper. `configs/full_2class.yaml` selects exactly these two classes
+(`data.classes: [real, ai_generated]`).
+
+**Format normalisation.** A classifier on container metadata alone separates the original real and generated files,
+so every video is letterboxed to 854x480, resampled to 24 fps, cut to its first 10 s, stripped of audio and re-encoded
+with H.264 (CRF 23, yuv420p). External benchmarks: GenBuster, ViF-Bench, FakePartsBench and GenVidBench (Pika and
+VideoCrafter2 removed, as they are training generators). `benchmark_external.py` builds and normalises them the same way.
+
+## Detector modes
+
+| Mode (paper name) | What runs | In this repo |
 |---|---|---|
-| A | `A_qwen_scanner` | Qwen2.5-VL-3B-Instruct + LoRA + linear head. Reads the frames as video (Phase 1 only). |
-| B | `B_llama_arbiter_static` | Llama-3.2-11B-Vision-Instruct + LoRA. Reads a 2x2 frame mosaic plus the evidence graph from **all** tools (Phases 3 and 4, no routing). |
-| C | `C_csf_agentic_<profile>` | Full CSF: scanner, then the GRPO dispatcher, then only the chosen tools, then the arbiter reusing the dispatcher's vision states. Trained once per proposal profile: `ultra_fast` (λ=1, β=0, no latent tool), `balanced` (λ=0.2, β=0.5), `max_security` (λ=0, β=2). |
+| SAFER-Scanner | scanner only | `CSFDetector.predict(mode="scanner")`; ablation row `A_qwen_scanner` |
+| Arbiter, no tools | arbiter with an empty evidence graph | `notool_probs` in the outcome tables |
+| **SAFER default** | frontline, then the learned dispatcher, which exits without tools | dispatcher action `early_exit` = mean of scanner and no-tool arbiter; the Ultra-Fast and Balanced dispatchers pick it on every in-domain test video |
+| SAFER-Static | arbiter once with all tools, no dispatcher-state pass | `mode="static"`; ablation row `B_llama_arbiter_static` |
+| Evidence mode | scanner averaged with the arbiter given a tool subset | computed from the outcome tables |
+| Low-latency mode (τ) | scanner alone unless its confidence is below τ | computed from the outcome tables |
+| Adaptation mode | decision threshold (or router) refitted on a labelled sample of the target domain | computed from external per-video scores |
+| Max-Security dispatcher | GRPO with λ=0, β=2 | ablation row `C_csf_agentic_max_security` |
 
-The report also includes these supporting rows:
-- **Fixed-routing ladder** (`csf_fixed_<action>`): each tool subset run without a learned dispatcher.
-- **`baseline_toolpool_gbdt`**: forensic features only, no VLM.
-- **`baseline_metadata_shortcut`**: gradient boosting on container metadata (resolution, fps, codec, bitrate). It shows how much of the dataset can be solved from source cues alone. Read the VLM numbers against it.
+Dispatcher reward: `R = 1[ŷ=y] − λ·C(a)/max C − β·1[y≠Real ∧ ŷ=Real]`, with C(a) the measured latency of action a.
+Profiles: Ultra-Fast (λ=1, β=0, latent disabled), Balanced (λ=0.2, β=0.5), Max-Security (λ=0, β=2).
 
-**Metrics** for each model are written to `runs/<run>/metrics/`:
-- Quality: accuracy, balanced accuracy, macro and weighted F1, MCC, Cohen's κ.
-- Per class: precision, recall, F1, ROC-AUC, PR-AUC, plus confusion matrices.
-- Calibration: log-loss, Brier score, ECE.
-- Forensic behaviour: binary fake-detection recall, miss rate, false-alarm rate, Edited↔Generated confusion, and accuracy per AI-Edited method.
-- Latency: p50/p90/p95/p99, throughput, tool cost, routing distribution and early-exit rate.
-- Live raw-video latency benchmark and training curves.
-- Plots: Pareto frontier, confusion matrices, ROC curves, bar charts, loss and GRPO reward curves.
+## Results reported in the paper
+
+In-domain, Chrono-66k test split (n=6,676; median end-to-end latency, batch 4, resident models):
+
+| Model | Macro-F1 | Errors | Miss % | False alarm % | p50 ms |
+|---|---|---|---|---|---|
+| Toolpool-GBDT (tools only, no VLM) | 96.39 | 241 | 3.57 | 3.65 | 235.9 |
+| SAFER-Scanner | 99.63 | 25 | 0.39 | 0.36 | 142.2 |
+| Arbiter, no tools | 99.36 | 43 | 0.60 | 0.69 | - |
+| SAFER-Static | 99.54 | 31 | 0.39 | 0.54 | 348.5 |
+| SAFER low-latency mode (τ=0.5) | 99.66 | 23 | 0.39 | 0.30 | 143.0 |
+| **SAFER default** | **99.70** | **20** | 0.27 | 0.33 | 239.1 |
+| SAFER evidence mode, all tools | 99.79 | 14 | 0.15 | 0.27 | 409.4 |
+| Oracle (cheapest correct action) | 99.81 | 13 | - | - | 239.1 |
+
+Zero-shot AUC on normalised external benchmarks († Pika and VideoCrafter2 removed):
+
+| Detector | GenBuster | ViF-Bench | FakeParts | GenVidBench† |
+|---|---|---|---|---|
+| Metadata-GBDT, normalised | 0.18 | 0.48 | 0.50 | - |
+| Qwen2.5-VL-3B, zero-shot | 0.69 | 0.56 | 0.64 | - |
+| SAFER-Scanner | 0.867 | 0.638 | 0.714 | 0.830 |
+| Arbiter, no tools | 0.808 | 0.621 | 0.692 | 0.802 |
+| SAFER-Static | 0.735 | 0.616 | 0.690 | 0.788 |
+| SAFER evidence mode, all tools | 0.800 | 0.645 | 0.725 | 0.821 |
+| **SAFER default** | 0.853 | 0.646 | 0.725 | 0.831 |
+
+Balanced accuracy at the 0.5 threshold, change relative to the SAFER default (adaptation rows: mean ± std over 10
+generator-disjoint splits):
+
+| | ViF-Bench | FakeParts | GenBuster | GenVidBench† |
+|---|---|---|---|---|
+| SAFER default (balanced accuracy, %) | 53.7 | 62.2 | 68.1 | 73.8 |
+| Routing oracle (cheapest correct action) | +1.6 | +3.8 | +7.2 | +5.1 |
+| Router refit on target labels | +0.9 ±0.1 | +0.6 ±0.1 | +3.3 ±0.8 | −0.6 ±0.4 |
+| **Adaptation mode (recalibration)** | **+7.4 ±0.8** | **+4.3 ±0.9** | **+12.9 ±0.5** | −0.6 ±0.5 |
+
+These numbers are copied from the paper; they are not regenerated by CI. All runs used seed 42 on four NVIDIA H200 NVL GPUs.
+
+**Scope.** All conclusions come from one scanner/arbiter pair (Qwen2.5-VL-3B, Llama-3.2-11B-Vision) and one pool of
+23 hand-crafted features; other backbones or fusion mechanisms may use tool evidence differently.
+
+## What the pipeline trains and reports
+
+| Id | Report row | What it is |
+|---|---|---|
+| A | `A_qwen_scanner` | SAFER-Scanner: Qwen2.5-VL-3B-Instruct + LoRA + linear head, 16 frames at 224 px. |
+| B | `B_llama_arbiter_static` | SAFER-Static: Llama-3.2-11B-Vision-Instruct + 4-bit LoRA on a 2x2 mosaic at 560 px, with the evidence graph from **all** tools. |
+| C | `C_csf_agentic_<profile>` | Full SAFER: frontline, GRPO dispatcher, only the chosen tools, arbiter reusing the cached vision states; one dispatcher per profile. |
+
+Supporting rows: the fixed-routing ladder (`csf_fixed_<action>`, including `csf_fixed_early_exit`, the no-tool exit),
+`baseline_toolpool_gbdt` (the 23 tool features only, no VLM) and `baseline_metadata_shortcut` (container metadata only).
+
+**Metrics** for each model are written to `runs/<run>/metrics/`: accuracy, balanced accuracy, macro and weighted F1,
+MCC, Cohen's κ; per-class precision, recall, F1, ROC-AUC, PR-AUC and confusion matrices; log-loss, Brier score, ECE;
+miss and false-alarm rates; latency percentiles, throughput, tool cost, routing distribution and early-exit rate;
+the live raw-video latency benchmark; and plots (Pareto frontier, confusion matrices, ROC curves, training and GRPO curves).
 
 ## Repository layout
 
@@ -47,10 +142,15 @@ The report also includes these supporting rows:
 main.py                   stage driver (resumable) - the only entry point
 configs/test.yaml         test run: 5 000 videos, 12-16 GB GPU (e.g. laptop RTX 5070 Ti 12 GB)
 configs/full.yaml         full run: all videos, >=24 GB GPU(s), tuned for speed + quality
+configs/full_2class.yaml  the paper's run: Chrono-66k (Real vs AI-Generated), 4x H200 settings
+full_2class.py            entry point for configs/full_2class.yaml (same stages as main.py)
+infer_2class.py           batch inference with an exported two-class bundle
+benchmark_external.py     zero-shot evaluation on normalised external benchmarks + baselines
 configs/smoke_cpu.yaml    CPU wiring check with tiny random models (no GPU, no gated weights)
 configs/regen.yaml        AI-Edited regeneration + training (4x H200)
 configs/regen_smoke.yaml  200-video generator wiring check
 tests/test_generation.py  dependency-free checks for the generator's allocation
+tests/test_evaluation.py  class-subset evaluation regressions
 manifest.csv              Chrono-TriClass-100k manifest (leakage-aware train/valid/test split)
 setup_env.ps1 / .sh       environment setup (Windows / Linux)
 scripts/                  launch.ps1/.sh (auto torchrun on >1 GPU), run_test.*, run_full.*
@@ -78,7 +178,8 @@ csf/
   models/dispatcher.py    Phase 2 policy, reward, profiles, GRPO trainer
   train/classifier_trainer.py  DDP training loop
   pipeline.py             scanner inference + shared-backbone outcome tables
-  eval/                   metrics, ablation + report, live latency benchmark
+  eval/                   metrics, ablation + report, live latency / tool-dependency benchmarks,
+                          unified results report
   hub.py                  export bundle, model card, interactive Hub push
   inference.py            CSFDetector: raw video -> verdict (used by the published repo)
   env_check.py            environment verification
@@ -91,8 +192,8 @@ There are two independent halves. You can run either on its own, or both end to 
 
 | Half | What it does | Entry point |
 |---|---|---|
-| **Dataset generator** | Builds the AI-Edited class from scratch: fetches Kinetics-400 clips, renders 33,333 manipulated videos with 24 models, rebuilds `manifest.csv` | `scripts/run_regen.sh` |
-| **Training pipeline** | Trains the CSF scanner/arbiter/dispatcher on a manifest, runs the ablation, exports and publishes | `scripts/run_full.sh` |
+| **Dataset generator** | Builds the AI-Edited class from scratch: fetches Kinetics-400 clips, renders 33,333 manipulated videos with 24 models, rebuilds `manifest.csv`. **Not used by the SAFER paper**, which is Real vs AI-Generated only. | `scripts/run_regen.sh` |
+| **Training pipeline** | Trains the SAFER scanner, arbiter and dispatchers on a manifest, runs the ablation, exports and publishes | `scripts/run_full_2class.sh` (the paper's run) or `scripts/run_full.sh` |
 
 The generator writes its videos where the training half looks for them, so "both" is just running
 one after the other. Section 3 has the exact commands for each.
@@ -298,6 +399,9 @@ and generation resumes from its per-video ledger. See
 ---
 
 ## 4. Regenerating the AI-Edited class
+
+> The SAFER paper does not use the AI-Edited class: it trains and evaluates on Real vs AI-Generated only.
+> This section is kept for the three-class dataset.
 
 The AI-Edited third of the dataset is rebuilt from Kinetics-400 following
 *AI Edited Data Source and Pipeline*: **33,333 videos, 8 manipulation families, 24 distinct
@@ -530,9 +634,9 @@ python main.py --config configs/full.yaml --stage push
 Base-model weights are not re-uploaded. The adapters load on top of the original Qwen and Llama repos, which keeps
 the Llama licence gating intact.
 
-## 9.1 Full Real vs AI-Generated run
+## 9.1 Reproducing the paper's training run (Chrono-66k, Real vs AI-Generated)
 
-Use the dedicated two-class config to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
+This is the configuration the paper's models were trained with. Use it to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
 
 ```bash
 bash scripts/run_full_2class.sh
@@ -556,13 +660,14 @@ The command prints **REAL/FAKE**, the model label, confidence, and selected rout
 
 ```python
 from csf.inference import CSFDetector
-det = CSFDetector("runs/full/export")          # or "<namespace>/<repo>" after pushing
+det = CSFDetector("runs/full_2class/export")   # or "<namespace>/<repo>" after pushing
 det.predict("clip.mp4", mode="agentic", profile="balanced")
-# {'label': 'AI-Edited', 'probs': {...}, 'action': 'spatial_spectral', 'tools_run': [...],
+# {'label': 'AI-Generated', 'probs': {...}, 'is_fake': True, 'action': 'early_exit', 'tools_run': [],
 #  'latency_ms': {'decode': ..., 'scanner': ..., 'dispatcher_state': ..., 'tools': ..., 'arbiter': ...},
 #  'evidence_graph': {...}}
 ```
-Or from the command line: `python -m csf.inference clip.mp4 --model_dir runs/full/export --mode agentic`.
+Or from the command line: `python -m csf.inference clip.mp4 --model_dir runs/full_2class/export --mode agentic`.
+`mode="agentic"` with the Balanced profile is the SAFER default; `mode="scanner"` is SAFER-Scanner; `mode="static"` is SAFER-Static.
 
 ## Design notes
 
@@ -577,5 +682,8 @@ Or from the command line: `python -m csf.inference clip.mp4 --model_dir runs/ful
   the arbiter pass, normalised to [0, 1] so a correct answer is never outweighed by its cost.
 - **No leakage into routing.** Dispatchers are trained on the validation outcome table, which neither VLM was fit
   on. The test split is used only for the final report.
-- **Limitations.** The dataset has no manipulation masks, so the proposal's `α·R_attr` (mIoU) term is 0. The
-  evidence graph encodes hypothesised mechanisms, not established causal relations.
+- **Same-reasoner measurement.** The no-tool arbiter pass is part of every run, so the value of a tool subset is
+  always measured against the same weights on the same frames, never against a different model.
+- **Limitations.** The dataset has no manipulation masks, so the attribution term `α·R_attr` (mIoU) is 0. The
+  evidence graph encodes hypothesised mechanisms, not established causal relations. All findings come from one
+  scanner/arbiter pair and one feature pool.

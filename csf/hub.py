@@ -57,7 +57,16 @@ def _metric_rows(metrics: Dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _task_line(cfg: Config) -> str:
+    """How the card names the task: the paper's binary setting, or the full three-class one."""
+    classes = [PRETTY_LABELS[c] for c in (cfg.data.classes or ["real", "ai_generated", "ai_edited"])]
+    kind = "binary" if len(classes) == 2 else f"{len(classes)}-class"
+    names = [f"**{c}**" for c in classes]
+    return kind, " or ".join(names) if len(names) < 3 else ", ".join(names[:-1]) + " or " + names[-1]
+
+
 def model_card(cfg: Config, metrics: Dict[str, Any], repo_id: str) -> str:
+    kind, classes = _task_line(cfg)
     return f"""---
 license: other
 license_name: llama3.2-and-qwen-research
@@ -67,18 +76,24 @@ base_model: [{cfg.models.qwen_id}, {cfg.models.llama_id}]
 pipeline_tag: video-classification
 ---
 
-# Chrono-Spectral Forensics (CSF) - tri-class video attribution
+# SAFER - cost-aware {kind} AI-generated video detection
 
-Classifies a video as **Real**, **AI-Generated** or **AI-Edited** with the agentic pipeline from
-*Agentic Forensic Systems for AI-Generated Video Detection*:
+Classifies a video as {classes} with SAFER, a cost-aware agentic detector that treats forensic analysis as
+evidence acquisition under a latency budget (*SAFER: When Is Acquiring Forensic Evidence Worth the Cost in
+Agentic AI-Generated Video Detection?*):
 
-1. **Phase 1 - scanner**: `{cfg.models.qwen_id}` + LoRA reads the frames as video.
-2. **Phase 2 - dispatcher**: a GRPO-trained policy on the `{cfg.models.llama_id}` state chooses which forensic
-   tools to run (or exits early) under a compute budget. One dispatcher per profile: `ultra_fast`, `balanced`, `max_security`.
-3. **Phase 3 - toolpool**: spatial (saturation, lighting, edges, optical flow), spectral (FFT / 3D-DCT / phase
-   correlation / noise residual) and latent (DIRE with a video-diffusion VAE) tools on sparse 64x64 patches.
-4. **Phase 4 - arbiter**: the same Llama-3.2-Vision backbone (+ LoRA) reads a frame mosaic plus the evidence
-   graph and outputs calibrated probabilities, reusing the dispatcher's vision states.
+1. **Frontline**: the scanner `{cfg.models.qwen_id}` + LoRA reads the frames as video, and the arbiter
+   `{cfg.models.llama_id}` + LoRA reads a frame mosaic with an empty evidence graph. This no-tool arbiter pass
+   runs on every video and caches its vision states.
+2. **Dispatcher**: a GRPO-trained policy on the frontline state decides whether spatial, spectral or latent
+   evidence is worth its measured latency, or exits without tools (mean of scanner and no-tool arbiter).
+   One dispatcher per profile: `ultra_fast`, `balanced`, `max_security`.
+3. **Toolpool**: spatial (saturation, lighting, edges, optical flow), spectral (FFT / 3D-DCT / phase
+   correlation / noise residual) and latent (DIRE with a video-diffusion VAE) features on sparse native-resolution patches.
+4. **Arbiter with evidence**: the same arbiter weights read the evidence graph, reusing the cached vision states.
+
+Because the no-tool pass comes from the same weights, the value of any tool subset is measured against the same
+reasoner without that evidence. In the paper's experiments the dispatcher learned to skip tools almost always.
 
 Trained on `{cfg.data.repo_id}` (run `{cfg.run_name}`, mode `{cfg.mode}`, {cfg.data.num_frames} frames/video).
 
@@ -104,7 +119,8 @@ import sys; sys.path.insert(0, "csf-model/code")
 from csf.inference import CSFDetector
 det = CSFDetector("csf-model")                # or the Hub id "{repo_id}"
 print(det.predict("video.mp4", mode="agentic", profile="balanced"))
-# modes: "scanner" (Qwen only, fastest) | "static" (all tools + Llama) | "agentic" (routed CSF)
+# modes: "scanner" (SAFER-Scanner, fastest) | "static" (SAFER-Static: all tools + arbiter)
+#        "agentic" (SAFER: frontline + dispatcher; profile="balanced" is the SAFER default)
 ```
 
 Low-VRAM GPUs (12-16 GB): pass `quantization="4bit"` (default) and, if needed, `components=("qwen",)`
@@ -117,6 +133,9 @@ or `components=("llama", "vae")` to load only what a mode needs.
   `balanced` for general use, `max_security` for audits where missing a fake is costly.
 - Check the `baseline_metadata_shortcut` row in the metrics: it shows how much of the dataset can be solved from
   container metadata alone. Scores on other video sources may be lower than the numbers above.
+- On new generators the ranking (AUC) transfers better than the 0.5 decision threshold. If you have a small labelled
+  sample from your target domain, recalibrate the threshold on it before relying on hard decisions; in the paper
+  this helped more than running more forensic tools.
 - The evidence graph encodes hypothesised mechanisms, not established causal relations.
 - Outputs are probabilistic forensic evidence, not proof; keep a human in the loop for consequential decisions.
 - Base-model licences apply (Llama 3.2 Community License, Qwen licence).

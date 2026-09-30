@@ -1,16 +1,18 @@
 """
-Chrono-Spectral Forensics (CSF) package.
+SAFER: cost-aware forensic evidence acquisition for AI-generated video detection.
 
-Tri-class (Real / AI-Generated / AI-Edited) video attribution pipeline built on the
-Chrono-TriClass-100k dataset, following the "Agentic Forensic Systems for AI-Generated
-Video Detection" proposal:
+The package keeps the project's working name `csf` (Chrono-Spectral Forensics). The paper's setting is binary
+(Real vs AI-Generated, Chrono-66k: the two-class part of the Chrono-TriClass-100k manifest, selected with
+`data.classes`); the code also supports the full three-class Real / AI-Generated / AI-Edited setting.
 
-    Phase 1  Qwen2.5-VL-3B semantic scanner            -> csf.models.classifier (kind="qwen")
-    Phase 2  GRPO budget-constrained dispatcher         -> csf.models.dispatcher
-    Phase 3  Spatial / Spectral / Latent toolpool       -> csf.tools
-    Phase 4  Evidence graph + Llama-3.2-Vision arbiter  -> csf.graph, csf.models.classifier (kind="llama")
+    Frontline   Qwen2.5-VL-3B scanner + Llama-3.2-Vision no-tool pass  -> csf.models.classifier
+    Dispatcher  GRPO cost-aware router (exit without tools, or pay for tools) -> csf.models.dispatcher
+    Toolpool    spatial / spectral / latent forensic features             -> csf.tools
+    Arbiter     evidence graph + the same Llama-3.2-Vision weights       -> csf.graph, csf.models.classifier
 
-Entry point: main.py at the repository root.
+The no-tool arbiter pass is the same-reasoner baseline against which the value of every tool subset is measured.
+
+Entry point: main.py at the repository root (full_2class.py for the paper's configuration).
 """
 
 __version__ = "1.0.0"
