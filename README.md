@@ -142,7 +142,8 @@ the live raw-video latency benchmark; and plots (Pareto frontier, confusion matr
 main.py                   stage driver (resumable) - the only entry point
 configs/test.yaml         test run: 5 000 videos, 12-16 GB GPU (e.g. laptop RTX 5070 Ti 12 GB)
 configs/full.yaml         full run: all videos, >=24 GB GPU(s), tuned for speed + quality
-configs/full_2class.yaml  the paper's run: Chrono-66k (Real vs AI-Generated), 4x H200 settings
+configs/safer.yaml        the paper's configuration, every stated hyperparameter pinned (Table 6, App. B)
+configs/full_2class.yaml  same training settings as safer.yaml (own run dir, 100-video latency benchmark)
 full_2class.py            entry point for configs/full_2class.yaml (same stages as main.py)
 infer_2class.py           batch inference with an exported two-class bundle
 benchmark_external.py     zero-shot evaluation on normalised external benchmarks + baselines
@@ -636,7 +637,16 @@ the Llama licence gating intact.
 
 ## 9.1 Reproducing the paper's training run (Chrono-66k, Real vs AI-Generated)
 
-This is the configuration the paper's models were trained with. Use it to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
+`configs/safer.yaml` records the paper's settings explicitly (16 frames, LoRA 32/64/0.05, label smoothing 0.05,
+effective batch 64 on four GPUs, GRPO: 1,500 iterations, 256 videos x 16 actions, KL 0.02, entropy 0.01, seed 42):
+
+```bash
+bash scripts/run_safer.sh            # Windows: scripts\run_safer.ps1
+```
+
+`configs/full_2class.yaml` has the same training settings with its own run directory
+(`runs/full_2class`) and a 100-video latency benchmark; keep using it to resume a run you started with it.
+Use it to run the same resumable end-to-end pipeline — prepare, features, Qwen training, Llama training, scanner predictions, outcome tables, GRPO dispatchers, evaluation, export and latency — while excluding AI-Edited from train/valid/test:
 
 ```bash
 bash scripts/run_full_2class.sh
