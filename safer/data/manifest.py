@@ -58,7 +58,7 @@ def local_dataset_root(cfg: DataConfig) -> Optional[Path]:
     Video paths in the manifest are resolved relative to the folder returned here."""
     if not cfg.local_root:
         return None
-    root = Path(cfg.local_root).expanduser()
+    root = Path(cfg.local_root).expanduser().resolve()   # absolute, so worker processes agree on it
     if not root.is_dir():
         raise FileNotFoundError(f"data.local_root '{root}' is not a folder")
     name = Path(cfg.manifest).name
