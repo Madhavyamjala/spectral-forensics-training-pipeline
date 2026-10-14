@@ -31,6 +31,10 @@ class PathsConfig:
 class DataConfig:
     repo_id: str = "madhav-yrc/Chrono-TriClass-100k"
     revision: Optional[str] = None
+    # Folder holding an extracted copy of the dataset (manifest.csv plus the Real/, AI_Generated/,
+    # "AI Edited/" folders). When set, nothing is fetched from the Hub and the videos are read in
+    # place and never deleted; repo_id is ignored.
+    local_root: Optional[str] = None
     manifest: str = "manifest.csv"
     classes: Optional[List[str]] = None   # train on a subset of LABELS; None = all three
     max_rows: Optional[int] = 5000

@@ -69,11 +69,15 @@ def is_transient(exc: Exception) -> bool:
                                         "remote end closed", "incomplete read", "reset by peer"))
 
 
-def download_video(repo_id: str, repo_path: str, video_dir: Path, revision: Optional[str] = None,
+def download_video(repo_id: Optional[str], repo_path: str, video_dir: Path, revision: Optional[str] = None,
                    max_retries: int = 8, base_backoff: float = 10.0) -> Path:
+    """`video_dir / repo_path`, fetched from the Hub dataset `repo_id` if it is missing.
+    With repo_id None (a local dataset copy) a missing file is an error, never a download."""
     target = video_dir / repo_path
     if target.exists() and target.stat().st_size > 0:
         return target
+    if repo_id is None:
+        raise FileNotFoundError(f"{target} is missing or empty in the local dataset copy (data.local_root)")
     target.parent.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:

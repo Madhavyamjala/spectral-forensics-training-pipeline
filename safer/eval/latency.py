@@ -76,9 +76,10 @@ def ensure_latency_videos(cfg: Config, index, num_videos: int):
         Persist per-video checksum verification for benchmark artifacts when the dataset exposes hashes.
     """
     from huggingface_hub import hf_hub_download
+    from safer.data.manifest import video_source
 
     rows = _latency_rows(index, num_videos)
-    video_dir = Path(cfg.paths.video_dir)
+    video_dir, repo_id, _ = video_source(cfg.data, Path(cfg.paths.video_dir))
     video_dir.mkdir(parents=True, exist_ok=True)
     rows["video_path"] = [str(video_dir / p) for p in rows["repo_path"]]
 
@@ -90,6 +91,9 @@ def ensure_latency_videos(cfg: Config, index, num_videos: int):
         dest.parent.mkdir(parents=True, exist_ok=True)
         pending.append((row.repo_path, dest))
 
+    if pending and repo_id is None:
+        raise FileNotFoundError(f"{len(pending)} latency benchmark video(s) are missing from the local dataset "
+                                f"copy (data.local_root), e.g. {pending[0][1]}")
     if pending:
         workers = max(1, min(int(cfg.data.download_workers), 16))
         log.info("Latency benchmark: %d/%d raw videos missing -> downloading with %d worker(s)",
@@ -97,7 +101,7 @@ def ensure_latency_videos(cfg: Config, index, num_videos: int):
 
         def fetch(repo_path: str, dest: Path) -> str:
             downloaded = hf_hub_download(
-                cfg.data.repo_id,
+                repo_id,
                 repo_path,
                 repo_type="dataset",
                 revision=cfg.data.revision,

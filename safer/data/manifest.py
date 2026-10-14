@@ -7,11 +7,12 @@ The manifest (produced by dataset.py) has one row per video:
 with a leakage-aware (sha256-grouped) stratified train/valid/test split already assigned.
 
 This module
-  1. resolves the manifest: a local path if it exists, otherwise `manifest.csv` downloaded from
-     the dataset repo on the Hub,
+  1. resolves the manifest: with `data.local_root` (an extracted copy of the dataset), the one inside
+     that copy unless `data.manifest` is a path; otherwise a local path if it exists, else `manifest.csv`
+     downloaded from the dataset repo on the Hub,
   2. maps every (class, video_id) to its repo file path from the repo's naming scheme, e.g.
      real-17 -> "Real/part-1/real-17.mp4" (ids that do not match fall back to a one-off repo listing
-     cached in <cache_dir>/repo_index.json),
+     cached in <cache_dir>/repo_index.json; with `data.local_root`, a scan of that folder),
   3. fills `generator_edit_method` from the AI-Edited sub-folder name when the manifest says
      "unknown" (face_manipulation, inpainting, object_removal, ...),
   4. for the test run, draws a stratified subset of `max_rows` rows that keeps the manifest's
@@ -27,7 +28,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
@@ -49,8 +50,38 @@ def _norm(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
 
+def local_dataset_root(cfg: DataConfig) -> Optional[Path]:
+    """Folder of the extracted dataset copy that holds the manifest, or None when reading from the Hub.
+
+    `data.local_root` may point at that folder or at any folder above it, since unzipping an archive
+    often adds a level (e.g. `unzip repo.zip -d anonymous_repo` -> anonymous_repo/<name>/manifest.csv).
+    Video paths in the manifest are resolved relative to the folder returned here."""
+    if not cfg.local_root:
+        return None
+    root = Path(cfg.local_root).expanduser()
+    if not root.is_dir():
+        raise FileNotFoundError(f"data.local_root '{root}' is not a folder")
+    name = Path(cfg.manifest).name
+    if (root / name).is_file():
+        return root
+    hits: List[Path] = sorted(p.parent for p in root.rglob(name) if p.is_file())
+    if not hits:
+        raise FileNotFoundError(f"No {name} found under data.local_root '{root}'. Point data.local_root at "
+                                f"the extracted dataset folder, or set data.manifest to the manifest's path.")
+    if len(hits) > 1:
+        raise ValueError(f"Several {name} files under data.local_root '{root}': {[str(h) for h in hits[:5]]}. "
+                         f"Point data.local_root at the one to use.")
+    return hits[0]
+
+
 def resolve_manifest(cfg: DataConfig, cache_dir: Path) -> Path:
     local = Path(cfg.manifest)
+    root = local_dataset_root(cfg)
+    if root is not None and len(local.parts) == 1:
+        # a bare file name means the local copy's own manifest, not one that happens to sit in the
+        # working directory (the repo ships a manifest.csv at its root); give a path to override
+        log.info("Using the manifest of the local dataset copy: %s", root / local.name)
+        return root / local.name
     if local.exists():
         log.info("Using local manifest: %s", local.resolve())
         return local
@@ -96,6 +127,34 @@ def build_repo_index(cfg: DataConfig, cache_dir: Path) -> Dict[str, str]:
     return index
 
 
+def build_local_index(root: Path) -> Dict[str, str]:
+    """Map "<class>/<video_id>" -> path relative to `root` for every video file under it.
+
+    The class comes from the first folder on the path named like a class folder (Real, AI_Generated,
+    "AI Edited"); files under no such folder are indexed as "*/<video_id>"."""
+    folder_to_class = {_norm(folder): cls for cls, folder in CLASS_FOLDERS.items()}
+    index: Dict[str, str] = {}
+    for p in root.rglob("*"):
+        if p.suffix.lower() not in VIDEO_EXTS or not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        cls = next((folder_to_class[_norm(part)] for part in rel.parts[:-1] if _norm(part) in folder_to_class), "*")
+        index.setdefault(f"{cls}/{p.stem}", rel.as_posix())
+    log.info("Local dataset index: %d video files under %s", len(index), root)
+    return index
+
+
+def video_source(cfg: DataConfig, video_dir: Path) -> Tuple[Path, Optional[str], bool]:
+    """Where videos are read from: (folder, Hub repo to fetch missing files from or None, may delete).
+
+    A local dataset copy is read in place and never deleted, whatever `delete_videos_after_cache` says:
+    those files are the user's dataset, not a download cache."""
+    root = local_dataset_root(cfg)
+    if root is not None:
+        return root, None, False
+    return Path(video_dir), cfg.repo_id, cfg.delete_videos_after_cache
+
+
 def _method_from_path(cls: str, repo_path: str, manifest_method: str) -> str:
     if isinstance(manifest_method, str) and manifest_method not in ("", "unknown", "nan"):
         return manifest_method
@@ -137,16 +196,21 @@ def load_run_manifest(cfg: DataConfig, cache_dir: Path, seed: int) -> pd.DataFra
              df["class"].value_counts().to_dict(), df["split"].value_counts().to_dict())
 
     df["repo_path"] = [repo_path_for(c, v) for c, v in zip(df["class"], df["video_id"])]
+    root = local_dataset_root(cfg)
+    if root is not None:
+        # a local copy may not follow the Hub layout: keep only paths that exist, look the rest up
+        df["repo_path"] = [p if isinstance(p, str) and (root / p).is_file() else None for p in df["repo_path"]]
     if df["repo_path"].isna().any():
-        log.info("%d video id(s) do not follow the standard naming -> resolving them via the repo listing",
-                 int(df["repo_path"].isna().sum()))
-        index = build_repo_index(cfg, cache_dir)
-        df["repo_path"] = [p if isinstance(p, str) else index.get(f"{c}/{v}")
+        log.info("%d video id(s) are not at their standard path -> resolving them via the %s",
+                 int(df["repo_path"].isna().sum()), "local folder scan" if root is not None else "repo listing")
+        index = build_local_index(root) if root is not None else build_repo_index(cfg, cache_dir)
+        df["repo_path"] = [p if isinstance(p, str) else index.get(f"{c}/{v}", index.get(f"*/{v}"))
                            for c, v, p in zip(df["class"], df["video_id"], df["repo_path"])]
     n_missing = int(df["repo_path"].isna().sum())
     if n_missing:
         log.warning("%d manifest row(s) have no matching video file in %s -> dropped. Examples: %s",
-                    n_missing, cfg.repo_id, df.loc[df["repo_path"].isna(), "video_id"].head(5).tolist())
+                    n_missing, root if root is not None else cfg.repo_id,
+                    df.loc[df["repo_path"].isna(), "video_id"].head(5).tolist())
         df = df[df["repo_path"].notna()].copy()
 
     method_col = df["generator_edit_method"] if "generator_edit_method" in df else pd.Series("unknown", index=df.index)

@@ -59,6 +59,18 @@ Chrono-66k is the Real and AI-Generated part of the `madhav-yrc/Chrono-TriClass-
 generator (section 4) are not used by the paper. `configs/full_2class.yaml` selects exactly these two classes
 (`data.classes: [real, ai_generated]`).
 
+**Reading the data from a local copy.** By default videos are fetched from the dataset repo on the Hub. To run
+from an extracted copy instead (a folder holding `manifest.csv` and the `Real/`, `AI_Generated/` folders, or any
+folder above it), set `data.local_root`:
+
+```bash
+bash scripts/run_safer.sh --set data.local_root=/data/chrono66k
+```
+
+The manifest and videos are then read in place, no Hub request is made for the dataset, and the videos are never
+deleted (`data.delete_videos_after_cache` only applies to Hub downloads). Files that are not at their standard path
+are found by scanning the folder; manifest rows with no file are dropped and logged.
+
 **Format normalisation.** A classifier on container metadata alone separates the original real and generated files,
 so every video is letterboxed to 854x480, resampled to 24 fps, cut to its first 10 s, stripped of audio and re-encoded
 with H.264 (CRF 23, yuv420p). External benchmarks: GenBuster, ViF-Bench, FakePartsBench and GenVidBench (Pika and

@@ -96,8 +96,10 @@ def build_feature_cache(df: pd.DataFrame, cfg: Config, dist_info: DistInfo) -> p
     from tqdm import tqdm
     from safer.tools.toolpool import LatentTool
 
+    from safer.data.manifest import video_source
+
     cache_dir, d = cfg.cache_dir, cfg.data
-    video_dir = Path(cfg.paths.video_dir)
+    video_dir, repo_id, may_delete = video_source(d, Path(cfg.paths.video_dir))
     keep = set(df[df["split"] == "test"].sort_values("video_id").head(d.keep_videos_for_latency)["video_id"])
 
     mine = df.iloc[dist_info.rank::dist_info.world_size]
@@ -112,15 +114,15 @@ def build_feature_cache(df: pd.DataFrame, cfg: Config, dist_info: DistInfo) -> p
         latent_tool = LatentTool(cfg.models.vae_id, cfg.models.vae_subfolder, cfg.models.vae_fallback_id,
                                  dist_info.device, dtype)
         workers = max(1, min(d.download_workers, (os.cpu_count() or 2) // dist_info.world_size))
-        log.info("Extraction pool: %d worker process(es), prefetch=%d, delete_videos_after_cache=%s",
-                 workers, d.prefetch, d.delete_videos_after_cache)
+        log.info("Extraction pool: %d worker process(es), prefetch=%d, videos from %s, delete after cache=%s",
+                 workers, d.prefetch, repo_id or video_dir, may_delete)
         cls_idx = mine.columns.get_loc("class")
         jobs = deque({
-            "key": (r[cls_idx], r.video_id, r.repo_path), "repo_id": d.repo_id, "repo_path": r.repo_path,
+            "key": (r[cls_idx], r.video_id, r.repo_path), "repo_id": repo_id, "repo_path": r.repo_path,
             "revision": d.revision, "video_dir": str(video_dir), "num_frames": d.num_frames,
             "tool_max_side": d.tool_max_side, "frame_size": d.frame_size, "jpeg_quality": d.jpeg_quality,
             "patch_size": d.patch_size, "num_patches": d.num_patches,
-            "delete_after": d.delete_videos_after_cache and r.video_id not in keep,
+            "delete_after": may_delete and r.video_id not in keep,
         } for r in todo)
 
         tp = Throughput(len(todo))

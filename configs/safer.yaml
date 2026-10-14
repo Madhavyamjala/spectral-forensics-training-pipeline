@@ -24,6 +24,7 @@ paths:
 
 data:
   repo_id: madhav-yrc/Chrono-TriClass-100k
+  local_root: null                   # folder of an extracted dataset copy; when set, nothing is fetched from the Hub
   manifest: manifest.csv
   classes: [real, ai_generated]      # Chrono-66k
   max_rows: null
