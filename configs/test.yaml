@@ -21,7 +21,7 @@ paths:
   video_dir: ./cache/test/videos
 
 data:
-  repo_id: madhav-yrc/Chrono-TriClass-100k
+  repo_id: "<anonymized>"             # Hub id withheld for review; use data.local_root
   manifest: manifest.csv             # falls back to manifest.csv inside the dataset repo if this path is missing
   max_rows: 5000
   num_frames: 8

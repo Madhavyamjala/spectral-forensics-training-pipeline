@@ -54,10 +54,22 @@ split and, zero-shot, on four external benchmarks.
 | AI-Generated | VidProM (Pika, VideoCrafter2) | 33,312 | 26,650 | 3,331 | 3,331 |
 | **Total** | | **66,646** | **53,334** | **6,636** | **6,676** |
 
-Chrono-66k is the Real and AI-Generated part of the `madhav-yrc/Chrono-TriClass-100k` manifest in this repo
+Chrono-66k is the Real and AI-Generated part of the Chrono-TriClass-100k manifest in this repo
 (`manifest.csv`, split at the source-clip level by SHA-256, 80/10/10 stratified). The AI-Edited class and its
 generator (section 4) are not used by the paper. `configs/full_2class.yaml` selects exactly these two classes
 (`data.classes: [real, ai_generated]`).
+
+**Getting the data (anonymised for review).** Chrono-66k is available at
+<https://anonymous-hf.com/a/u7uxxaxreq1v/>. From the repository root:
+
+```bash
+wget "https://anonymous-hf.com/api/a/u7uxxaxreq1v/download/" -O repo.zip
+unzip repo.zip -d anonymous_repo
+bash scripts/run_safer.sh            # configs/safer.yaml reads ./anonymous_repo (data.local_root)
+```
+
+The pipeline reads `manifest.csv` and the videos straight from the extracted folder, so the generic
+`datasets.load_dataset(...)` step shown on the download page is not needed.
 
 **Reading the data from a local copy.** By default videos are fetched from the dataset repo on the Hub. To run
 from an extracted copy instead (a folder holding `manifest.csv` and the `Real/`, `AI_Generated/` folders, or any
@@ -246,8 +258,8 @@ Everything else the setup script installs.
 ### Linux
 
 ```bash
-git clone https://github.com/Madhavyamjala/spectral-forensics-training-pipeline.git
-cd spectral-forensics-training-pipeline
+# get the code: download the archive from https://anonymous.4open.science/r/safer-5C41,
+# unzip it and cd into the extracted folder
 
 # 1. system packages (Ubuntu/Debian; use dnf/yum equivalents elsewhere)
 sudo apt update && sudo apt install -y python3.12 python3.12-venv git ffmpeg
@@ -266,8 +278,8 @@ python -m safer.env_check
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/Madhavyamjala/spectral-forensics-training-pipeline.git
-cd spectral-forensics-training-pipeline
+# get the code: download the archive from https://anonymous.4open.science/r/safer-5C41,
+# unzip it and cd into the extracted folder
 
 # 1. ffmpeg (skip if you already have it on PATH)
 winget install Gyan.FFmpeg

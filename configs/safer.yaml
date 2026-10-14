@@ -23,8 +23,8 @@ paths:
   video_dir: ./cache/safer/videos
 
 data:
-  repo_id: madhav-yrc/Chrono-TriClass-100k
-  local_root: null                   # folder of an extracted dataset copy; when set, nothing is fetched from the Hub
+  repo_id: "<anonymized>"            # Hub id withheld for review; the data is read from local_root
+  local_root: anonymous_repo         # created by `unzip repo.zip -d anonymous_repo` (README, "Getting the data")
   manifest: manifest.csv
   classes: [real, ai_generated]      # Chrono-66k
   max_rows: null

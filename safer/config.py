@@ -29,7 +29,7 @@ class PathsConfig:
 
 @dataclass
 class DataConfig:
-    repo_id: str = "madhav-yrc/Chrono-TriClass-100k"
+    repo_id: str = "<anonymized>"      # Hub id withheld for review; set data.local_root
     revision: Optional[str] = None
     # Folder holding an extracted copy of the dataset (manifest.csv plus the Real/, AI_Generated/,
     # "AI Edited/" folders). When set, nothing is fetched from the Hub and the videos are read in
