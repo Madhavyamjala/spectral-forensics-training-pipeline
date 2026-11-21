@@ -142,6 +142,10 @@ output against the paper before citing it as a reproduction.
 Not reimplemented: the confidence gate over matched actions and GRPO trained on target-domain labels (Tables 3
 and 12), and the cue statistics of Appendix F.
 
+The analyses added in the revision (latency-weight sweep, calibration, label budget, fusion bound, VAE round-trip,
+D3, one-harness latency) and the cluster scripts that produced them are described in
+[docs/REPRODUCE.md](docs/REPRODUCE.md).
+
 ## What the pipeline trains and reports
 
 | Id | Report row | What it is |
